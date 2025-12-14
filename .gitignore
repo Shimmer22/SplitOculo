@@ -50,12 +50,10 @@ logs/
 wandb/
 runs/
 
-# Data
-data/imagenet/
-data/coco/
-*.tar
-*.tar.gz
-*.zip
+# Data - whitelist mode (ignore all except .py files)
+data/*
+!data/__init__.py
+!data/dataset.py
 
 # OS
 .DS_Store
