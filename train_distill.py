@@ -4,6 +4,7 @@
 训练 CNN 模型逼近 ViT (如 CLIP) 的输出特征
 """
 import argparse
+import re
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,10 +13,86 @@ from pathlib import Path
 from tqdm import tqdm
 
 import timm
+import matplotlib.pyplot as plt
 
 from core.utils import set_seed, get_logger, count_parameters
 from data.dataset import get_dummy_loader, get_imagenet_loader
 from models.adapters import FeatureAdapter, DistillationHead
+
+
+def visualize_training(log_path, output_dir='./results'):
+    """解析日志并生成训练曲线"""
+    epochs = []
+    train_loss, train_mse, train_cos = [], [], []
+    val_mse, val_cos_sim = [], []
+    
+    with open(log_path, 'r') as f:
+        lines = f.readlines()
+    
+    current_epoch = None
+    for line in lines:
+        if 'Epoch' in line and '/' in line:
+            match = re.search(r'Epoch (\d+)/\d+', line)
+            if match:
+                current_epoch = int(match.group(1))
+        
+        if 'Train - Loss:' in line:
+            match = re.search(r'Loss: ([\d.]+), MSE: ([\d.]+), Cos: ([\d.]+)', line)
+            if match:
+                epochs.append(current_epoch)
+                train_loss.append(float(match.group(1)))
+                train_mse.append(float(match.group(2)))
+                train_cos.append(float(match.group(3)))
+        
+        if 'Val - MSE:' in line:
+            match = re.search(r'MSE: ([\d.]+), Cos Sim: ([\d.]+)', line)
+            if match:
+                val_mse.append(float(match.group(1)))
+                val_cos_sim.append(float(match.group(2)))
+    
+    if not epochs:
+        print("⚠️ 日志中没有找到训练数据")
+        return None
+    
+    # 绘图
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    
+    axes[0, 0].plot(epochs, train_loss, 'b-', linewidth=2)
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_title('Training Loss', fontweight='bold')
+    
+    axes[0, 1].plot(epochs, train_mse, 'b-', label='Train MSE', linewidth=2)
+    if val_mse:
+        axes[0, 1].plot(epochs[:len(val_mse)], val_mse, 'r--', label='Val MSE', linewidth=2)
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('MSE')
+    axes[0, 1].set_title('MSE Loss', fontweight='bold')
+    axes[0, 1].legend()
+    
+    axes[1, 0].plot(epochs, train_cos, 'g-', linewidth=2)
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Cosine Loss')
+    axes[1, 0].set_title('Training Cosine Loss', fontweight='bold')
+    
+    if val_cos_sim:
+        axes[1, 1].plot(epochs[:len(val_cos_sim)], val_cos_sim, 'm-', linewidth=2)
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Cosine Similarity')
+        axes[1, 1].set_title('Validation Cosine Similarity', fontweight='bold')
+        axes[1, 1].set_ylim(0, 1)
+    
+    plt.tight_layout()
+    
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True)
+    fig_path = output_path / 'training_curves.png'
+    plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"📊 训练曲线已保存: {fig_path}")
+    return fig_path
 
 
 class DistillationTrainer:
@@ -337,6 +414,11 @@ def main():
     
     # 开始训练
     trainer.train(train_loader, val_loader)
+    
+    # 训练结束后生成可视化
+    log_path = Path(args.output_dir) / 'train.log'
+    if log_path.exists():
+        visualize_training(log_path, output_dir='./results')
 
 
 if __name__ == '__main__':
