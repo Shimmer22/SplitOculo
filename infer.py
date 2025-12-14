@@ -55,10 +55,12 @@ class DistilledFeatureExtractor(nn.Module):
     
     def load_checkpoint(self, checkpoint_path, device='cpu'):
         """加载训练好的权重"""
-        ckpt = torch.load(checkpoint_path, map_location=device)
+        # weights_only=False 是因为 checkpoint 包含 argparse.Namespace
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         self.student.load_state_dict(ckpt['student_state_dict'])
         self.adapter.load_state_dict(ckpt['adapter_state_dict'])
         print(f"✅ 已加载检查点: {checkpoint_path}")
+        return self
         return self
 
 
