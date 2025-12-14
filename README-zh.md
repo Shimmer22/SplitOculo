@@ -6,6 +6,10 @@
   <i>Edge-Cloud Collaborative Vision Feature Splitting for Smart Glasses</i>
 </p>
 
+<p align="center">
+  <a href="README.md">English</a>
+</p>
+
 ---
 
 ## 📖 项目简介
