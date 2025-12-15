@@ -5,14 +5,19 @@
 这样训练速度可以提升 10-50 倍。
 
 Usage:
-    python train_with_precomputed.py --features_dir ./data/qwen_features --data_dir ./data/imagenette2-320
+    python scripts/train_with_precomputed.py --features_dir ./data/qwen_features --data_dir ./data/imagenette2-320
 """
 import argparse
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from pathlib import Path
 from tqdm import tqdm
 import json
 import timm

@@ -2,14 +2,19 @@
 推理脚本：使用训练好的蒸馏模型提取特征
 
 Usage:
-    python infer.py --checkpoint checkpoints/best_model.pth --image path/to/image.jpg
-    python infer.py --checkpoint checkpoints/best_model.pth --dummy  # 使用假数据测试
+    python scripts/infer.py --checkpoint checkpoints/best_model.pth --image path/to/image.jpg
+    python scripts/infer.py --checkpoint checkpoints/best_model.pth --dummy  # 使用假数据测试
 """
 import argparse
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import torch
 import torch.nn as nn
 import timm
-from pathlib import Path
 from PIL import Image
 from torchvision import transforms
 
@@ -60,7 +65,6 @@ class DistilledFeatureExtractor(nn.Module):
         self.student.load_state_dict(ckpt['student_state_dict'])
         self.adapter.load_state_dict(ckpt['adapter_state_dict'])
         print(f"✅ 已加载检查点: {checkpoint_path}")
-        return self
         return self
 
 
