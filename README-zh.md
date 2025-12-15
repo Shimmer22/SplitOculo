@@ -30,6 +30,7 @@
 cnn_vit/
 ├── main_benchmark.py       # 性能评估入口
 ├── train_distill.py        # 蒸馏训练入口
+├── infer.py                # 推理脚本
 ├── requirements.txt        # 依赖库
 │
 ├── core/                   # 核心框架
@@ -106,6 +107,28 @@ python train_distill.py \
     --epochs 100 \
     --batch_size 64 \
     --lr 1e-4
+```
+
+### 4. 使用训练好的模型推理
+
+```bash
+# 快速测试
+python infer.py --checkpoint checkpoints/best_model.pth --dummy
+
+# 对真实图像推理
+python infer.py --checkpoint checkpoints/best_model.pth --image path/to/image.jpg
+
+# 保存特征到文件
+python infer.py --checkpoint checkpoints/best_model.pth --image photo.jpg --output features.pt
+```
+
+输出：
+```
+🔧 Device: cuda
+✅ 已加载检查点: checkpoints/best_model.pth
+✅ 特征形状: torch.Size([1, 1024, 16, 16])
+   特征范围: [-1.6851, 1.5349]
+   特征均值: 0.0167
 ```
 
 ---

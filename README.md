@@ -28,6 +28,7 @@ SplitOculo is a research framework for **edge-cloud collaborative computing** on
 SplitOculo/
 ├── main_benchmark.py       # Benchmark entry point
 ├── train_distill.py        # Distillation training entry
+├── infer.py                # Inference with trained model
 ├── requirements.txt
 │
 ├── core/                   # Core framework
@@ -102,6 +103,28 @@ python train_distill.py \
     --student_model mobilenetv2_100 \
     --epochs 100 \
     --batch_size 64
+```
+
+### 4. Inference with Trained Model
+
+```bash
+# Test with dummy data
+python infer.py --checkpoint checkpoints/best_model.pth --dummy
+
+# Run on real image
+python infer.py --checkpoint checkpoints/best_model.pth --image path/to/image.jpg
+
+# Save features to file
+python infer.py --checkpoint checkpoints/best_model.pth --image photo.jpg --output features.pt
+```
+
+Output:
+```
+🔧 Device: cuda
+✅ Loaded checkpoint: checkpoints/best_model.pth
+✅ Feature shape: torch.Size([1, 1024, 16, 16])
+   Feature range: [-1.6851, 1.5349]
+   Feature mean: 0.0167
 ```
 
 ---
