@@ -63,3 +63,6 @@ Thumbs.db
 *.bak
 .env
 .env.local
+
+# Test images
+test.jpg
