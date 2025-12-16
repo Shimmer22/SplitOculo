@@ -211,6 +211,18 @@ class HybridQwenVLM:
         
         print(f"   上采样: {cnn_h}x{cnn_w} -> {target_h}x{target_w} tokens")
         
+        # === Feature scaling to match Qwen Layer 4 distribution ===
+        # CNN output: mean≈0, std≈0.06
+        # Qwen Layer 4: mean≈-0.017, std≈0.83
+        # Scale CNN output to match Qwen's expected distribution
+        cnn_std = edge_features.std()
+        target_std = 0.83  # Qwen Layer 4 approximate std
+        target_mean = -0.017  # Qwen Layer 4 approximate mean
+        
+        if cnn_std > 0:
+            edge_features = (edge_features - edge_features.mean()) / cnn_std * target_std + target_mean
+            print(f"   特征缩放: std {cnn_std:.3f} -> {target_std}, mean -> {target_mean}")
+        
         # 处理 edge_features 形状: (B, num_tokens, hidden) -> (total_tokens, hidden)
         edge_features = edge_features.view(-1, edge_features.shape[-1])  # (256, 1280)
         
@@ -330,13 +342,13 @@ def main():
     parser.add_argument('--checkpoint', type=str, default='checkpoints/qwen_precomputed/best_model.pth')
     parser.add_argument('--image', type=str, default=None)
     parser.add_argument('--dummy', action='store_true')
-    parser.add_argument('--split_layer', type=int, default=8,
-                        help='Which layer CNN replaces (1-32)')
+    parser.add_argument('--split_layer', type=int, default=4,
+                        help='Which layer CNN replaces (1-32, must match training layer)')
     parser.add_argument('--device', type=str, 
                         default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--quantize', type=str, default='int8',
+    parser.add_argument('--quantize', type=str, default='none',
                         choices=['none', 'fp16', 'int8'],
-                        help='Quantization method for transmission')
+                        help='Quantization method for transmission (none recommended for debugging)')
     parser.add_argument('--full_inference', action='store_true',
                         help='Run complete inference including Qwen deep layers')
     parser.add_argument('--prompt', type=str, default=None,
@@ -374,7 +386,7 @@ def main():
     print(f"   输出形状: {edge_features.shape}")
     print(f"   维度: {edge_features.shape[-1]} (应为 1280)")
     
-    # 量化分析
+    # 量化分析 (端侧特征大小，上采样前)
     print(f"\n📡 传输大小分析 ({args.quantize} 量化):")
     quantized, metadata = hybrid.quantize_features(edge_features, method=args.quantize)
     
@@ -385,10 +397,28 @@ def main():
     else:
         bytes_per_val = 4
     
+    # 端侧特征大小 (上采样在云端执行)
     transmission_bytes = quantized.numel() * bytes_per_val
-    print(f"   原始 JPEG 224x224: ~30 KB")
-    print(f"   量化特征: {transmission_bytes / 1024:.2f} KB")
-    print(f"   压缩比: {30 * 1024 / transmission_bytes:.1f}x" if transmission_bytes < 30 * 1024 else f"   大于原图 {transmission_bytes / 1024 / 30:.1f}x")
+    num_tokens = edge_features.shape[1]  # 49 tokens (7x7)
+    
+    # 测量实际 JPEG 大小 (resize 到 224x224 后)
+    import io
+    if args.image and not args.dummy:
+        img_resized = Image.open(args.image).convert('RGB')
+        img_resized = img_resized.resize((224, 224), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        img_resized.save(buffer, format='JPEG', quality=85)
+        jpeg_bytes = buffer.tell()
+        print(f"   原始 JPEG (224×224, Q85): {jpeg_bytes / 1024:.2f} KB")
+    else:
+        jpeg_bytes = 30 * 1024  # fallback
+        print(f"   原始 JPEG 224×224: ~{jpeg_bytes / 1024:.0f} KB (估计)")
+    
+    print(f"   端侧特征 ({num_tokens} tokens, {args.quantize}): {transmission_bytes / 1024:.2f} KB")
+    if transmission_bytes < jpeg_bytes:
+        print(f"   压缩比: {jpeg_bytes / transmission_bytes:.1f}x")
+    else:
+        print(f"   大于原图: {transmission_bytes / jpeg_bytes:.1f}x")
     
     # 完整推理 (可选)
     if args.full_inference:

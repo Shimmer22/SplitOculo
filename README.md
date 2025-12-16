@@ -55,15 +55,15 @@ pip install -r requirements.txt
 
 **Step 1: Pre-compute Qwen features (supports intermediate layers)**
 ```bash
-# Extract Layer 8 features (shallow, easier to learn)
+# Extract Layer 4 features (shallow, easier to learn)
 python scripts/precompute_qwen_features.py \
     --data_dir ./data/imagenette2-320 \
-    --layer 8 \
+    --layer 4 \
     --split train
 
 python scripts/precompute_qwen_features.py \
     --data_dir ./data/imagenette2-320 \
-    --layer 8 \
+    --layer 4 \
     --split val
 ```
 
@@ -77,22 +77,27 @@ python scripts/train_with_precomputed.py \
 
 ### 3. Inference
 
+> **⚠️ Important**: The `--split_layer` parameter in inference must match the `--layer` used during feature precomputation!
+
 ```bash
 # Edge-side encoding only (fast, no Qwen needed)
 python scripts/infer_hybrid.py \
     --checkpoint checkpoints/qwen_precomputed/best_model.pth \
     --image photo.jpg
 
-# With int8 quantization for smaller transmission
-python scripts/infer_hybrid.py \
-    --checkpoint checkpoints/qwen_precomputed/best_model.pth \
-    --image photo.jpg \
-    --quantize int8
-
 # Full hybrid inference (edge CNN + cloud Qwen deep layers)
 python scripts/infer_hybrid.py \
     --checkpoint checkpoints/qwen_precomputed/best_model.pth \
     --image photo.jpg \
+    --split_layer 4 \
+    --full_inference
+
+# With int8 quantization for smaller transmission
+python scripts/infer_hybrid.py \
+    --checkpoint checkpoints/qwen_precomputed/best_model.pth \
+    --image photo.jpg \
+    --split_layer 4 \
+    --quantize int8 \
     --full_inference
 ```
 
@@ -100,10 +105,10 @@ python scripts/infer_hybrid.py \
 
 ## 📐 Architecture
 
-### Shallow Layer Alignment (Layer 8)
+### Shallow Layer Alignment (Layer 4)
 
 ```
-Qwen ViT Layer 8 (1280 dim) ────────┐
+Qwen ViT Layer 4 (1280 dim) ────────┐
     [Offline Precomputed]            │
                                      │──→  MSE + Cosine Loss
 CNN (96ch) ──→ Projector (1280 dim) ─┘
@@ -114,11 +119,11 @@ CNN (96ch) ──→ Projector (1280 dim) ─┘
 
 ```
          ┌─────────────────────────────────────────────────────┐
-Edge:    │ Image → CNN → Projector → features (1280 dim, int8) │
+Edge:    │ Image → CNN → Projector → 49 tokens (7×7, 1280 dim) │
          └─────────────────────┬───────────────────────────────┘
-                               │ ~61 KB transmission
+                               │ ~61 KB (int8) transmission
          ┌─────────────────────▼───────────────────────────────┐
-Cloud:   │ features → Qwen Blocks[8:] → Merger → LLM → Response │
+Cloud:   │ Upsample 49→256 → Scale → Qwen[4:] → Merger → LLM   │
          └─────────────────────────────────────────────────────┘
 ```
 
@@ -126,10 +131,34 @@ Cloud:   │ features → Qwen Blocks[8:] → Merger → LLM → Response │
 
 ## 📊 Training Results
 
-| Target | Val Cos Sim | Val MSE | Learnable? |
-|--------|-------------|---------|------------|
-| Layer 8 (1280) | **0.77** | 1.07 | ✅ Yes |
-| Merger (2048) | ~0.00 | ~4.8 | ❌ No |
+| Target | Val Cos Sim | Val MSE | Status |
+|--------|-------------|---------|--------|
+| Layer 4 (1280) | **0.86** | 0.63 | ✅ Working |
+| Layer 8 (1280) | ~0.77 | 1.07 | ✅ Learnable |
+| Merger (2048) | ~0.00 | ~4.8 | ❌ Too Hard |
+
+### Transmission Size Analysis
+
+| Format | Size | Notes |
+|--------|------|-------|
+| JPEG 224×224 (Q85) | ~13 KB | Baseline |
+| Edge features (int8) | ~61 KB | 49 tokens × 1280 dim |
+| Edge features (fp16) | ~123 KB | Higher precision |
+
+> Note: Current int8 features are larger than JPEG. Future work: add entropy coding or reduce token count.
+
+---
+
+## ⚠️ Known Issues
+
+### Layer Mismatch
+The `--split_layer` parameter in `infer_hybrid.py` must match the `--layer` used during `precompute_qwen_features.py`. A mismatch will cause incorrect outputs.
+
+### Feature Scale Mismatch
+The CNN Projector outputs features with a different scale than Qwen's intermediate layers. The inference script automatically scales features to match Qwen's expected distribution (std≈0.83, mean≈-0.017).
+
+### Token Upsampling (Cloud-side)
+CNN outputs 49 tokens (7×7 grid), but Qwen expects 256 tokens (16×16). Bilinear upsampling is performed **on the cloud side** to save transmission bandwidth.
 
 ---
 
@@ -153,7 +182,8 @@ Cloud:   │ features → Qwen Blocks[8:] → Merger → LLM → Response │
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--image` | - | Path to input image |
-| `--quantize` | int8 | none/fp16/int8 |
+| `--split_layer` | 4 | Must match training layer |
+| `--quantize` | none | none/fp16/int8 |
 | `--full_inference` | False | Run Qwen deep layers on cloud |
 
 ---

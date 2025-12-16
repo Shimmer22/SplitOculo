@@ -55,15 +55,15 @@ pip install -r requirements.txt
 
 **步骤 1：预计算 Qwen 特征（支持中间层）**
 ```bash
-# 提取第 8 层特征（浅层，易学习）
+# 提取第 4 层特征（浅层，易学习）
 python scripts/precompute_qwen_features.py \
     --data_dir ./data/imagenette2-320 \
-    --layer 8 \
+    --layer 4 \
     --split train
 
 python scripts/precompute_qwen_features.py \
     --data_dir ./data/imagenette2-320 \
-    --layer 8 \
+    --layer 4 \
     --split val
 ```
 
@@ -77,22 +77,27 @@ python scripts/train_with_precomputed.py \
 
 ### 3. 推理
 
+> **⚠️ 重要**：推理时 `--split_layer` 参数必须与预计算特征时的 `--layer` 一致！
+
 ```bash
 # 仅端侧编码（快速，无需 Qwen）
 python scripts/infer_hybrid.py \
     --checkpoint checkpoints/qwen_precomputed/best_model.pth \
     --image photo.jpg
 
-# 使用 int8 量化减少传输大小
-python scripts/infer_hybrid.py \
-    --checkpoint checkpoints/qwen_precomputed/best_model.pth \
-    --image photo.jpg \
-    --quantize int8
-
 # 完整混合推理（端侧 CNN + 云端 Qwen 深层）
 python scripts/infer_hybrid.py \
     --checkpoint checkpoints/qwen_precomputed/best_model.pth \
     --image photo.jpg \
+    --split_layer 4 \
+    --full_inference
+
+# 使用 int8 量化减少传输大小
+python scripts/infer_hybrid.py \
+    --checkpoint checkpoints/qwen_precomputed/best_model.pth \
+    --image photo.jpg \
+    --split_layer 4 \
+    --quantize int8 \
     --full_inference
 ```
 
@@ -100,10 +105,10 @@ python scripts/infer_hybrid.py \
 
 ## 📐 架构
 
-### 浅层对齐（Layer 8）
+### 浅层对齐（Layer 4）
 
 ```
-Qwen ViT 第8层 (1280 维) ────────────┐
+Qwen ViT 第4层 (1280 维) ────────────┐
     [离线预计算]                      │
                                      │──→  MSE + Cosine Loss
 CNN (96通道) ──→ Projector (1280 维) ─┘
@@ -114,11 +119,11 @@ CNN (96通道) ──→ Projector (1280 维) ─┘
 
 ```
          ┌─────────────────────────────────────────────────────┐
-端侧:    │ 图像 → CNN → Projector → 特征 (1280 维, int8)        │
+端侧:    │ 图像 → CNN → Projector → 49 tokens (7×7, 1280 维)    │
          └─────────────────────┬───────────────────────────────┘
-                               │ ~61 KB 传输
+                               │ ~61 KB (int8) 传输
          ┌─────────────────────▼───────────────────────────────┐
-云端:    │ 特征 → Qwen Blocks[8:] → Merger → LLM → 回复         │
+云端:    │ 上采样 49→256 → 缩放 → Qwen[4:] → Merger → LLM       │
          └─────────────────────────────────────────────────────┘
 ```
 
@@ -126,10 +131,34 @@ CNN (96通道) ──→ Projector (1280 维) ─┘
 
 ## 📊 训练结果
 
-| 目标 | Val Cos Sim | Val MSE | 可学习？ |
-|------|-------------|---------|----------|
-| Layer 8 (1280) | **0.77** | 1.07 | ✅ 是 |
-| Merger (2048) | ~0.00 | ~4.8 | ❌ 否 |
+| 目标 | Val Cos Sim | Val MSE | 状态 |
+|------|-------------|---------|------|
+| Layer 4 (1280) | **0.86** | 0.63 | ✅ 可用 |
+| Layer 8 (1280) | ~0.77 | 1.07 | ✅ 可学习 |
+| Merger (2048) | ~0.00 | ~4.8 | ❌ 太难 |
+
+### 传输大小分析
+
+| 格式 | 大小 | 说明 |
+|------|------|------|
+| JPEG 224×224 (Q85) | ~13 KB | 基准 |
+| 端侧特征 (int8) | ~61 KB | 49 tokens × 1280 维 |
+| 端侧特征 (fp16) | ~123 KB | 更高精度 |
+
+> 注：当前 int8 特征大于 JPEG。未来工作：添加熵编码或减少 token 数量。
+
+---
+
+## ⚠️ 已知问题
+
+### 层不匹配
+`infer_hybrid.py` 中的 `--split_layer` 参数必须与 `precompute_qwen_features.py` 中的 `--layer` 一致。不匹配会导致输出错误。
+
+### 特征尺度不匹配
+CNN Projector 输出的特征尺度与 Qwen 中间层不同。推理脚本会自动缩放特征以匹配 Qwen 的期望分布（std≈0.83, mean≈-0.017）。
+
+### Token 上采样（云端执行）
+CNN 输出 49 个 tokens (7×7 网格)，但 Qwen 期望 256 个 tokens (16×16)。双线性上采样**在云端执行**以节省传输带宽。
 
 ---
 
@@ -153,7 +182,8 @@ CNN (96通道) ──→ Projector (1280 维) ─┘
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--image` | - | 输入图片路径 |
-| `--quantize` | int8 | none/fp16/int8 |
+| `--split_layer` | 4 | 必须与训练层一致 |
+| `--quantize` | none | none/fp16/int8 |
 | `--full_inference` | False | 在云端运行 Qwen 深层 |
 
 ---
