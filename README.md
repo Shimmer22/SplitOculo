@@ -31,21 +31,12 @@ SplitOculo/
 │   ├── precompute_qwen_features.py   # Pre-extract Qwen features
 │   ├── train_with_precomputed.py     # Train with Qwen features
 │   ├── infer.py                      # CLIP-aligned inference
-│   └── infer_qwen.py                 # Qwen-aligned inference
+│   ├── infer_qwen.py                 # Qwen-aligned inference
+│   └── infer_hybrid.py               # Hybrid CNN+Qwen inference
 │
 ├── core/                   # Core framework
-│   ├── framework.py        # BaseSplitModel, ExperimentRunner
-│   └── utils.py            # FLOPs counter, seed, logger
-│
 ├── models/                 # Model definitions
-│   ├── mobilenet_v2.py
-│   ├── mobile_vit.py
-│   ├── levit.py
-│   └── adapters.py         # Feature alignment adapters
-│
 ├── data/                   # Data utilities
-│   └── dataset.py          # ImageNet/Dummy loaders
-│
 ├── checkpoints/            # Training checkpoints
 └── results/                # Benchmark outputs
 ```
@@ -60,115 +51,110 @@ SplitOculo/
 pip install -r requirements.txt
 ```
 
-### 2. Run Benchmark
+### 2. Qwen2.5-VL Alignment (Recommended)
 
+**Step 1: Pre-compute Qwen features (supports intermediate layers)**
 ```bash
-python main_benchmark.py
-```
-
-### 3. CLIP Feature Distillation
-
-```bash
-# Quick test with dummy data
-python scripts/train_distill.py --dummy --epochs 5
-
-# Full training with ImageNet
-python scripts/train_distill.py \
-    --data_dir /path/to/imagenet \
-    --epochs 100 --batch_size 64
-```
-
-### 4. Qwen2.5-VL Alignment (Recommended for VLM)
-
-**Step 1: Pre-compute Qwen features (one-time, supports resume)**
-```bash
-# Extract features for all images
+# Extract Layer 8 features (shallow, easier to learn)
 python scripts/precompute_qwen_features.py \
     --data_dir ./data/imagenette2-320 \
-    --output_dir ./data/qwen_features \
+    --layer 8 \
     --split train
 
-# Or extract features of part of images
 python scripts/precompute_qwen_features.py \
     --data_dir ./data/imagenette2-320 \
-    --output_dir ./data/qwen_features \
+    --layer 8 \
     --split val
-
-# Resume from checkpoint if interrupted
-python scripts/precompute_qwen_features.py --resume ...
 ```
 
 **Step 2: Train with precomputed features**
 ```bash
 python scripts/train_with_precomputed.py \
     --features_dir ./data/qwen_features \
-    --data_dir ./data/imagenette2-320 \
-    --epochs 100 --batch_size 64
+    --target_hidden_size 1280 \
+    --epochs 100
 ```
 
-### 5. Inference
+### 3. Inference
 
 ```bash
-# CLIP-aligned inference
-python scripts/infer.py --checkpoint checkpoints/best_model.pth --image photo.jpg
+# Edge-side encoding only (fast, no Qwen needed)
+python scripts/infer_hybrid.py \
+    --checkpoint checkpoints/qwen_precomputed/best_model.pth \
+    --image photo.jpg
 
-# Qwen-aligned inference (edge-side visual encoding)
-python scripts/infer_qwen.py --checkpoint checkpoints/qwen_precomputed/best_model.pth --image photo.jpg
+# With int8 quantization for smaller transmission
+python scripts/infer_hybrid.py \
+    --checkpoint checkpoints/qwen_precomputed/best_model.pth \
+    --image photo.jpg \
+    --quantize int8
+
+# Full hybrid inference (edge CNN + cloud Qwen deep layers)
+python scripts/infer_hybrid.py \
+    --checkpoint checkpoints/qwen_precomputed/best_model.pth \
+    --image photo.jpg \
+    --full_inference
 ```
 
 ---
 
 ## 📐 Architecture
 
-### CLIP Distillation
+### Shallow Layer Alignment (Layer 8)
 
 ```
-Teacher (CLIP ViT)  ────────┐
-    [Frozen]                │
-                            │──→  MSE + Cosine Loss
-Student (MobileNetV2) ──→ Adapter ──┘
+Qwen ViT Layer 8 (1280 dim) ────────┐
+    [Offline Precomputed]            │
+                                     │──→  MSE + Cosine Loss
+CNN (96ch) ──→ Projector (1280 dim) ─┘
     [Trainable]
 ```
 
-### Qwen2.5-VL Alignment
+### Hybrid Inference Pipeline
 
 ```
-Qwen ViT+Merger (2048 dim) ─────────┐
-    [Offline Precomputed]           │
-                                    │──→  MSE + Cosine Loss
-CNN (96ch) ──→ LLMProjector (2048) ─┘
-    [Trainable]
+         ┌─────────────────────────────────────────────────────┐
+Edge:    │ Image → CNN → Projector → features (1280 dim, int8) │
+         └─────────────────────┬───────────────────────────────┘
+                               │ ~61 KB transmission
+         ┌─────────────────────▼───────────────────────────────┐
+Cloud:   │ features → Qwen Blocks[8:] → Merger → LLM → Response │
+         └─────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 📊 Supported Models
+## 📊 Training Results
 
-| Model | Params | GFLOPs | Usage |
-|-------|--------|--------|-------|
-| MobileNetV2 | 1.8M | 0.56 | Student backbone |
-| CLIP ViT-L/14 | 304M | 81.0 | CLIP teacher |
-| Qwen2.5-VL 3B | 3B | - | VLM teacher |
+| Target | Val Cos Sim | Val MSE | Learnable? |
+|--------|-------------|---------|------------|
+| Layer 8 (1280) | **0.77** | 1.07 | ✅ Yes |
+| Merger (2048) | ~0.00 | ~4.8 | ❌ No |
 
 ---
 
 ## 📝 Key Arguments
 
-### Precompute Features
+### Precompute
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--max_samples` | None | Limit samples (for testing) |
+| `--layer` | 8 | ViT layer (1-32, or -1 for merger) |
+| `--split` | train | train or val |
 | `--resume` | False | Resume from checkpoint |
-| `--split` | train | Which split to process |
 
 ### Training
 | Argument | Default | Description |
 |----------|---------|-------------|
+| `--target_hidden_size` | 1280 | Target dim (1280 for layer, 2048 for merger) |
 | `--epochs` | 100 | Training epochs |
 | `--batch_size` | 64 | Batch size |
-| `--lr` | 1e-4 | Learning rate |
-| `--cos_weight` | 0.5 | Cosine loss weight |
-| `--llm_hidden_size` | 2048 | Qwen LLM hidden size |
+
+### Inference
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--image` | - | Path to input image |
+| `--quantize` | int8 | none/fp16/int8 |
+| `--full_inference` | False | Run Qwen deep layers on cloud |
 
 ---
 

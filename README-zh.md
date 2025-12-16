@@ -31,21 +31,12 @@ SplitOculo/
 │   ├── precompute_qwen_features.py   # 预提取 Qwen 特征
 │   ├── train_with_precomputed.py     # 使用预计算特征训练
 │   ├── infer.py                      # CLIP 对齐推理
-│   └── infer_qwen.py                 # Qwen 对齐推理
+│   ├── infer_qwen.py                 # Qwen 对齐推理
+│   └── infer_hybrid.py               # 混合 CNN+Qwen 推理
 │
 ├── core/                   # 核心框架
-│   ├── framework.py        # BaseSplitModel, ExperimentRunner
-│   └── utils.py            # FLOPs 计算, 随机种子, 日志
-│
 ├── models/                 # 模型定义
-│   ├── mobilenet_v2.py
-│   ├── mobile_vit.py
-│   ├── levit.py
-│   └── adapters.py         # 特征对齐适配器
-│
 ├── data/                   # 数据工具
-│   └── dataset.py          # ImageNet/虚拟数据加载器
-│
 ├── checkpoints/            # 训练检查点
 └── results/                # 评估输出
 ```
@@ -60,115 +51,110 @@ SplitOculo/
 pip install -r requirements.txt
 ```
 
-### 2. 运行性能评估
+### 2. Qwen2.5-VL 对齐（推荐）
 
+**步骤 1：预计算 Qwen 特征（支持中间层）**
 ```bash
-python main_benchmark.py
-```
-
-### 3. CLIP 特征蒸馏
-
-```bash
-# 使用假数据快速测试
-python scripts/train_distill.py --dummy --epochs 5
-
-# 使用 ImageNet 完整训练
-python scripts/train_distill.py \
-    --data_dir /path/to/imagenet \
-    --epochs 100 --batch_size 64
-```
-
-### 4. Qwen2.5-VL 对齐（推荐用于 VLM）
-
-**步骤 1：预计算 Qwen 特征（一次性，支持断点续传）**
-```bash
-# 提取所有图片的特征
+# 提取第 8 层特征（浅层，易学习）
 python scripts/precompute_qwen_features.py \
     --data_dir ./data/imagenette2-320 \
-    --output_dir ./data/qwen_features \
+    --layer 8 \
     --split train
 
-# 或者是提取部分图片的特征
 python scripts/precompute_qwen_features.py \
     --data_dir ./data/imagenette2-320 \
-    --output_dir ./data/qwen_features \
+    --layer 8 \
     --split val
-
-# 断点续传
-python scripts/precompute_qwen_features.py --resume ...
 ```
 
 **步骤 2：使用预计算特征训练**
 ```bash
 python scripts/train_with_precomputed.py \
     --features_dir ./data/qwen_features \
-    --data_dir ./data/imagenette2-320 \
-    --epochs 100 --batch_size 64
+    --target_hidden_size 1280 \
+    --epochs 100
 ```
 
-### 5. 推理
+### 3. 推理
 
 ```bash
-# CLIP 对齐推理
-python scripts/infer.py --checkpoint checkpoints/best_model.pth --image photo.jpg
+# 仅端侧编码（快速，无需 Qwen）
+python scripts/infer_hybrid.py \
+    --checkpoint checkpoints/qwen_precomputed/best_model.pth \
+    --image photo.jpg
 
-# Qwen 对齐推理（端侧视觉编码）
-python scripts/infer_qwen.py --checkpoint checkpoints/qwen_precomputed/best_model.pth --image photo.jpg
+# 使用 int8 量化减少传输大小
+python scripts/infer_hybrid.py \
+    --checkpoint checkpoints/qwen_precomputed/best_model.pth \
+    --image photo.jpg \
+    --quantize int8
+
+# 完整混合推理（端侧 CNN + 云端 Qwen 深层）
+python scripts/infer_hybrid.py \
+    --checkpoint checkpoints/qwen_precomputed/best_model.pth \
+    --image photo.jpg \
+    --full_inference
 ```
 
 ---
 
 ## 📐 架构
 
-### CLIP 蒸馏
+### 浅层对齐（Layer 8）
 
 ```
-Teacher (CLIP ViT)  ────────┐
-    [冻结]                   │
-                            │──→  MSE + Cosine Loss
-Student (MobileNetV2) ──→ Adapter ──┘
+Qwen ViT 第8层 (1280 维) ────────────┐
+    [离线预计算]                      │
+                                     │──→  MSE + Cosine Loss
+CNN (96通道) ──→ Projector (1280 维) ─┘
     [可训练]
 ```
 
-### Qwen2.5-VL 对齐
+### 混合推理流水线
 
 ```
-Qwen ViT+Merger (2048 维) ──────────┐
-    [离线预计算]                     │
-                                    │──→  MSE + Cosine Loss
-CNN (96通道) ──→ LLMProjector (2048) ─┘
-    [可训练]
+         ┌─────────────────────────────────────────────────────┐
+端侧:    │ 图像 → CNN → Projector → 特征 (1280 维, int8)        │
+         └─────────────────────┬───────────────────────────────┘
+                               │ ~61 KB 传输
+         ┌─────────────────────▼───────────────────────────────┐
+云端:    │ 特征 → Qwen Blocks[8:] → Merger → LLM → 回复         │
+         └─────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 📊 支持的模型
+## 📊 训练结果
 
-| 模型 | 参数量 | GFLOPs | 用途 |
-|------|--------|--------|------|
-| MobileNetV2 | 1.8M | 0.56 | Student 骨干网络 |
-| CLIP ViT-L/14 | 304M | 81.0 | CLIP Teacher |
-| Qwen2.5-VL 3B | 3B | - | VLM Teacher |
+| 目标 | Val Cos Sim | Val MSE | 可学习？ |
+|------|-------------|---------|----------|
+| Layer 8 (1280) | **0.77** | 1.07 | ✅ 是 |
+| Merger (2048) | ~0.00 | ~4.8 | ❌ 否 |
 
 ---
 
 ## 📝 关键参数
 
-### 预计算特征
+### 预计算
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--max_samples` | None | 限制样本数（测试用） |
+| `--layer` | 8 | ViT 层 (1-32, 或 -1 表示 merger) |
+| `--split` | train | train 或 val |
 | `--resume` | False | 断点续传 |
-| `--split` | train | 处理哪个数据集分割 |
 
 ### 训练
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
+| `--target_hidden_size` | 1280 | 目标维度 (1280 中间层, 2048 merger) |
 | `--epochs` | 100 | 训练轮数 |
 | `--batch_size` | 64 | 批大小 |
-| `--lr` | 1e-4 | 学习率 |
-| `--cos_weight` | 0.5 | Cosine 损失权重 |
-| `--llm_hidden_size` | 2048 | Qwen LLM 隐藏维度 |
+
+### 推理
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--image` | - | 输入图片路径 |
+| `--quantize` | int8 | none/fp16/int8 |
+| `--full_inference` | False | 在云端运行 Qwen 深层 |
 
 ---
 
