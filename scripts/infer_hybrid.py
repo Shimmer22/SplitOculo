@@ -425,32 +425,54 @@ def generate_with_visual_tokens(model, processor, visual_tokens, prompt, device)
     """
     使用视觉 tokens 生成文本回复
     
-    这是一个简化版本，直接将视觉 tokens 嵌入到模型中
+    正确的注入方式：替换 <|image_pad|> 占位符，而不是简单拼接
     """
-    # 准备文本输入
+    num_visual_tokens = visual_tokens.shape[1]  # 例如 64 或 165
+    
+    # 构造包含图像占位符的消息
+    # 使用 <|vision_start|><|image_pad|>×N<|vision_end|> 格式
+    image_placeholder = "<|vision_start|>" + "<|image_pad|>" * num_visual_tokens + "<|vision_end|>"
+    
     messages = [
-        {"role": "user", "content": prompt}
+        {"role": "user", "content": image_placeholder + prompt}
     ]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    # Tokenize
     text_inputs = processor.tokenizer(text, return_tensors="pt", padding=True)
     input_ids = text_inputs["input_ids"].to(device)
     attention_mask = text_inputs["attention_mask"].to(device)
     
     # 获取文本 embeddings
     embed_layer = model.get_input_embeddings()
-    text_embeds = embed_layer(input_ids)
+    inputs_embeds = embed_layer(input_ids)
     
-    # 找到图像 token 位置并插入视觉 tokens
-    # Qwen 使用特殊 token 标记图像位置
-    # 简化：将视觉 tokens 插入到文本开头
-    visual_tokens = visual_tokens.to(text_embeds.dtype)
+    # 找到 image_pad token 的位置并替换
+    image_token_id = model.config.image_token_id  # 151655
+    image_mask = (input_ids == image_token_id)
     
-    # 拼接: [视觉 tokens] + [文本 embeddings]
-    inputs_embeds = torch.cat([visual_tokens, text_embeds], dim=1)
+    # 确保 visual_tokens 数量匹配
+    num_placeholders = image_mask.sum().item()
+    if num_placeholders != num_visual_tokens:
+        print(f"   ⚠️ Token 数量不匹配: 占位符 {num_placeholders} vs 视觉 {num_visual_tokens}")
+        # 调整 visual_tokens 大小
+        if num_visual_tokens < num_placeholders:
+            # 重复最后一个 token
+            pad = visual_tokens[:, -1:, :].repeat(1, num_placeholders - num_visual_tokens, 1)
+            visual_tokens = torch.cat([visual_tokens, pad], dim=1)
+        else:
+            # 截断
+            visual_tokens = visual_tokens[:, :num_placeholders, :]
     
-    # 更新 attention mask
-    visual_mask = torch.ones(visual_tokens.shape[:2], device=device, dtype=attention_mask.dtype)
-    attention_mask = torch.cat([visual_mask, attention_mask], dim=1)
+    # 替换 image_pad embeddings 为 visual_tokens
+    visual_tokens = visual_tokens.to(inputs_embeds.dtype)
+    
+    # 找到所有 image_pad 位置的索引
+    batch_indices, token_indices = torch.where(image_mask)
+    
+    # 替换
+    for i, (b, t) in enumerate(zip(batch_indices, token_indices)):
+        inputs_embeds[b, t] = visual_tokens[b, i % visual_tokens.shape[1]]
     
     # 生成
     with torch.no_grad():
@@ -458,17 +480,18 @@ def generate_with_visual_tokens(model, processor, visual_tokens, prompt, device)
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             max_new_tokens=256,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
+            do_sample=False,  # 使用 greedy 更稳定
             pad_token_id=processor.tokenizer.pad_token_id,
             eos_token_id=processor.tokenizer.eos_token_id,
         )
     
-    # 解码生成的 tokens
-    # 注意: 当使用 inputs_embeds 时, generate 输出的是完整序列
-    # 需要跳过 prompt 部分的 tokens (但这些不在输出中,因为 inputs_embeds 不是 token ids)
+    # 解码
     response = processor.tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    # 只返回回复部分（去掉 prompt）
+    # 查找 assistant 标记后的内容
+    if "assistant" in response.lower():
+        response = response.split("assistant")[-1].strip()
     
     return response
 
