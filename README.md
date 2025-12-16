@@ -88,6 +88,7 @@ python scripts/precompute_qwen_features.py \
     --output_dir ./data/qwen_features \
     --split train
 
+# Or extract features of part of images
 python scripts/precompute_qwen_features.py \
     --data_dir ./data/imagenette2-320 \
     --output_dir ./data/qwen_features \
@@ -97,7 +98,7 @@ python scripts/precompute_qwen_features.py \
 python scripts/precompute_qwen_features.py --resume ...
 ```
 
-**Step 2: Train with precomputed features (10-50x faster)**
+**Step 2: Train with precomputed features**
 ```bash
 python scripts/train_with_precomputed.py \
     --features_dir ./data/qwen_features \

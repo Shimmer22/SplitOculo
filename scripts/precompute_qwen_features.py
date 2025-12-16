@@ -26,13 +26,33 @@ from torchvision import transforms
 
 
 class QwenFeatureExtractor:
-    """Qwen2.5-VL 视觉特征提取器"""
+    """
+    Qwen2.5-VL 视觉特征提取器
     
-    def __init__(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct", device='cuda'):
+    支持提取中间层特征（浅层更容易被 CNN 学习）
+    
+    Qwen ViT 结构:
+        patch_embed → [Block 0-31] → merger
+                        ↑
+                    可在任意层提取
+    """
+    
+    def __init__(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct", device='cuda', 
+                 extract_layer=8):
+        """
+        Args:
+            extract_layer: 提取哪一层的输出 (1-32)
+                - 8: 浅层，容易学习 (默认推荐)
+                - 16: 中层
+                - 32: 深层 (原始行为，等同于 merger 输入)
+                - -1: 最终 merger 输出 (2048 dim，非常难)
+        """
         self.model_name = model_name
         self.device = device
+        self.extract_layer = extract_layer
         self.model = None
         self.processor = None
+        self.total_layers = 32  # Qwen 3B 有 32 层
         
     def load(self):
         """加载 Qwen 模型"""
@@ -56,18 +76,24 @@ class QwenFeatureExtractor:
             param.requires_grad = False
         self.model.eval()
         
-        print("✅ Model loaded")
+        # 获取实际层数
+        self.total_layers = len(self.model.visual.blocks)
+        print(f"✅ Model loaded (ViT has {self.total_layers} layers)")
+        print(f"📍 Will extract from layer {self.extract_layer}")
+        
         return self
     
     @torch.no_grad()
     def extract_features(self, pil_image):
         """
-        提取单张图像的视觉特征
+        提取指定层的视觉特征
         
         Args:
             pil_image: PIL.Image 对象
         Returns:
             features: (num_tokens, hidden_size) tensor
+                - 中间层: hidden_size = 1280
+                - merger 输出: hidden_size = 2048
         """
         # 构造消息
         messages = [{
@@ -86,13 +112,94 @@ class QwenFeatureExtractor:
         pixel_values = inputs["pixel_values"].to(self.device)
         grid_thw = inputs["image_grid_thw"].to(self.device)
         
-        # 提取视觉特征
-        hidden_states = self.model.visual(
-            pixel_values.to(self.model.visual.patch_embed.proj.weight.dtype),
-            grid_thw=grid_thw
-        )
+        if self.extract_layer == -1:
+            # 提取最终 merger 输出 (原始行为)
+            hidden_states = self.model.visual(
+                pixel_values.to(self.model.visual.patch_embed.proj.weight.dtype),
+                grid_thw=grid_thw
+            )
+        else:
+            # 提取中间层
+            hidden_states = self._extract_intermediate_layer(
+                pixel_values.to(self.model.visual.patch_embed.proj.weight.dtype),
+                grid_thw=grid_thw
+            )
         
-        return hidden_states.cpu()  # (num_tokens, hidden_size)
+        return hidden_states.cpu()
+    
+    def _extract_intermediate_layer(self, pixel_values, grid_thw):
+        """
+        手动执行 forward 并在指定层停止
+        
+        完全匹配 Qwen2_5_VisionTransformerPretrainedModel.forward() 实现
+        """
+        import torch.nn.functional as F
+        
+        visual = self.model.visual
+        
+        # 1. Patch embedding
+        hidden_states = visual.patch_embed(pixel_values)
+        
+        # 2. Rotary position embedding
+        rotary_pos_emb = visual.rot_pos_emb(grid_thw)
+        
+        # 3. Window indexing (关键步骤)
+        window_index, cu_window_seqlens = visual.get_window_index(grid_thw)
+        cu_window_seqlens = torch.tensor(
+            cu_window_seqlens,
+            device=hidden_states.device,
+            dtype=torch.int32,
+        )
+        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+        
+        # 4. 重排 hidden_states
+        seq_len, _ = hidden_states.size()
+        hidden_states = hidden_states.reshape(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
+        hidden_states = hidden_states[window_index, :, :]
+        hidden_states = hidden_states.reshape(seq_len, -1)
+        
+        # 5. 重排 rotary_pos_emb 并创建 position_embeddings
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
+        rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+        
+        # 6. cu_seqlens
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], 
+            grid_thw[:, 0]
+        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        
+        # 7. 逐层执行 blocks
+        for layer_num, blk in enumerate(visual.blocks):
+            # 选择正确的 cu_seqlens
+            if layer_num in visual.fullatt_block_indexes:
+                cu_seqlens_now = cu_seqlens
+            else:
+                cu_seqlens_now = cu_window_seqlens
+            
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
+            )
+            
+            # 在指定层停止
+            if layer_num == self.extract_layer - 1:
+                break
+        
+        # 需要反转 window indexing 以恢复原始顺序
+        reverse_indices = torch.argsort(window_index)
+        hidden_states = hidden_states.view(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
+        hidden_states = hidden_states[reverse_indices, :, :]
+        hidden_states = hidden_states.view(seq_len, -1)
+        
+        return hidden_states  # (num_tokens, 1280)
+
+
+
 
 
 def get_image_paths(data_dir, split='train'):
@@ -153,6 +260,8 @@ def main():
     # 模型参数
     parser.add_argument('--qwen_model', type=str, default='Qwen/Qwen2.5-VL-3B-Instruct',
                         help='Qwen model name')
+    parser.add_argument('--layer', type=int, default=8,
+                        help='Which ViT layer to extract (1-32, default 8 for shallow, -1 for merger output)')
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -195,7 +304,8 @@ def main():
     # 加载模型
     extractor = QwenFeatureExtractor(
         model_name=args.qwen_model,
-        device=args.device
+        device=args.device,
+        extract_layer=args.layer
     ).load()
     
     # 预处理 transform (只做基本的 resize)
@@ -251,10 +361,12 @@ def main():
     save_checkpoint(checkpoint_path, processed_list, -1)
     
     # 保存元数据
+    hidden_size = 2048 if args.layer == -1 else 1280  # merger output vs intermediate
     metadata = {
         'total_processed': len(processed_list),
         'total_errors': len(errors),
-        'hidden_size': 2048,  # Qwen 3B hidden size
+        'hidden_size': hidden_size,
+        'extract_layer': args.layer,
         'split': args.split,
         'data_dir': str(args.data_dir),
         'qwen_model': args.qwen_model

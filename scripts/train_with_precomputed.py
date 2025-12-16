@@ -171,7 +171,7 @@ class PrecomputedTrainer:
         # Projector
         self.projector = LLMProjector(
             in_channels=self.student_channels,
-            llm_hidden_size=self.args.llm_hidden_size,
+            llm_hidden_size=self.args.target_hidden_size,
             hidden_channels=self.args.projector_hidden,
             downsample_ratio=self.args.downsample_ratio
         ).to(self.device)
@@ -344,7 +344,8 @@ def main():
     # Student 参数
     parser.add_argument('--student_model', type=str, default='mobilenetv2_100')
     parser.add_argument('--student_layer', type=int, default=3)
-    parser.add_argument('--llm_hidden_size', type=int, default=2048)
+    parser.add_argument('--target_hidden_size', type=int, default=1280,
+                        help='Target hidden size (1280 for intermediate layers, 2048 for merger)')
     parser.add_argument('--projector_hidden', type=int, default=512)
     parser.add_argument('--downsample_ratio', type=int, default=2)
     

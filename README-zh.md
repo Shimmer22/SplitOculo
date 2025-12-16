@@ -88,6 +88,7 @@ python scripts/precompute_qwen_features.py \
     --output_dir ./data/qwen_features \
     --split train
 
+# 或者是提取部分图片的特征
 python scripts/precompute_qwen_features.py \
     --data_dir ./data/imagenette2-320 \
     --output_dir ./data/qwen_features \
@@ -97,7 +98,7 @@ python scripts/precompute_qwen_features.py \
 python scripts/precompute_qwen_features.py --resume ...
 ```
 
-**步骤 2：使用预计算特征训练（快 10-50 倍）**
+**步骤 2：使用预计算特征训练**
 ```bash
 python scripts/train_with_precomputed.py \
     --features_dir ./data/qwen_features \
