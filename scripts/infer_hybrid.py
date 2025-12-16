@@ -179,47 +179,107 @@ class HybridQwenVLM:
         云端完成剩余视觉编码
         
         Args:
-            edge_features: (B, num_tokens, 1280) 端侧输出
+            edge_features: (B, num_tokens, 1280) 端侧输出 (来自 CNN, 通常是 7x7=49 tokens)
             grid_thw: grid 信息 (可选)
         Returns:
             visual_tokens: (B, merged_tokens, 2048) 可送入 LLM
         """
+        import torch.nn.functional as F
+        
         if self.qwen_model is None:
             raise RuntimeError("请先调用 load_qwen()")
         
         visual = self.qwen_model.visual
+        B = edge_features.shape[0]
+        num_tokens = edge_features.shape[1]
+        cnn_h = cnn_w = int(num_tokens ** 0.5)  # 7x7 = 49
         
-        # 如果没有 grid_thw，从 224x224 图像推断
-        if grid_thw is None:
-            # 224/14 = 16 patches per dim, t=1 for static image
-            B = edge_features.shape[0]
-            grid_thw = torch.tensor([[1, 16, 16]] * B, dtype=torch.long).to(self.device)
+        # Qwen ViT 使用 224/14 = 16x16 = 256 tokens
+        target_h = target_w = 16
+        target_tokens = target_h * target_w  # 256
+        
+        # 上采样 CNN 特征以匹配 Qwen 的 token 网格
+        # (B, 49, 1280) -> (B, 1280, 7, 7) -> upsample -> (B, 1280, 16, 16) -> (B, 256, 1280)
+        edge_features_2d = edge_features.view(B, cnn_h, cnn_w, -1).permute(0, 3, 1, 2)  # (B, 1280, 7, 7)
+        edge_features_upsampled = F.interpolate(
+            edge_features_2d, 
+            size=(target_h, target_w), 
+            mode='bilinear', 
+            align_corners=False
+        )  # (B, 1280, 16, 16)
+        edge_features = edge_features_upsampled.permute(0, 2, 3, 1).view(B, target_tokens, -1)  # (B, 256, 1280)
+        
+        print(f"   上采样: {cnn_h}x{cnn_w} -> {target_h}x{target_w} tokens")
+        
+        # 处理 edge_features 形状: (B, num_tokens, hidden) -> (total_tokens, hidden)
+        edge_features = edge_features.view(-1, edge_features.shape[-1])  # (256, 1280)
+        
+        # 使用固定的 grid_thw
+        grid_thw = torch.tensor([[1, target_h, target_w]] * B, dtype=torch.long).to(self.device)
         
         # Rotary position embedding
         rotary_pos_emb = visual.rot_pos_emb(grid_thw)
+        
+        # Window indexing
+        window_index, cu_window_seqlens = visual.get_window_index(grid_thw)
+        cu_window_seqlens = torch.tensor(
+            cu_window_seqlens,
+            device=edge_features.device,
+            dtype=torch.int32,
+        )
+        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+        
+        # 重排 hidden_states 以匹配 window indexing
+        seq_len = edge_features.shape[0]
+        hidden_states = edge_features.view(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
+        hidden_states = hidden_states[window_index, :, :]
+        hidden_states = hidden_states.reshape(seq_len, -1)
+        
+        # 重排 rotary_pos_emb 并创建 position_embeddings
+        rotary_pos_emb = rotary_pos_emb.view(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
+        rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+        rotary_pos_emb = rotary_pos_emb.view(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
         
         # cu_seqlens
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2],
             grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0), value=0)
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        
+        # 转换数据类型
+        hidden_states = hidden_states.to(visual.blocks[0].attn.qkv.weight.dtype)
         
         # 继续执行剩余的 blocks
-        hidden_states = edge_features.to(visual.blocks[0].attn.qkv.weight.dtype)
-        
         for i, block in enumerate(visual.blocks):
             if i < self.split_layer:
                 continue  # 跳过前 N 层 (已由 CNN 替代)
             
+            # 选择正确的 cu_seqlens
+            if i in visual.fullatt_block_indexes:
+                cu_seqlens_now = cu_seqlens
+            else:
+                cu_seqlens_now = cu_window_seqlens
+            
             hidden_states = block(
                 hidden_states,
-                cu_seqlens=cu_seqlens,
-                rotary_pos_emb=rotary_pos_emb
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
             )
         
         # 通过 merger
+        # 需要先反转 window indexing
+        reverse_indices = torch.argsort(window_index)
+        hidden_states = hidden_states.view(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
+        hidden_states = hidden_states[reverse_indices, :, :]
+        hidden_states = hidden_states.reshape(seq_len, -1)
+        
         visual_tokens = visual.merger(hidden_states)
+        
+        # 恢复 batch 维度
+        visual_tokens = visual_tokens.view(B, -1, visual_tokens.shape[-1])
         
         return visual_tokens  # (B, merged_tokens, 2048)
     
