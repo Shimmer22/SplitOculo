@@ -91,31 +91,13 @@ python scripts/infer_hybrid.py \
     --image photo.jpg \
     --split_layer 4 \
     --full_inference
-
-# With int8 quantization for smaller transmission
-python scripts/infer_hybrid.py \
-    --checkpoint checkpoints/qwen_precomputed/best_model.pth \
-    --image photo.jpg \
-    --split_layer 4 \
-    --quantize int8 \
-    --full_inference
 ```
 
 ---
 
 ## 📐 Architecture
 
-### Shallow Layer Alignment (Layer 4)
-
-```
-Qwen ViT Layer 4 (1280 dim) ────────┐
-    [Offline Precomputed]            │
-                                     │──→  MSE + Cosine Loss
-CNN (96ch) ──→ Projector (1280 dim) ─┘
-    [Trainable]
-```
-
-### Hybrid Inference Pipeline
+### Current Architecture
 
 ```
          ┌─────────────────────────────────────────────────────┐
@@ -123,9 +105,45 @@ Edge:    │ Image → CNN → Projector → 49 tokens (7×7, 1280 dim) │
          └─────────────────────┬───────────────────────────────┘
                                │ ~61 KB (int8) transmission
          ┌─────────────────────▼───────────────────────────────┐
-Cloud:   │ Upsample 49→256 → Scale → Qwen[4:] → Merger → LLM   │
+Cloud:   │ Bilinear Upsample 49→256 → Qwen[4:] → Merger → LLM  │
          └─────────────────────────────────────────────────────┘
 ```
+
+### Projector Role
+
+The **Projector** is a lightweight CNN module that:
+1. Transforms CNN feature channels (96ch → 1280 dim)
+2. Downsamples spatial resolution (14×14 → 7×7) via AvgPool
+3. Converts to token sequence for Qwen compatibility
+
+**Current upsampling is parameter-free** (bilinear interpolation), which is the bottleneck (see experiments below).
+
+---
+
+## 🔬 Ablation Experiments
+
+We conducted systematic experiments to identify the semantic loss bottleneck:
+
+| Experiment | Input | Output | Result |
+|------------|-------|--------|--------|
+| A. Teacher 256 tokens (no downsample) | Qwen Layer 4 directly | "person wearing hat with feather" | ✅ Correct |
+| B. Precomputed .pt 256 tokens | From training data | "fishing net with fish" | ✅ Correct |
+| C. Teacher 256→49→256 (down+upsample) | Downsampled then upsampled | "textured fabric, diagonal stripes" | ❌ Wrong |
+| D. CNN 49 tokens + upsample | CNN output | "pixelated pattern" / "black" | ❌ Wrong |
+
+### Key Findings
+
+1. **Pipeline is correct**: Experiments A & B prove blocks[4:] + merger + LLM work correctly
+2. **Upsampling is the bottleneck**: Experiment C shows even teacher features lose semantics after 256→49→256
+3. **49 tokens insufficient**: 7×7 spatial resolution cannot preserve image semantics
+4. **CNN quality secondary**: The 0.86 cos_sim CNN isn't the main issue; upsampling is
+
+### Implication
+
+To fix semantic loss, we need:
+- **Option 1**: Transmit 256 tokens (larger bandwidth, ~320 KB int8)
+- **Option 2**: Train a **learnable upsampler** on cloud side (recommended)
+- **Option 3**: Reduce CNN downsampling to output 256 tokens directly
 
 ---
 
@@ -133,47 +151,36 @@ Cloud:   │ Upsample 49→256 → Scale → Qwen[4:] → Merger → LLM   │
 
 | Target | Val Cos Sim | Val MSE | Status |
 |--------|-------------|---------|--------|
-| Layer 4 (1280) | **0.86** | 0.63 | ⚠️ Pipeline works, semantic quality needs improvement |
+| Layer 4 (1280) | **0.86** | 0.63 | ⚠️ Training OK, upsampling bottleneck |
 | Layer 8 (1280) | ~0.77 | 1.07 | ✅ Learnable |
 | Merger (2048) | ~0.00 | ~4.8 | ❌ Too Hard |
 
-### Quality Analysis
-
-- **cos_sim=0.86**: Pipeline works, but **semantic information is lost**
-- **Required**: cos_sim > 0.95 for semantic correctness, or end-to-end fine-tuning
-- **Ground truth test**: Qwen Layer 4 features produce correct output, CNN features don't
-
-### Transmission Size Analysis
+### Transmission Size
 
 | Format | Size | Notes |
 |--------|------|-------|
 | JPEG 224×224 (Q85) | ~13 KB | Baseline |
-| Edge features (int8) | ~61 KB | 49 tokens × 1280 dim |
-| Edge features (fp16) | ~123 KB | Higher precision |
-
-> Note: Current int8 features are larger than JPEG. Future work: add entropy coding or reduce token count.
+| 49 tokens (int8) | ~61 KB | Current, semantic loss |
+| 256 tokens (int8) | ~320 KB | No semantic loss |
 
 ---
 
-## ⚠️ Known Issues
+## 🔮 Future Work: Learnable Upsampler
 
-### Feature Quality Gap
-Current training achieves 0.86 cosine similarity, which is **insufficient for semantic correctness**. The pipeline is verified to work correctly - when using Qwen's actual Layer 4 features, the LLM produces correct responses.
+A promising direction is training a **learnable upsampler** on the cloud side:
 
-**To improve quality, consider:**
-- Train with more diverse/larger datasets
-- Use deeper or wider CNN architecture
-- Try end-to-end fine-tuning of Qwen blocks[4:]
-- Target cos_sim > 0.95
+```
+         ┌─────────────────────────────────────────────────────┐
+Edge:    │ Image → CNN → Projector → 49 tokens (7×7, 1280 dim) │
+         └─────────────────────┬───────────────────────────────┘
+                               │ ~61 KB transmission
+         ┌─────────────────────▼───────────────────────────────┐
+Cloud:   │ Learned Upsampler 49→256 → Qwen[4:] → Merger → LLM  │
+         │     [Trainable]                                      │
+         └─────────────────────────────────────────────────────┘
+```
 
-### Layer Mismatch
-The `--split_layer` parameter in `infer_hybrid.py` must match the `--layer` used during `precompute_qwen_features.py`. A mismatch will cause incorrect outputs.
-
-### Feature Scale Mismatch
-The CNN Projector outputs features with a different scale than Qwen's intermediate layers. The inference script automatically scales features to match Qwen's expected distribution (std≈0.83, mean≈-0.017).
-
-### Token Upsampling (Cloud-side)
-CNN outputs 49 tokens (7×7 grid), but Qwen expects 256 tokens (16×16). Bilinear upsampling is performed **on the cloud side** to save transmission bandwidth.
+The upsampler can be trained end-to-end with frozen Qwen blocks or jointly.
 
 ---
 
@@ -184,7 +191,6 @@ CNN outputs 49 tokens (7×7 grid), but Qwen expects 256 tokens (16×16). Bilinea
 |----------|---------|-------------|
 | `--layer` | 8 | ViT layer (1-32, or -1 for merger) |
 | `--split` | train | train or val |
-| `--resume` | False | Resume from checkpoint |
 
 ### Training
 | Argument | Default | Description |
