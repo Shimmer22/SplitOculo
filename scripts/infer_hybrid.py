@@ -339,6 +339,8 @@ def main():
                         help='Quantization method for transmission')
     parser.add_argument('--full_inference', action='store_true',
                         help='Run complete inference including Qwen deep layers')
+    parser.add_argument('--prompt', type=str, default=None,
+                        help='Text prompt for LLM (default: 描述这张图片中的内容。)')
     args = parser.parse_args()
     
     device = torch.device(args.device)
@@ -401,10 +403,76 @@ def main():
         print(f"   视觉 tokens: {visual_tokens.shape}")
         print(f"   维度: {visual_tokens.shape[-1]} (应为 2048)")
         
-        return visual_tokens
+        # 生成文本回复
+        prompt = args.prompt if args.prompt else "描述这张图片中的内容。"
+        print(f"\n💬 生成回复 (prompt: {prompt})")
+        
+        response = generate_with_visual_tokens(
+            hybrid.qwen_model,
+            hybrid.processor,
+            visual_tokens,
+            prompt,
+            device
+        )
+        print(f"\n🤖 回复:\n{response}")
+        
+        return response
     
     return edge_features
 
 
+def generate_with_visual_tokens(model, processor, visual_tokens, prompt, device):
+    """
+    使用视觉 tokens 生成文本回复
+    
+    这是一个简化版本，直接将视觉 tokens 嵌入到模型中
+    """
+    # 准备文本输入
+    messages = [
+        {"role": "user", "content": prompt}
+    ]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    text_inputs = processor.tokenizer(text, return_tensors="pt", padding=True)
+    input_ids = text_inputs["input_ids"].to(device)
+    attention_mask = text_inputs["attention_mask"].to(device)
+    
+    # 获取文本 embeddings
+    embed_layer = model.get_input_embeddings()
+    text_embeds = embed_layer(input_ids)
+    
+    # 找到图像 token 位置并插入视觉 tokens
+    # Qwen 使用特殊 token 标记图像位置
+    # 简化：将视觉 tokens 插入到文本开头
+    visual_tokens = visual_tokens.to(text_embeds.dtype)
+    
+    # 拼接: [视觉 tokens] + [文本 embeddings]
+    inputs_embeds = torch.cat([visual_tokens, text_embeds], dim=1)
+    
+    # 更新 attention mask
+    visual_mask = torch.ones(visual_tokens.shape[:2], device=device, dtype=attention_mask.dtype)
+    attention_mask = torch.cat([visual_mask, attention_mask], dim=1)
+    
+    # 生成
+    with torch.no_grad():
+        outputs = model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            max_new_tokens=256,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            pad_token_id=processor.tokenizer.pad_token_id,
+            eos_token_id=processor.tokenizer.eos_token_id,
+        )
+    
+    # 解码生成的 tokens
+    # 注意: 当使用 inputs_embeds 时, generate 输出的是完整序列
+    # 需要跳过 prompt 部分的 tokens (但这些不在输出中,因为 inputs_embeds 不是 token ids)
+    response = processor.tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    return response
+
+
 if __name__ == '__main__':
     main()
+
