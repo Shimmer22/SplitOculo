@@ -133,9 +133,15 @@ Cloud:   │ Upsample 49→256 → Scale → Qwen[4:] → Merger → LLM   │
 
 | Target | Val Cos Sim | Val MSE | Status |
 |--------|-------------|---------|--------|
-| Layer 4 (1280) | **0.86** | 0.63 | ✅ Working |
+| Layer 4 (1280) | **0.86** | 0.63 | ⚠️ Pipeline works, semantic quality needs improvement |
 | Layer 8 (1280) | ~0.77 | 1.07 | ✅ Learnable |
 | Merger (2048) | ~0.00 | ~4.8 | ❌ Too Hard |
+
+### Quality Analysis
+
+- **cos_sim=0.86**: Pipeline works, but **semantic information is lost**
+- **Required**: cos_sim > 0.95 for semantic correctness, or end-to-end fine-tuning
+- **Ground truth test**: Qwen Layer 4 features produce correct output, CNN features don't
 
 ### Transmission Size Analysis
 
@@ -150,6 +156,15 @@ Cloud:   │ Upsample 49→256 → Scale → Qwen[4:] → Merger → LLM   │
 ---
 
 ## ⚠️ Known Issues
+
+### Feature Quality Gap
+Current training achieves 0.86 cosine similarity, which is **insufficient for semantic correctness**. The pipeline is verified to work correctly - when using Qwen's actual Layer 4 features, the LLM produces correct responses.
+
+**To improve quality, consider:**
+- Train with more diverse/larger datasets
+- Use deeper or wider CNN architecture
+- Try end-to-end fine-tuning of Qwen blocks[4:]
+- Target cos_sim > 0.95
 
 ### Layer Mismatch
 The `--split_layer` parameter in `infer_hybrid.py` must match the `--layer` used during `precompute_qwen_features.py`. A mismatch will cause incorrect outputs.
