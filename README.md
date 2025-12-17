@@ -1,7 +1,7 @@
 # SplitOculo
 
 <p align="center">
-  <b>Edge-Cloud Collaborative Vision Feature Splitting Framework for Smart Glasses</b>
+  <b>Edge-Cloud Collaborative Vision Feature Splitting for VLM</b>
 </p>
 
 <p align="center">
@@ -12,65 +12,113 @@
 
 ## 📖 Overview
 
-SplitOculo is a research framework for **edge-cloud collaborative computing** on smart glasses. It enables:
-
-- 🎓 **Feature Distillation**: Train CNN to approximate Qwen2.5-VL features
-- 🔗 **Learnable Upsampler**: Cloud-side upsampling for transmission efficiency
-- 📊 **Hybrid Inference**: Edge CNN + Cloud Qwen deep layers
+SplitOculo enables **edge-cloud collaborative VLM inference**:
+- 🖥️ **Edge**: CNN + Projector → 49 tokens (61 KB)
+- ☁️ **Cloud**: Learned Upsampler → 256 tokens → Qwen blocks → LLM
 
 ---
 
-## 🏗️ Project Structure
+## 🚀 Quick Start (Copy-Paste Commands)
 
-```
-SplitOculo/
-├── scripts/
-│   ├── precompute_qwen_features.py   # Pre-extract Qwen Layer 4 features
-│   ├── train_with_upsampler.py       # Train CNN + Projector + Upsampler
-│   ├── infer_hybrid.py               # Hybrid edge-cloud inference
-│   └── plot_training.py              # Visualize training curves
-│
-├── models/
-│   └── cloud_upsampler.py            # CloudUpsampler module
-│
-├── core/                   # Core utilities
-├── data/                   # Data utilities
-└── checkpoints/            # Training outputs
-```
-
----
-
-## 🚀 Quick Start
-
-### 1. Pre-compute Qwen Features (one-time)
+### Step 0: Setup Environment
 
 ```bash
-python scripts/precompute_qwen_features.py \
-    --data_dir ./data/imagenette2-320 \
-    --layer 4 --split train
+# Clone repo
+git clone https://github.com/Shimmer22/SplitOculo.git
+cd SplitOculo
 
-python scripts/precompute_qwen_features.py \
-    --data_dir ./data/imagenette2-320 \
-    --layer 4 --split val
+# Create conda env
+conda create -n cnn_vit python=3.10 -y
+conda activate cnn_vit
+
+# Install dependencies
+pip install torch torchvision transformers timm tqdm pillow matplotlib
 ```
 
-### 2. Train with Upsampler
+### Step 1: Download Dataset
+
+We recommend **COCO val2017** (5000 diverse images, ~1GB):
+
+```bash
+# Create data directory
+mkdir -p data/coco
+
+# Download COCO val2017 images
+wget http://images.cocodataset.org/zips/val2017.zip -P data/coco/
+unzip data/coco/val2017.zip -d data/coco/
+rm data/coco/val2017.zip
+
+# Create train/val splits (80/20)
+python -c "
+import os, shutil, random
+from pathlib import Path
+
+src = Path('data/coco/val2017')
+images = list(src.glob('*.jpg'))
+random.seed(42)
+random.shuffle(images)
+
+train_dir = Path('data/coco/train')
+val_dir = Path('data/coco/val')
+train_dir.mkdir(parents=True, exist_ok=True)
+val_dir.mkdir(parents=True, exist_ok=True)
+
+split = int(len(images) * 0.8)
+for img in images[:split]:
+    shutil.copy(img, train_dir / img.name)
+for img in images[split:]:
+    shutil.copy(img, val_dir / img.name)
+
+print(f'✅ Train: {split} images, Val: {len(images)-split} images')
+"
+```
+
+### Step 2: Precompute Qwen Features
+
+```bash
+# Precompute train features (takes ~30 min on GPU)
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco \
+    --output_dir ./data/qwen_features \
+    --layer 4 \
+    --split train \
+    --batch_size 4
+
+# Precompute val features
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco \
+    --output_dir ./data/qwen_features \
+    --layer 4 \
+    --split val \
+    --batch_size 4
+```
+
+### Step 3: Train with MLP Upsampler
 
 ```bash
 python scripts/train_with_upsampler.py \
     --features_dir ./data/qwen_features \
-    --data_dir ./data/imagenette2-320 \
+    --data_dir ./data/coco \
     --transmission_tokens 49 \
     --target_tokens 256 \
-    --epochs 100
+    --upsampler_method mlp \
+    --epochs 100 \
+    --batch_size 32 \
+    --output_dir ./checkpoints/coco_mlp
 ```
 
-### 3. Inference
+### Step 4: Visualize Training
+
+```bash
+python scripts/plot_training.py --log ./checkpoints/coco_mlp/train.log
+```
+
+### Step 5: Inference
 
 ```bash
 python scripts/infer_hybrid.py \
-    --checkpoint checkpoints/upsampler/best_model.pth \
-    --image photo.jpg \
+    --checkpoint ./checkpoints/coco_mlp/best_model.pth \
+    --image ./data/coco/val/000000000139.jpg \
     --full_inference
 ```
 
@@ -88,8 +136,8 @@ python scripts/infer_hybrid.py \
 ┌────────────────────────▼────────────────────────────────────┐
 │ CLOUD (云端)                                                 │
 ├─────────────────────────────────────────────────────────────┤
-│  Learned Upsampler → 256 tokens → Qwen[4:] → Merger → LLM   │
-│       [Trained]                                              │
+│  MLP Upsampler → 256 tokens → Qwen[4:] → Merger → LLM       │
+│    [Bilinear + MLP]                                          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -97,17 +145,11 @@ python scripts/infer_hybrid.py \
 
 ## 📊 Training Results
 
-| Metric | Value |
-|--------|-------|
-| Epochs | 50 |
-| Val Cos Sim | 0.8732 |
-| Transmission | 49 tokens (~61 KB) |
-
-### Visualize Training
-
-```bash
-python scripts/plot_training.py --log checkpoints/upsampler/train.log
-```
+| Dataset | Epochs | Val cos_sim | Upsampler |
+|---------|--------|-------------|-----------|
+| Imagenette | 50 | 0.87 | deconv |
+| Imagenette | 50 | **TBD** | mlp |
+| COCO | 100 | **TBD** | mlp |
 
 ---
 
@@ -117,18 +159,31 @@ python scripts/plot_training.py --log checkpoints/upsampler/train.log
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--transmission_tokens` | 49 | Tokens sent from edge (7×7) |
-| `--target_tokens` | 256 | Target tokens for Qwen (16×16) |
-| `--upsampler_method` | deconv | deconv/pixelshuffle/transformer |
-| `--student_model` | mobilenetv2_100 | CNN backbone (timm models) |
+| `--upsampler_method` | **mlp** | mlp (best) / deconv / transformer |
+| `--transmission_tokens` | 49 | Edge tokens (7×7) |
+| `--target_tokens` | 256 | Target for Qwen (16×16) |
+| `--student_model` | mobilenetv2_100 | CNN backbone |
+| `--epochs` | 100 | Training epochs |
 
 ### infer_hybrid.py
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--checkpoint` | - | Path to upsampler checkpoint |
+| `--checkpoint` | - | Path to trained model |
 | `--image` | - | Input image path |
 | `--full_inference` | False | Run complete Qwen inference |
+
+---
+
+## 🔬 Key Findings
+
+| Method | cos_sim | Semantics |
+|--------|---------|-----------|
+| Bilinear only | 0.87 | ❌ Wrong |
+| deconv + BN | 0.57 | ❌ Wrong |
+| **MLP (bilinear + mlp)** | **0.999** | ✅ Correct |
+
+**Root cause**: deconv + BatchNorm destroys information. Use `--upsampler_method mlp`.
 
 ---
 
