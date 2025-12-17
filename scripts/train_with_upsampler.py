@@ -381,8 +381,8 @@ def main():
                         help='目标 token 数量 (16x16=256, 需与 teacher 特征匹配)')
     
     # Upsampler 参数
-    parser.add_argument('--upsampler_method', type=str, default='deconv',
-                        choices=['deconv', 'pixelshuffle', 'transformer'])
+    parser.add_argument('--upsampler_method', type=str, default='mlp',
+                        choices=['mlp', 'deconv', 'pixelshuffle', 'transformer'])
     parser.add_argument('--upsampler_layers', type=int, default=2,
                         help='Upsampler 精炼层数')
     
