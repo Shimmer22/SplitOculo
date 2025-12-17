@@ -18,25 +18,36 @@ SplitOculo enables **edge-cloud collaborative VLM inference**:
 
 ---
 
-## ⚠️ Current Limitations
+## 🆕 v2.0 Update: TransformerUpsampler + GAN Training
+
+> [!TIP]
+> **v2.0 achieves cos_sim=0.89 with correct LLM outputs on training set images!**
+
+### What's New
+- **TransformerUpsampler**: 4-layer Transformer with learned positional embedding (67M params)
+- **GAN Training**: Adversarial training produces sharper features
+- **FeatureDiscriminator**: Spectral-normalized discriminator for stable GAN training
+
+### Training Results
+
+| Phase | cos_sim | val_std | LLM Output |
+|-------|---------|---------|------------|
+| Warmup (MSE only) | 0.891 | 0.748 | - |
+| **GAN Finetuning** | **0.893** | **0.768** | ✅ Correct on training images |
+
+### Current Limitations
 
 > [!CAUTION]
-> **Multi-image training does not generalize well.** Single-image overfitting achieves cos_sim=0.99 with correct semantics, but multi-image training plateaus at cos_sim=0.87 with wrong outputs.
+> **Generalization gap**: Works well on training set images, but **out-of-distribution images still produce incorrect outputs**.
 
-| Mode | cos_sim | LLM Output |
-|------|---------|------------|
-| **Single-image overfit** | 0.99 | ✅ "modern living room with TV, dining table, kitchen..." |
-| **Multi-image train** | 0.87 | ❌ "gradient background transitioning from light brown..." |
+| Image Source | LLM Output Quality |
+|--------------|-------------------|
+| Training set | ✅ Correct (e.g., "a bear", "kitchen scene with cabinets") |
+| OOD images | ❌ Often incorrect or generic |
 
-### Root Cause Analysis
-- 0.87 cos_sim is **insufficient** for semantic understanding
-- CNN features fundamentally differ from Qwen ViT features
-- Simple distillation cannot bridge this gap
-
-### Potential Solutions (TODO)
-1. End-to-end fine-tuning Qwen blocks
-2. More expressive upsampler architecture
-3. Task-driven training (VQA loss) instead of feature matching
+### Root Cause
+- CNN features fundamentally differ from ViT global attention patterns
+- 0.89 cos_sim is still insufficient for robust cross-domain generalization
 
 ---
 
@@ -99,39 +110,44 @@ python scripts/precompute_qwen_features.py \
     --layer 4 --split val --batch_size 4
 ```
 
-### Step 3: Train (or Debug with Overfit)
+### Step 3: Train with GAN (v2.0)
 
-**Normal training:**
+**Phase 1: Warmup (MSE only)**
 ```bash
-python scripts/train_with_upsampler.py \
+python scripts/train_gan.py \
     --features_dir ./data/qwen_features \
     --data_dir ./data/coco \
-    --upsampler_method mlp \
-    --epochs 100 --batch_size 32 \
-    --output_dir ./checkpoints/coco_mlp
+    --phase warmup \
+    --epochs 20 \
+    --batch_size 16 \
+    --output_dir ./checkpoints/gan_layer4
 ```
 
-**Single-image overfit debug (recommended first):**
+**Phase 2: GAN Finetuning**
 ```bash
-python scripts/train_with_upsampler.py \
+python scripts/train_gan.py \
     --features_dir ./data/qwen_features \
     --data_dir ./data/coco \
-    --overfit ./data/qwen_features/train/000000.pt \
-    --epochs 500
+    --phase gan \
+    --warmup_checkpoint ./checkpoints/gan_layer4/warmup_best.pth \
+    --epochs 50 \
+    --lambda_mse 10.0 \
+    --lambda_adv 0.1 \
+    --output_dir ./checkpoints/gan_layer4
 ```
 
 ### Step 4: Inference
 
 ```bash
 python scripts/infer_hybrid.py \
-    --checkpoint ./checkpoints/coco_mlp/best_model.pth \
-    --image ./data/coco/train/000000000139.jpg \
+    --checkpoint ./checkpoints/gan_layer4/gan_best.pth \
+    --image ./data/coco/train/000000000285.jpg \
     --full_inference
 ```
 
 ---
 
-## 📐 Architecture
+## 📐 Architecture (v2.0)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -141,7 +157,8 @@ python scripts/infer_hybrid.py \
                          │ ~61 KB int8
 ┌────────────────────────▼────────────────────────────────────┐
 │ CLOUD                                                        │
-│  MLP Upsampler → 256 tokens → Qwen[4:] → Merger → LLM       │
+│  TransformerUpsampler → 256 tokens → Qwen[4:] → LLM         │
+│  (Bilinear + 4-layer Transformer + Learned PosEmbed)        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -149,13 +166,10 @@ python scripts/infer_hybrid.py \
 
 ## 🔬 Key Findings
 
-| Method | cos_sim | Works? |
-|--------|---------|--------|
-| Bilinear only | 0.87 | ❌ |
-| deconv + BN | 0.57 | ❌ |
-| **MLP (bilinear + mlp)** | 0.99* | ✅* |
-
-*Only with single-image overfitting
+| Method | cos_sim | val_std | Works? |
+|--------|---------|---------|--------|
+| MLP (v1.0) | 0.87 | 0.74 | ❌ |
+| **TransformerUpsampler + GAN (v2.0)** | **0.89** | **0.77** | ✅ (training set) |
 
 ---
 
@@ -163,10 +177,11 @@ python scripts/infer_hybrid.py \
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--upsampler_method` | mlp | mlp / deconv / transformer |
-| `--overfit` | None | Path to .pt file for single-image debug |
-| `--transmission_tokens` | 49 | Edge tokens (7×7) |
-| `--epochs` | 100 | Training iterations |
+| `--upsampler_type` | transformer | transformer / mlp / deconv |
+| `--phase` | - | warmup (MSE) / gan (adversarial) |
+| `--lambda_mse` | 10.0 | MSE loss weight (content) |
+| `--lambda_adv` | 0.1 | Adversarial loss weight (style) |
+| `--transformer_layers` | 4 | TransformerUpsampler depth |
 
 ---
 

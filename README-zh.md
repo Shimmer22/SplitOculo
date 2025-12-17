@@ -18,25 +18,36 @@ SplitOculo 实现 **边端-云端协同 VLM 推理**：
 
 ---
 
-## ⚠️ 当前不足
+## 🆕 v2.0 更新: TransformerUpsampler + GAN 训练
+
+> [!TIP]
+> **v2.0 在训练集图片上达到 cos_sim=0.89，LLM 输出正确！**
+
+### 新特性
+- **TransformerUpsampler**: 4层 Transformer + Learned Position Embedding (67M 参数)
+- **GAN 训练**: 对抗训练生成更锐利的特征
+- **FeatureDiscriminator**: Spectral Norm 稳定 GAN 训练
+
+### 训练结果
+
+| 阶段 | cos_sim | val_std | LLM 输出 |
+|------|---------|---------|----------|
+| Warmup (仅 MSE) | 0.891 | 0.748 | - |
+| **GAN 微调** | **0.893** | **0.768** | ✅ 训练集图片正确 |
+
+### 当前不足
 
 > [!CAUTION]
-> **多图训练无法有效泛化。** 单图过拟合可达 cos_sim=0.99 且语义正确，但多图训练仅能达到 cos_sim=0.87，输出错误。
+> **泛化差距**: 训练集图片效果好，但**集合外图片仍输出错误**。
 
-| 模式 | cos_sim | LLM 输出 |
-|------|---------|----------|
-| **单图过拟合** | 0.99 | ✅ "modern living room with TV, dining table, kitchen..." |
-| **多图训练** | 0.87 | ❌ "gradient background transitioning from light brown..." |
+| 图片来源 | LLM 输出质量 |
+|----------|--------------|
+| 训练集 | ✅ 正确 (如 "一只熊"、"厨房场景，有橱柜") |
+| 集合外图片 | ❌ 通常不正确或过于笼统 |
 
-### 根本原因分析
-- 0.87 的 cos_sim **不足以**让 LLM 理解语义
-- CNN 特征与 Qwen ViT 特征本质不同
-- 简单的蒸馏无法弥合这个差距
-
-### 可能的解决方案 (TODO)
-1. 端到端微调 Qwen blocks
-2. 更强表达力的上采样器架构
-3. 任务驱动训练 (VQA loss) 而非特征匹配
+### 根本原因
+- CNN 特征与 ViT 全局注意力模式本质不同
+- 0.89 cos_sim 仍不足以实现鲁棒的跨域泛化
 
 ---
 
@@ -99,39 +110,44 @@ python scripts/precompute_qwen_features.py \
     --layer 4 --split val --batch_size 4
 ```
 
-### 步骤 3: 训练 (或使用过拟合调试)
+### 步骤 3: GAN 训练 (v2.0)
 
-**正常训练:**
+**Phase 1: Warmup (仅 MSE)**
 ```bash
-python scripts/train_with_upsampler.py \
+python scripts/train_gan.py \
     --features_dir ./data/qwen_features \
     --data_dir ./data/coco \
-    --upsampler_method mlp \
-    --epochs 100 --batch_size 32 \
-    --output_dir ./checkpoints/coco_mlp
+    --phase warmup \
+    --epochs 20 \
+    --batch_size 16 \
+    --output_dir ./checkpoints/gan_layer4
 ```
 
-**单图过拟合调试 (推荐先运行):**
+**Phase 2: GAN 微调**
 ```bash
-python scripts/train_with_upsampler.py \
+python scripts/train_gan.py \
     --features_dir ./data/qwen_features \
     --data_dir ./data/coco \
-    --overfit ./data/qwen_features/train/000000.pt \
-    --epochs 500
+    --phase gan \
+    --warmup_checkpoint ./checkpoints/gan_layer4/warmup_best.pth \
+    --epochs 50 \
+    --lambda_mse 10.0 \
+    --lambda_adv 0.1 \
+    --output_dir ./checkpoints/gan_layer4
 ```
 
 ### 步骤 4: 推理
 
 ```bash
 python scripts/infer_hybrid.py \
-    --checkpoint ./checkpoints/coco_mlp/best_model.pth \
-    --image ./data/coco/train/000000000139.jpg \
+    --checkpoint ./checkpoints/gan_layer4/gan_best.pth \
+    --image ./data/coco/train/000000000285.jpg \
     --full_inference
 ```
 
 ---
 
-## 📐 架构
+## 📐 架构 (v2.0)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -141,7 +157,8 @@ python scripts/infer_hybrid.py \
                          │ ~61 KB int8
 ┌────────────────────────▼────────────────────────────────────┐
 │ 云端 (CLOUD)                                                 │
-│  MLP 上采样 → 256 tokens → Qwen[4:] → Merger → LLM           │
+│  TransformerUpsampler → 256 tokens → Qwen[4:] → LLM         │
+│  (双线性插值 + 4层 Transformer + Learned PosEmbed)           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -149,13 +166,10 @@ python scripts/infer_hybrid.py \
 
 ## 🔬 关键发现
 
-| 方法 | cos_sim | 有效? |
-|------|---------|-------|
-| 纯 Bilinear | 0.87 | ❌ |
-| deconv + BN | 0.57 | ❌ |
-| **MLP (bilinear + mlp)** | 0.99* | ✅* |
-
-*仅限单图过拟合
+| 方法 | cos_sim | val_std | 有效? |
+|------|---------|---------|-------|
+| MLP (v1.0) | 0.87 | 0.74 | ❌ |
+| **TransformerUpsampler + GAN (v2.0)** | **0.89** | **0.77** | ✅ (训练集) |
 
 ---
 
@@ -163,10 +177,11 @@ python scripts/infer_hybrid.py \
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--upsampler_method` | mlp | mlp / deconv / transformer |
-| `--overfit` | None | 指定 .pt 文件进行单图过拟合调试 |
-| `--transmission_tokens` | 49 | 端侧 tokens (7×7) |
-| `--epochs` | 100 | 训练轮数 |
+| `--upsampler_type` | transformer | transformer / mlp / deconv |
+| `--phase` | - | warmup (MSE) / gan (对抗) |
+| `--lambda_mse` | 10.0 | MSE 损失权重 (内容) |
+| `--lambda_adv` | 0.1 | 对抗损失权重 (风格) |
+| `--transformer_layers` | 4 | TransformerUpsampler 层数 |
 
 ---
 

@@ -146,6 +146,84 @@ class CloudUpsampler(nn.Module):
         return x
 
 
+class TransformerUpsampler(nn.Module):
+    """
+    Transformer-based Upsampler for SplitOculo v2.0
+    
+    核心思想:
+    1. 先用双线性插值将 49 tokens 拉伸到 256 tokens（空间对齐）
+    2. 用 Transformer Encoder 进行全局上下文混合（模拟 ViT 的 Self-Attention）
+    3. 加入 Learned Positional Embedding（因为上采样后位置信息需要重新注入）
+    
+    这让 CNN 特征能够"看到"全局信息，弥补 CNN 只能看局部的缺陷。
+    """
+    def __init__(self, hidden_size=1280, input_tokens=49, target_tokens=256, num_layers=4):
+        super().__init__()
+        self.input_size = int(input_tokens ** 0.5)   # 7
+        self.target_size = int(target_tokens ** 0.5)  # 16
+        self.hidden_size = hidden_size
+        self.target_tokens = target_tokens
+        
+        # 1. 预处理: 简单的 Conv 层，在空间维度上做一些平滑
+        self.pre_process = nn.Sequential(
+            nn.Conv2d(hidden_size, hidden_size, kernel_size=3, padding=1),
+            nn.GELU()
+        )
+        
+        # 2. Transformer Encoder: 核心是让每个 token 能看到所有其他 token
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=16,                    # 多头注意力，捕捉不同维度的语义
+            dim_feedforward=hidden_size * 2,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True              # Pre-Norm，训练更稳定
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # 3. Learned Positional Embedding: 上采样后的空间位置信息
+        self.pos_embed = nn.Parameter(torch.randn(1, target_tokens, hidden_size) * 0.02)
+        
+        # 4. 输出层归一化
+        self.output_norm = nn.LayerNorm(hidden_size)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: [B, 49, 1280] 或 [B, 1280, 7, 7]
+        Returns:
+            [B, 256, 1280]
+        """
+        # 处理输入格式
+        if x.dim() == 3:
+            B, N, C = x.shape
+            x = x.transpose(1, 2).reshape(B, C, self.input_size, self.input_size)
+        else:
+            B = x.shape[0]
+        
+        # 1. 预处理
+        x = self.pre_process(x)
+        
+        # 2. 双线性插值: 7x7 → 16x16
+        x = F.interpolate(x, size=(self.target_size, self.target_size), 
+                         mode='bilinear', align_corners=False)
+        
+        # 3. 转为 token 序列: [B, 256, 1280]
+        x = x.flatten(2).transpose(1, 2)
+        
+        # 4. 加入位置编码
+        x = x + self.pos_embed
+        
+        # 5. Transformer 全局上下文混合
+        x = self.transformer(x)
+        
+        # 6. 输出归一化
+        x = self.output_norm(x)
+        
+        return x
+
+
 class LearnableProjector(nn.Module):
     """
     完整的端侧 Projector + 云端 Upsampler

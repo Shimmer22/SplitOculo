@@ -140,4 +140,7 @@ def main():
 
 
 if __name__ == '__main__':
+    # support chinese
+    plt.rcParams['font.sans-serif'] = ['SimHei']
+    plt.rcParams['axes.unicode_minus'] = False
     main()

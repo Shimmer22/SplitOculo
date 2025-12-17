@@ -114,14 +114,27 @@ class HybridUpsamplerVLM:
         self.projector.load_state_dict(ckpt['projector_state_dict'])
         self.projector.eval()
         
-        # 云端 Upsampler
-        self.upsampler = CloudUpsampler(
-            hidden_size=hidden_size,
-            input_tokens=self.transmission_tokens,
-            target_tokens=self.target_tokens,
-            method=upsampler_method,
-            num_refine_layers=upsampler_layers
-        ).to(device)
+        # 云端 Upsampler (支持 TransformerUpsampler)
+        upsampler_type = args.get('upsampler_type', upsampler_method)
+        transformer_layers = args.get('transformer_layers', 4)
+        
+        if upsampler_type == 'transformer':
+            from models.cloud_upsampler import TransformerUpsampler
+            self.upsampler = TransformerUpsampler(
+                hidden_size=hidden_size,
+                input_tokens=self.transmission_tokens,
+                target_tokens=self.target_tokens,
+                num_layers=transformer_layers
+            ).to(device)
+            print(f"   使用 TransformerUpsampler ({transformer_layers} layers)")
+        else:
+            self.upsampler = CloudUpsampler(
+                hidden_size=hidden_size,
+                input_tokens=self.transmission_tokens,
+                target_tokens=self.target_tokens,
+                method=upsampler_type,
+                num_refine_layers=upsampler_layers
+            ).to(device)
         self.upsampler.load_state_dict(ckpt['upsampler_state_dict'])
         self.upsampler.eval()
         
@@ -304,7 +317,7 @@ def main():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--full_inference', action='store_true',
                         help='Run complete inference including Qwen')
-    parser.add_argument('--prompt', type=str, default='What is in this image?')
+    parser.add_argument('--prompt', type=str, default='这张图里有什么?')
     
     args = parser.parse_args()
     device = torch.device(args.device)
