@@ -388,7 +388,7 @@ def main():
     
     # 训练参数
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--cos_weight', type=float, default=0.5)

@@ -1,37 +1,46 @@
 """
-混合推理脚本：CNN 替换 Qwen ViT 浅层，剩余深层仍用 Qwen
+使用可学习上采样器的混合推理脚本
 
-端云协同场景:
-- 端侧: Image → CNN → Projector → features (1280 dim, 可量化)
-- 云端: features → Remaining Qwen Blocks → Merger → LLM → response
+架构:
+- 端侧: Image → CNN → Projector → 49 tokens (7×7)
+- 传输: 49 tokens (~61 KB int8)
+- 云端: Upsampler → 256 tokens → Qwen[4:] → Merger → LLM
 
 Usage:
-    python scripts/infer_hybrid.py --checkpoint checkpoints/best_model.pth --image photo.jpg
+    python scripts/infer_with_upsampler.py \
+        --checkpoint checkpoints/upsampler/best_model.pth \
+        --image photo.jpg \
+        --full_inference
 """
 import argparse
 import sys
 from pathlib import Path
 
-# Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import timm
 from PIL import Image
 from torchvision import transforms
+import math
+
+from models.cloud_upsampler import CloudUpsampler
 
 
-class LLMProjector(nn.Module):
-    """将 CNN 特征投影到 ViT 隐藏空间 (1280 dim)"""
-    def __init__(self, in_channels, hidden_size=1280, 
-                 hidden_channels=512, downsample_ratio=2):
+class EdgeProjector(nn.Module):
+    """端侧 Projector: CNN 特征 → 传输 tokens"""
+    def __init__(self, in_channels, hidden_size=1280,
+                 hidden_channels=512, transmission_tokens=49):
         super().__init__()
+        
+        self.transmission_size = int(math.sqrt(transmission_tokens))
         
         self.pw_conv1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm2d(hidden_channels)
         self.act1 = nn.GELU()
-        self.avg_pool = nn.AvgPool2d(kernel_size=downsample_ratio, stride=downsample_ratio)
+        self.pool = nn.AdaptiveAvgPool2d((self.transmission_size, self.transmission_size))
         self.dw_conv = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3,
                                   padding=1, groups=hidden_channels, bias=False)
         self.bn2 = nn.BatchNorm2d(hidden_channels)
@@ -41,101 +50,88 @@ class LLMProjector(nn.Module):
         
     def forward(self, x):
         x = self.act1(self.bn1(self.pw_conv1(x)))
-        x = self.avg_pool(x)
+        x = self.pool(x)
         residual = x
         x = self.act2(self.bn2(self.dw_conv(x)))
         x = x + residual
         x = self.bn3(self.pw_conv2(x))
         b, c, h, w = x.shape
-        x = x.flatten(2).transpose(1, 2)  # (B, num_tokens, hidden_size)
+        x = x.flatten(2).transpose(1, 2)
         return x
 
 
-class EdgeVisualEncoder(nn.Module):
+class HybridUpsamplerVLM:
     """
-    端侧视觉编码器
+    使用可学习上采样器的混合 VLM
     
-    CNN (MobileNetV2) + Projector → features (1280 dim)
-    输出与 Qwen ViT 中间层兼容
+    加载 train_with_upsampler.py 训练的检查点
     """
-    def __init__(self, student_model='mobilenetv2_100', student_layer=3,
-                 student_channels=96, hidden_size=1280,
-                 projector_hidden=512, downsample_ratio=2):
-        super().__init__()
-        
-        self.student = timm.create_model(
-            student_model,
-            pretrained=False,
-            features_only=True,
-            out_indices=[student_layer]
-        )
-        
-        self.projector = LLMProjector(
-            in_channels=student_channels,
-            hidden_size=hidden_size,
-            hidden_channels=projector_hidden,
-            downsample_ratio=downsample_ratio
-        )
-    
-    def forward(self, x):
-        """
-        Args:
-            x: (B, 3, H, W) input images
-        Returns:
-            (B, num_tokens, 1280) features compatible with Qwen ViT
-        """
-        feat = self.student(x)[-1]
-        tokens = self.projector(feat)
-        return tokens
-    
-    def load_checkpoint(self, checkpoint_path, device='cpu'):
-        """加载训练好的权重"""
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        self.student.load_state_dict(ckpt['student_state_dict'])
-        self.projector.load_state_dict(ckpt['projector_state_dict'])
-        print(f"✅ 已加载检查点: {checkpoint_path}")
-        return self
-
-
-class HybridQwenVLM:
-    """
-    混合视觉语言模型
-    
-    CNN + Projector 替换 Qwen ViT 前 N 层
-    剩余层 + Merger 仍使用 Qwen
-    
-    架构:
-        Image → CNN → Projector (1280) → Qwen Blocks[N:] → Merger (2048) → LLM
-    """
-    def __init__(self, 
-                 edge_checkpoint=None,
+    def __init__(self, checkpoint_path, 
                  qwen_model_name="Qwen/Qwen2.5-VL-3B-Instruct",
-                 split_layer=8,
-                 device='cuda'):
+                 split_layer=4, device='cuda'):
         self.device = device
         self.qwen_model_name = qwen_model_name
         self.split_layer = split_layer
         
-        # 端侧编码器
-        self.edge_encoder = EdgeVisualEncoder(
-            student_model='mobilenetv2_100',
-            student_layer=3,
-            student_channels=96,
-            hidden_size=1280
-        )
+        # 加载检查点
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        args = ckpt.get('args', {})
         
-        if edge_checkpoint:
-            self.edge_encoder.load_checkpoint(edge_checkpoint, device)
+        self.transmission_tokens = args.get('transmission_tokens', 49)
+        self.target_tokens = args.get('target_tokens', 256)
+        hidden_size = args.get('target_hidden_size', 1280)
+        upsampler_method = args.get('upsampler_method', 'deconv')
+        upsampler_layers = args.get('upsampler_layers', 2)
         
-        self.edge_encoder = self.edge_encoder.to(device)
-        self.edge_encoder.eval()
+        print(f"📦 Loading checkpoint: {checkpoint_path}")
+        print(f"   传输 tokens: {self.transmission_tokens}")
+        print(f"   目标 tokens: {self.target_tokens}")
+        print(f"   上采样方法: {upsampler_method}")
         
-        # Qwen 模型 (延迟加载)
+        # CNN backbone
+        student_model = args.get('student_model', 'mobilenetv2_100')
+        student_layer = args.get('student_layer', 3)
+        
+        self.student = timm.create_model(
+            student_model, pretrained=False, features_only=True,
+            out_indices=[student_layer]
+        ).to(device)
+        self.student.load_state_dict(ckpt['student_state_dict'])
+        self.student.eval()
+        
+        # 获取 student 通道数
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, 224, 224).to(device)
+            student_channels = self.student(dummy)[-1].shape[1]
+        
+        # 端侧 Projector
+        self.projector = EdgeProjector(
+            in_channels=student_channels,
+            hidden_size=hidden_size,
+            hidden_channels=args.get('projector_hidden', 512),
+            transmission_tokens=self.transmission_tokens
+        ).to(device)
+        self.projector.load_state_dict(ckpt['projector_state_dict'])
+        self.projector.eval()
+        
+        # 云端 Upsampler
+        self.upsampler = CloudUpsampler(
+            hidden_size=hidden_size,
+            input_tokens=self.transmission_tokens,
+            target_tokens=self.target_tokens,
+            method=upsampler_method,
+            num_refine_layers=upsampler_layers
+        ).to(device)
+        self.upsampler.load_state_dict(ckpt['upsampler_state_dict'])
+        self.upsampler.eval()
+        
+        print(f"✅ 模型加载完成")
+        
         self.qwen_model = None
         self.processor = None
     
     def load_qwen(self):
-        """加载 Qwen 模型 (云端)"""
+        """加载 Qwen 模型"""
         from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
         
         print(f"📥 Loading Qwen from {self.qwen_model_name}...")
@@ -151,7 +147,6 @@ class HybridQwenVLM:
             trust_remote_code=True
         )
         
-        # 冻结参数
         for param in self.qwen_model.parameters():
             param.requires_grad = False
         self.qwen_model.eval()
@@ -162,370 +157,205 @@ class HybridQwenVLM:
         return self
     
     @torch.no_grad()
-    def encode_image_edge(self, image_tensor):
-        """
-        端侧编码
-        
-        Args:
-            image_tensor: (B, 3, H, W) normalized tensor
-        Returns:
-            features: (B, num_tokens, 1280)
-        """
-        return self.edge_encoder(image_tensor)
+    def encode_edge(self, image_tensor):
+        """端侧编码: Image → 49 tokens"""
+        feat = self.student(image_tensor)[-1]
+        tokens = self.projector(feat)
+        return tokens
     
-    @torch.no_grad() 
-    def complete_visual_encoding(self, edge_features, grid_thw=None):
-        """
-        云端完成剩余视觉编码
+    @torch.no_grad()
+    def upsample_cloud(self, edge_tokens):
+        """云端上采样: 49 tokens → 256 tokens"""
+        upsampled = self.upsampler(edge_tokens)
         
-        Args:
-            edge_features: (B, num_tokens, 1280) 端侧输出 (来自 CNN, 通常是 7x7=49 tokens)
-            grid_thw: grid 信息 (可选)
-        Returns:
-            visual_tokens: (B, merged_tokens, 2048) 可送入 LLM
-        """
-        import torch.nn.functional as F
+        # 特征缩放以匹配 Qwen Layer 4 分布
+        # Qwen Layer 4: mean≈-0.017, std≈0.83
+        target_std = 0.83
+        target_mean = -0.017
         
+        current_std = upsampled.std()
+        if current_std > 0:
+            upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+        
+        return upsampled
+    
+    @torch.no_grad()
+    def complete_visual_encoding(self, upsampled_tokens):
+        """继续 Qwen blocks → merger"""
         if self.qwen_model is None:
             raise RuntimeError("请先调用 load_qwen()")
         
         visual = self.qwen_model.visual
-        B = edge_features.shape[0]
-        num_tokens = edge_features.shape[1]
-        cnn_h = cnn_w = int(num_tokens ** 0.5)  # 7x7 = 49
+        B = upsampled_tokens.shape[0]
+        target_h = target_w = int(self.target_tokens ** 0.5)
         
-        # Qwen ViT 使用 224/14 = 16x16 = 256 tokens
-        target_h = target_w = 16
-        target_tokens = target_h * target_w  # 256
-        
-        # 上采样 CNN 特征以匹配 Qwen 的 token 网格
-        # (B, 49, 1280) -> (B, 1280, 7, 7) -> upsample -> (B, 1280, 16, 16) -> (B, 256, 1280)
-        edge_features_2d = edge_features.view(B, cnn_h, cnn_w, -1).permute(0, 3, 1, 2)  # (B, 1280, 7, 7)
-        edge_features_upsampled = F.interpolate(
-            edge_features_2d, 
-            size=(target_h, target_w), 
-            mode='bilinear', 
-            align_corners=False
-        )  # (B, 1280, 16, 16)
-        edge_features = edge_features_upsampled.permute(0, 2, 3, 1).view(B, target_tokens, -1)  # (B, 256, 1280)
-        
-        print(f"   上采样: {cnn_h}x{cnn_w} -> {target_h}x{target_w} tokens")
-        
-        # === Feature scaling to match Qwen Layer 4 distribution ===
-        # CNN output: mean≈0, std≈0.06
-        # Qwen Layer 4: mean≈-0.017, std≈0.83
-        # Scale CNN output to match Qwen's expected distribution
-        cnn_std = edge_features.std()
-        target_std = 0.83  # Qwen Layer 4 approximate std
-        target_mean = -0.017  # Qwen Layer 4 approximate mean
-        
-        if cnn_std > 0:
-            edge_features = (edge_features - edge_features.mean()) / cnn_std * target_std + target_mean
-            print(f"   特征缩放: std {cnn_std:.3f} -> {target_std}, mean -> {target_mean}")
-        
-        # 处理 edge_features 形状: (B, num_tokens, hidden) -> (total_tokens, hidden)
-        edge_features = edge_features.view(-1, edge_features.shape[-1])  # (256, 1280)
-        
-        # 使用固定的 grid_thw
+        # 设置 grid
         grid_thw = torch.tensor([[1, target_h, target_w]] * B, dtype=torch.long).to(self.device)
+        
+        # 转为 Qwen 需要的格式
+        hidden_states = upsampled_tokens.view(-1, upsampled_tokens.shape[-1])
+        hidden_states = hidden_states.to(visual.blocks[0].attn.qkv.weight.dtype)
         
         # Rotary position embedding
         rotary_pos_emb = visual.rot_pos_emb(grid_thw)
-        
-        # Window indexing
         window_index, cu_window_seqlens = visual.get_window_index(grid_thw)
-        cu_window_seqlens = torch.tensor(
-            cu_window_seqlens,
-            device=edge_features.device,
-            dtype=torch.int32,
-        )
+        cu_window_seqlens = torch.tensor(cu_window_seqlens, device=self.device, dtype=torch.int32)
         cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
         
-        # 重排 hidden_states 以匹配 window indexing
-        seq_len = edge_features.shape[0]
-        hidden_states = edge_features.view(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
+        seq_len = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
         hidden_states = hidden_states[window_index, :, :]
         hidden_states = hidden_states.reshape(seq_len, -1)
         
-        # 重排 rotary_pos_emb 并创建 position_embeddings
-        rotary_pos_emb = rotary_pos_emb.view(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
-        rotary_pos_emb = rotary_pos_emb.view(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
         
-        # cu_seqlens
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2],
-            grid_thw[:, 0]
-        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
         
-        # 转换数据类型
-        hidden_states = hidden_states.to(visual.blocks[0].attn.qkv.weight.dtype)
-        
-        # 继续执行剩余的 blocks
-        for i, block in enumerate(visual.blocks):
-            if i < self.split_layer:
-                continue  # 跳过前 N 层 (已由 CNN 替代)
-            
-            # 选择正确的 cu_seqlens
-            if i in visual.fullatt_block_indexes:
-                cu_seqlens_now = cu_seqlens
+        # 执行 blocks[split_layer:]
+        for layer_num, blk in enumerate(visual.blocks):
+            if layer_num < self.split_layer:
+                continue
+            if layer_num in visual.fullatt_block_indexes:
+                hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
             else:
-                cu_seqlens_now = cu_window_seqlens
-            
-            hidden_states = block(
-                hidden_states,
-                cu_seqlens=cu_seqlens_now,
-                position_embeddings=position_embeddings,
-            )
+                hidden_states = blk(hidden_states, cu_seqlens=cu_window_seqlens, position_embeddings=position_embeddings)
         
-        # 通过 merger
-        # 需要先反转 window indexing
+        # 反转 window indexing
         reverse_indices = torch.argsort(window_index)
-        hidden_states = hidden_states.view(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
+        hidden_states = hidden_states.reshape(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
         hidden_states = hidden_states[reverse_indices, :, :]
         hidden_states = hidden_states.reshape(seq_len, -1)
         
+        # Merger
         visual_tokens = visual.merger(hidden_states)
+        visual_tokens = visual_tokens.unsqueeze(0) if visual_tokens.dim() == 2 else visual_tokens
         
-        # 恢复 batch 维度
-        visual_tokens = visual_tokens.view(B, -1, visual_tokens.shape[-1])
-        
-        return visual_tokens  # (B, merged_tokens, 2048)
+        return visual_tokens
     
-    def quantize_features(self, features, method='int8'):
-        """
-        量化特征以减少传输大小
+    @torch.no_grad()
+    def generate(self, visual_tokens, prompt):
+        """生成文本回复"""
+        num_visual_tokens = visual_tokens.shape[1]
         
-        Args:
-            features: (B, num_tokens, hidden_size) float tensor
-            method: 'int8', 'fp16'
-        Returns:
-            quantized_data, metadata for dequantization
-        """
-        if method == 'int8':
-            # 简单的 min-max int8 量化
-            min_val = features.min()
-            max_val = features.max()
-            scale = (max_val - min_val) / 255
-            quantized = ((features - min_val) / scale).round().to(torch.uint8)
-            return quantized, {'min': min_val.item(), 'scale': scale.item()}
-        elif method == 'fp16':
-            return features.half(), {}
-        else:
-            return features, {}
-    
-    def dequantize_features(self, quantized, metadata, method='int8'):
-        """反量化"""
-        if method == 'int8':
-            return quantized.float() * metadata['scale'] + metadata['min']
-        elif method == 'fp16':
-            return quantized.float()
-        else:
-            return quantized
+        image_placeholder = "<|vision_start|>" + "<|image_pad|>" * num_visual_tokens + "<|vision_end|>"
+        messages = [{'role': 'user', 'content': image_placeholder + prompt}]
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        text_inputs = self.processor.tokenizer(text, return_tensors='pt', padding=True)
+        input_ids = text_inputs['input_ids'].to(self.device)
+        attention_mask = text_inputs['attention_mask'].to(self.device)
+        
+        embed_layer = self.qwen_model.get_input_embeddings()
+        inputs_embeds = embed_layer(input_ids)
+        
+        image_token_id = self.qwen_model.config.image_token_id
+        image_mask = (input_ids == image_token_id)
+        num_placeholders = image_mask.sum().item()
+        
+        visual_tokens_flat = visual_tokens.view(-1, visual_tokens.shape[-1])
+        if visual_tokens_flat.shape[0] != num_placeholders:
+            if visual_tokens_flat.shape[0] < num_placeholders:
+                pad = visual_tokens_flat[-1:].repeat(num_placeholders - visual_tokens_flat.shape[0], 1)
+                visual_tokens_flat = torch.cat([visual_tokens_flat, pad], dim=0)
+            else:
+                visual_tokens_flat = visual_tokens_flat[:num_placeholders]
+        
+        visual_tokens_flat = visual_tokens_flat.to(inputs_embeds.dtype)
+        batch_indices, token_indices = torch.where(image_mask)
+        for i, (b, t) in enumerate(zip(batch_indices, token_indices)):
+            inputs_embeds[b, t] = visual_tokens_flat[i]
+        
+        outputs = self.qwen_model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            max_new_tokens=256,
+            do_sample=False,
+            pad_token_id=self.processor.tokenizer.pad_token_id,
+            eos_token_id=self.processor.tokenizer.eos_token_id,
+        )
+        
+        response = self.processor.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if 'assistant' in response.lower():
+            response = response.split('assistant')[-1].strip()
+        
+        return response
 
 
-def get_image_transform(image_size=224):
-    """图像预处理"""
+def get_image_transform(size=224):
     return transforms.Compose([
-        transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(image_size),
+        transforms.Resize(size, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(size),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Hybrid CNN-Qwen Inference')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/qwen_precomputed/best_model.pth')
-    parser.add_argument('--image', type=str, default=None)
-    parser.add_argument('--dummy', action='store_true')
-    parser.add_argument('--split_layer', type=int, default=4,
-                        help='Which layer CNN replaces (1-32, must match training layer)')
-    parser.add_argument('--device', type=str, 
-                        default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--quantize', type=str, default='none',
-                        choices=['none', 'fp16', 'int8'],
-                        help='Quantization method for transmission (none recommended for debugging)')
+    parser = argparse.ArgumentParser(description='Hybrid Inference with Learned Upsampler')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/upsampler/best_model.pth',
+                        help='Path to upsampler checkpoint')
+    parser.add_argument('--image', type=str, required=True, help='Path to input image')
+    parser.add_argument('--split_layer', type=int, default=4)
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--full_inference', action='store_true',
-                        help='Run complete inference including Qwen deep layers')
-    parser.add_argument('--prompt', type=str, default=None,
-                        help='Text prompt for LLM (default: 描述这张图片中的内容。)')
+                        help='Run complete inference including Qwen')
+    parser.add_argument('--prompt', type=str, default='What is in this image?')
+    
     args = parser.parse_args()
-    
     device = torch.device(args.device)
-    print(f"🔧 Device: {device}")
-    print(f"📍 Split layer: {args.split_layer}")
     
-    # 加载混合模型
-    hybrid = HybridQwenVLM(
-        edge_checkpoint=args.checkpoint if Path(args.checkpoint).exists() else None,
+    print("=" * 60)
+    print("🔧 Hybrid Inference with Learned Upsampler")
+    print("=" * 60)
+    
+    # 加载模型
+    model = HybridUpsamplerVLM(
+        checkpoint_path=args.checkpoint,
         split_layer=args.split_layer,
         device=device
     )
     
-    # 准备输入
+    # 加载图像
     transform = get_image_transform(224)
-    
-    if args.dummy:
-        print("📷 使用假数据测试...")
-        image = torch.randn(1, 3, 224, 224).to(device)
-    elif args.image:
-        print(f"📷 加载图像: {args.image}")
-        img = Image.open(args.image).convert('RGB')
-        image = transform(img).unsqueeze(0).to(device)
-    else:
-        print("❌ 请指定 --image 或 --dummy")
-        return
+    img = Image.open(args.image).convert('RGB')
+    image = transform(img).unsqueeze(0).to(device)
+    print(f"\n📷 加载图像: {args.image}")
     
     # 端侧编码
     print("\n🖥️  端侧 (Edge) 编码...")
-    edge_features = hybrid.encode_image_edge(image)
-    print(f"   输出形状: {edge_features.shape}")
-    print(f"   维度: {edge_features.shape[-1]} (应为 1280)")
+    edge_tokens = model.encode_edge(image)
+    print(f"   输出: {edge_tokens.shape} tokens")
     
-    # 量化分析 (端侧特征大小，上采样前)
-    print(f"\n📡 传输大小分析 ({args.quantize} 量化):")
-    quantized, metadata = hybrid.quantize_features(edge_features, method=args.quantize)
+    # 云端上采样
+    print("\n☁️  云端上采样...")
+    upsampled_tokens = model.upsample_cloud(edge_tokens)
+    print(f"   上采样: {edge_tokens.shape[1]} → {upsampled_tokens.shape[1]} tokens")
     
-    if args.quantize == 'int8':
-        bytes_per_val = 1
-    elif args.quantize == 'fp16':
-        bytes_per_val = 2
-    else:
-        bytes_per_val = 4
+    # 计算大小
+    edge_size_kb = edge_tokens.numel() * 1 / 1024  # int8
+    upsampled_size_kb = upsampled_tokens.numel() * 1 / 1024
+    print(f"   传输大小 (int8): {edge_size_kb:.2f} KB")
     
-    # 端侧特征大小 (上采样在云端执行)
-    transmission_bytes = quantized.numel() * bytes_per_val
-    num_tokens = edge_features.shape[1]  # 49 tokens (7x7)
-    
-    # 测量实际 JPEG 大小 (resize 到 224x224 后)
-    import io
-    if args.image and not args.dummy:
-        img_resized = Image.open(args.image).convert('RGB')
-        img_resized = img_resized.resize((224, 224), Image.Resampling.LANCZOS)
-        buffer = io.BytesIO()
-        img_resized.save(buffer, format='JPEG', quality=85)
-        jpeg_bytes = buffer.tell()
-        print(f"   原始 JPEG (224×224, Q85): {jpeg_bytes / 1024:.2f} KB")
-    else:
-        jpeg_bytes = 30 * 1024  # fallback
-        print(f"   原始 JPEG 224×224: ~{jpeg_bytes / 1024:.0f} KB (估计)")
-    
-    print(f"   端侧特征 ({num_tokens} tokens, {args.quantize}): {transmission_bytes / 1024:.2f} KB")
-    if transmission_bytes < jpeg_bytes:
-        print(f"   压缩比: {jpeg_bytes / transmission_bytes:.1f}x")
-    else:
-        print(f"   大于原图: {transmission_bytes / jpeg_bytes:.1f}x")
-    
-    # 完整推理 (可选)
     if args.full_inference:
-        print("\n☁️  云端 (Cloud) 完成推理...")
-        hybrid.load_qwen()
+        print("\n☁️  云端完成推理...")
+        model.load_qwen()
         
-        # 反量化
-        dequantized = hybrid.dequantize_features(quantized, metadata, method=args.quantize)
-        
-        # 完成视觉编码
-        visual_tokens = hybrid.complete_visual_encoding(dequantized)
+        visual_tokens = model.complete_visual_encoding(upsampled_tokens)
         print(f"   视觉 tokens: {visual_tokens.shape}")
-        print(f"   维度: {visual_tokens.shape[-1]} (应为 2048)")
         
-        # 生成文本回复
-        prompt = args.prompt if args.prompt else "描述这张图片中的内容。"
-        print(f"\n💬 生成回复 (prompt: {prompt})")
+        print(f"\n💬 生成回复 (prompt: {args.prompt})")
+        response = model.generate(visual_tokens, args.prompt)
         
-        response = generate_with_visual_tokens(
-            hybrid.qwen_model,
-            hybrid.processor,
-            visual_tokens,
-            prompt,
-            device
-        )
-        print(f"\n🤖 回复:\n{response}")
-        
-        return response
+        print(f"\n🤖 回复:")
+        print(response)
     
-    return edge_features
-
-
-def generate_with_visual_tokens(model, processor, visual_tokens, prompt, device):
-    """
-    使用视觉 tokens 生成文本回复
-    
-    正确的注入方式：替换 <|image_pad|> 占位符，而不是简单拼接
-    """
-    num_visual_tokens = visual_tokens.shape[1]  # 例如 64 或 165
-    
-    # 构造包含图像占位符的消息
-    # 使用 <|vision_start|><|image_pad|>×N<|vision_end|> 格式
-    image_placeholder = "<|vision_start|>" + "<|image_pad|>" * num_visual_tokens + "<|vision_end|>"
-    
-    messages = [
-        {"role": "user", "content": image_placeholder + prompt}
-    ]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    
-    # Tokenize
-    text_inputs = processor.tokenizer(text, return_tensors="pt", padding=True)
-    input_ids = text_inputs["input_ids"].to(device)
-    attention_mask = text_inputs["attention_mask"].to(device)
-    
-    # 获取文本 embeddings
-    embed_layer = model.get_input_embeddings()
-    inputs_embeds = embed_layer(input_ids)
-    
-    # 找到 image_pad token 的位置并替换
-    image_token_id = model.config.image_token_id  # 151655
-    image_mask = (input_ids == image_token_id)
-    
-    # 确保 visual_tokens 数量匹配
-    num_placeholders = image_mask.sum().item()
-    if num_placeholders != num_visual_tokens:
-        print(f"   ⚠️ Token 数量不匹配: 占位符 {num_placeholders} vs 视觉 {num_visual_tokens}")
-        # 调整 visual_tokens 大小
-        if num_visual_tokens < num_placeholders:
-            # 重复最后一个 token
-            pad = visual_tokens[:, -1:, :].repeat(1, num_placeholders - num_visual_tokens, 1)
-            visual_tokens = torch.cat([visual_tokens, pad], dim=1)
-        else:
-            # 截断
-            visual_tokens = visual_tokens[:, :num_placeholders, :]
-    
-    # 替换 image_pad embeddings 为 visual_tokens
-    visual_tokens = visual_tokens.to(inputs_embeds.dtype)
-    
-    # 找到所有 image_pad 位置的索引
-    batch_indices, token_indices = torch.where(image_mask)
-    
-    # 替换
-    for i, (b, t) in enumerate(zip(batch_indices, token_indices)):
-        inputs_embeds[b, t] = visual_tokens[b, i % visual_tokens.shape[1]]
-    
-    # 生成
-    with torch.no_grad():
-        outputs = model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            max_new_tokens=256,
-            do_sample=False,  # 使用 greedy 更稳定
-            pad_token_id=processor.tokenizer.pad_token_id,
-            eos_token_id=processor.tokenizer.eos_token_id,
-        )
-    
-    # 解码
-    response = processor.tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    # 只返回回复部分（去掉 prompt）
-    # 查找 assistant 标记后的内容
-    if "assistant" in response.lower():
-        response = response.split("assistant")[-1].strip()
-    
-    return response
+    print("\n" + "=" * 60)
 
 
 if __name__ == '__main__':
     main()
-
