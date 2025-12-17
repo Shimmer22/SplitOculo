@@ -18,37 +18,51 @@ SplitOculo 实现 **边端-云端协同 VLM 推理**：
 
 ---
 
-## 🚀 快速开始 (直接复制执行)
+## ⚠️ 当前不足
+
+> [!CAUTION]
+> **多图训练无法有效泛化。** 单图过拟合可达 cos_sim=0.99 且语义正确，但多图训练仅能达到 cos_sim=0.87，输出错误。
+
+| 模式 | cos_sim | LLM 输出 |
+|------|---------|----------|
+| **单图过拟合** | 0.99 | ✅ "modern living room with TV, dining table, kitchen..." |
+| **多图训练** | 0.87 | ❌ "gradient background transitioning from light brown..." |
+
+### 根本原因分析
+- 0.87 的 cos_sim **不足以**让 LLM 理解语义
+- CNN 特征与 Qwen ViT 特征本质不同
+- 简单的蒸馏无法弥合这个差距
+
+### 可能的解决方案 (TODO)
+1. 端到端微调 Qwen blocks
+2. 更强表达力的上采样器架构
+3. 任务驱动训练 (VQA loss) 而非特征匹配
+
+---
+
+## 🚀 快速开始
 
 ### 步骤 0: 环境配置
 
 ```bash
-# 克隆仓库
 git clone https://github.com/Shimmer22/SplitOculo.git
 cd SplitOculo
 
-# 创建 conda 环境
 conda create -n cnn_vit python=3.10 -y
 conda activate cnn_vit
 
-# 安装依赖
 pip install torch torchvision transformers timm tqdm pillow matplotlib
 ```
 
-### 步骤 1: 下载数据集
-
-推荐使用 **COCO val2017** (5000 张多样化图像, ~1GB):
+### 步骤 1: 下载数据集 (COCO val2017)
 
 ```bash
-# 创建数据目录
 mkdir -p data/coco
-
-# 下载 COCO val2017
 wget http://images.cocodataset.org/zips/val2017.zip -P data/coco/
 unzip data/coco/val2017.zip -d data/coco/
 rm data/coco/val2017.zip
 
-# 划分训练集/验证集 (80/20)
+# 划分 train/val (80/20)
 python -c "
 import os, shutil, random
 from pathlib import Path
@@ -69,56 +83,49 @@ for img in images[:split]:
 for img in images[split:]:
     shutil.copy(img, val_dir / img.name)
 
-print(f'✅ 训练集: {split} 张, 验证集: {len(images)-split} 张')
+print(f'✅ 训练集: {split}, 验证集: {len(images)-split}')
 "
 ```
 
 ### 步骤 2: 预计算 Qwen 特征
 
 ```bash
-# 预计算训练集特征 (GPU 上约 30 分钟)
 python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco \
-    --output_dir ./data/qwen_features \
-    --layer 4 \
-    --split train \
-    --batch_size 4
+    --data_dir ./data/coco --output_dir ./data/qwen_features \
+    --layer 4 --split train --batch_size 4
 
-# 预计算验证集特征
 python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco \
-    --output_dir ./data/qwen_features \
-    --layer 4 \
-    --split val \
-    --batch_size 4
+    --data_dir ./data/coco --output_dir ./data/qwen_features \
+    --layer 4 --split val --batch_size 4
 ```
 
-### 步骤 3: 使用 MLP 上采样器训练
+### 步骤 3: 训练 (或使用过拟合调试)
 
+**正常训练:**
 ```bash
 python scripts/train_with_upsampler.py \
     --features_dir ./data/qwen_features \
     --data_dir ./data/coco \
-    --transmission_tokens 49 \
-    --target_tokens 256 \
     --upsampler_method mlp \
-    --epochs 100 \
-    --batch_size 32 \
+    --epochs 100 --batch_size 32 \
     --output_dir ./checkpoints/coco_mlp
 ```
 
-### 步骤 4: 可视化训练
-
+**单图过拟合调试 (推荐先运行):**
 ```bash
-python scripts/plot_training.py --log ./checkpoints/coco_mlp/train.log
+python scripts/train_with_upsampler.py \
+    --features_dir ./data/qwen_features \
+    --data_dir ./data/coco \
+    --overfit ./data/qwen_features/train/000000.pt \
+    --epochs 500
 ```
 
-### 步骤 5: 推理
+### 步骤 4: 推理
 
 ```bash
 python scripts/infer_hybrid.py \
     --checkpoint ./checkpoints/coco_mlp/best_model.pth \
-    --image ./data/coco/val/000000000139.jpg \
+    --image ./data/coco/train/000000000139.jpg \
     --full_inference
 ```
 
@@ -129,61 +136,37 @@ python scripts/infer_hybrid.py \
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ 端侧 (EDGE)                                                  │
-├─────────────────────────────────────────────────────────────┤
 │  图像 → CNN → Projector → 49 tokens (7×7, 1280 维)           │
 └────────────────────────┬────────────────────────────────────┘
-                         │ 传输 (~61 KB int8)
+                         │ ~61 KB int8
 ┌────────────────────────▼────────────────────────────────────┐
 │ 云端 (CLOUD)                                                 │
-├─────────────────────────────────────────────────────────────┤
 │  MLP 上采样 → 256 tokens → Qwen[4:] → Merger → LLM           │
-│    [Bilinear + MLP]                                          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 📊 训练结果
+## 🔬 关键发现
 
-| 数据集 | Epochs | Val cos_sim | 上采样器 |
-|--------|--------|-------------|----------|
-| Imagenette | 50 | 0.87 | deconv |
-| Imagenette | 50 | **待测** | mlp |
-| COCO | 100 | **待测** | mlp |
+| 方法 | cos_sim | 有效? |
+|------|---------|-------|
+| 纯 Bilinear | 0.87 | ❌ |
+| deconv + BN | 0.57 | ❌ |
+| **MLP (bilinear + mlp)** | 0.99* | ✅* |
+
+*仅限单图过拟合
 
 ---
 
 ## 📝 关键参数
 
-### train_with_upsampler.py
-
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--upsampler_method` | **mlp** | mlp (最佳) / deconv / transformer |
+| `--upsampler_method` | mlp | mlp / deconv / transformer |
+| `--overfit` | None | 指定 .pt 文件进行单图过拟合调试 |
 | `--transmission_tokens` | 49 | 端侧 tokens (7×7) |
-| `--target_tokens` | 256 | Qwen 目标 (16×16) |
-| `--student_model` | mobilenetv2_100 | CNN 骨干网络 |
 | `--epochs` | 100 | 训练轮数 |
-
-### infer_hybrid.py
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--checkpoint` | - | 训练模型路径 |
-| `--image` | - | 输入图像路径 |
-| `--full_inference` | False | 运行完整 Qwen 推理 |
-
----
-
-## 🔬 关键发现
-
-| 方法 | cos_sim | 语义理解 |
-|------|---------|----------|
-| 纯 Bilinear | 0.87 | ❌ 错误 |
-| deconv + BN | 0.57 | ❌ 错误 |
-| **MLP (bilinear + mlp)** | **0.999** | ✅ 正确 |
-
-**根本原因**: deconv + BatchNorm 破坏信息。使用 `--upsampler_method mlp`。
 
 ---
 

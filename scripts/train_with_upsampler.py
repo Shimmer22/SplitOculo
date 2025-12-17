@@ -401,10 +401,22 @@ def main():
     parser.add_argument('--save_freq', type=int, default=10)
     parser.add_argument('--seed', type=int, default=42)
     
+    # 调试选项
+    parser.add_argument('--overfit', type=str, default=None,
+                        help='单图过拟合模式: 指定 .pt 特征文件路径进行过拟合调试')
+    
     args = parser.parse_args()
     set_seed(args.seed)
     
-    # 数据集
+    # 单图过拟合模式
+    if args.overfit:
+        print("=" * 60)
+        print("🔬 单图过拟合调试模式")
+        print("=" * 60)
+        run_overfit_debug(args)
+        return
+    
+    # 正常训练模式
     train_dataset = PrecomputedFeatureDataset(
         features_dir=args.features_dir,
         images_dir=args.data_dir,
@@ -432,6 +444,127 @@ def main():
     # 训练
     trainer = UpsamplerTrainer(args)
     trainer.train(train_loader, val_loader)
+
+
+def run_overfit_debug(args):
+    """单图过拟合调试: 训练后用 Qwen 验证语义理解"""
+    import torch.nn.functional as F
+    from PIL import Image
+    from torchvision import transforms
+    
+    device = torch.device(args.device)
+    
+    # 加载数据
+    feat_path = args.overfit
+    feat_data = torch.load(feat_path, weights_only=False)
+    teacher_256 = feat_data['features'].unsqueeze(0).float().to(device)
+    img_path = feat_data['path']
+    
+    print(f"📁 特征文件: {feat_path}")
+    print(f"📷 图像路径: {img_path}")
+    print(f"🎯 Teacher: {teacher_256.shape}, std={teacher_256.std():.3f}")
+    
+    # 加载图像
+    transform = transforms.Compose([
+        transforms.Resize(args.image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(args.image_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    image = transform(Image.open(img_path).convert('RGB')).unsqueeze(0).to(device)
+    
+    # 创建模型
+    student = timm.create_model(
+        args.student_model, pretrained=True, features_only=True, 
+        out_indices=[args.student_layer]
+    ).to(device)
+    
+    with torch.no_grad():
+        student_feat = student(image)[-1]
+        student_channels = student_feat.shape[1]
+    
+    projector = EdgeProjector(
+        in_channels=student_channels,
+        hidden_size=args.target_hidden_size,
+        hidden_channels=args.projector_hidden,
+        transmission_tokens=args.transmission_tokens
+    ).to(device)
+    
+    from models.cloud_upsampler import CloudUpsampler
+    upsampler = CloudUpsampler(
+        hidden_size=args.target_hidden_size,
+        input_tokens=args.transmission_tokens,
+        target_tokens=args.target_tokens,
+        method=args.upsampler_method,
+    ).to(device)
+    
+    # 优化器
+    params = list(student.parameters()) + list(projector.parameters()) + list(upsampler.parameters())
+    optimizer = optim.Adam(params, lr=1e-3)
+    
+    print()
+    print(f"🚀 开始过拟合训练 ({args.epochs} iterations)...")
+    
+    for i in range(args.epochs):
+        optimizer.zero_grad()
+        
+        feat = student(image)[-1]
+        tokens_49 = projector(feat)
+        tokens_256 = upsampler(tokens_49)
+        
+        loss = F.mse_loss(tokens_256, teacher_256)
+        loss.backward()
+        optimizer.step()
+        
+        if (i + 1) % 100 == 0 or i == 0:
+            cos_sim = F.cosine_similarity(
+                tokens_256.reshape(-1, args.target_hidden_size),
+                teacher_256.reshape(-1, args.target_hidden_size), dim=-1
+            ).mean()
+            print(f"   Iter {i+1}: loss={loss.item():.4f}, cos_sim={cos_sim.item():.4f}")
+    
+    # 最终验证
+    student.eval()
+    projector.eval()
+    upsampler.eval()
+    
+    with torch.no_grad():
+        feat = student(image)[-1]
+        tokens_49 = projector(feat)
+        tokens_256 = upsampler(tokens_49)
+        
+        cos_sim = F.cosine_similarity(
+            tokens_256.reshape(-1, args.target_hidden_size),
+            teacher_256.reshape(-1, args.target_hidden_size), dim=-1
+        ).mean()
+    
+    print()
+    print("=" * 60)
+    print(f"✅ 过拟合完成!")
+    print(f"   最终 cos_sim: {cos_sim.item():.4f}")
+    print(f"   输出 std: {tokens_256.std():.3f}")
+    print(f"   目标 std: {teacher_256.std():.3f}")
+    print("=" * 60)
+    
+    # 保存模型用于推理测试
+    output_path = Path(args.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    checkpoint = {
+        'student_state_dict': student.state_dict(),
+        'projector_state_dict': projector.state_dict(),
+        'upsampler_state_dict': upsampler.state_dict(),
+        'args': vars(args),
+        'overfit_image': img_path,
+        'final_cos_sim': cos_sim.item(),
+    }
+    
+    save_path = output_path / 'overfit_model.pth'
+    torch.save(checkpoint, save_path)
+    print(f"💾 模型已保存: {save_path}")
+    print()
+    print("📝 用以下命令测试推理:")
+    print(f"   python scripts/infer_hybrid.py --checkpoint {save_path} --image {img_path} --full_inference")
 
 
 if __name__ == '__main__':

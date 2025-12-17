@@ -203,22 +203,43 @@ class QwenFeatureExtractor:
 
 
 def get_image_paths(data_dir, split='train'):
-    """获取所有图片路径"""
+    """获取所有图片路径 (支持平铺目录或 ImageFolder 结构)"""
     data_path = Path(data_dir) / split
     if not data_path.exists():
         raise ValueError(f"路径不存在: {data_path}")
     
-    # 使用 ImageFolder 获取所有图片
-    dataset = ImageFolder(data_path)
+    print(f"📂 Scanning {data_path}...")
     
-    paths = []
-    for idx in range(len(dataset)):
-        img_path, label = dataset.samples[idx]
-        paths.append({
-            'path': img_path,
-            'label': label,
-            'idx': idx
-        })
+    # 检查是否有子目录 (ImageFolder 结构)
+    subdirs = [d for d in data_path.iterdir() if d.is_dir()]
+    
+    if len(subdirs) > 0:
+        # ImageFolder 结构 (如 ImageNet, Imagenette)
+        print(f"   检测到 ImageFolder 结构 ({len(subdirs)} 个类别)")
+        dataset = ImageFolder(data_path)
+        paths = []
+        for idx in range(len(dataset)):
+            img_path, label = dataset.samples[idx]
+            paths.append({
+                'path': img_path,
+                'label': label,
+                'idx': idx
+            })
+    else:
+        # 平铺目录 (如 COCO)
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+        image_files = sorted([
+            f for f in data_path.iterdir() 
+            if f.is_file() and f.suffix.lower() in image_extensions
+        ])
+        print(f"   检测到平铺目录 ({len(image_files)} 张图片)")
+        paths = []
+        for idx, img_path in enumerate(image_files):
+            paths.append({
+                'path': str(img_path),
+                'label': 0,  # 无标签
+                'idx': idx
+            })
     
     return paths
 
