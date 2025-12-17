@@ -70,8 +70,17 @@ class CloudUpsampler(nn.Module):
                 nn.GELU(),
             )
             
+        elif method == 'mlp':
+            # 方法3: Bilinear + MLP (最佳效果)
+            # 先用 bilinear 上采样，然后用 MLP 精炼每个 token
+            self.upsample = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size * 2),
+                nn.GELU(),
+                nn.Linear(hidden_size * 2, hidden_size),
+            )
+            
         elif method == 'transformer':
-            # 方法3: Transformer + 插值
+            # 方法4: Transformer + 插值
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_size, nhead=8, 
                 dim_feedforward=hidden_size * 4,
@@ -105,15 +114,21 @@ class CloudUpsampler(nn.Module):
         else:
             B = x.shape[0]
         
-        if self.method == 'transformer':
+        if self.method == 'mlp':
+            # MLP 方法: 先 bilinear 上采样，然后 MLP 精炼
+            x = F.interpolate(x, size=(self.target_size, self.target_size), 
+                             mode='bilinear', align_corners=False)
+            x = x.permute(0, 2, 3, 1).reshape(B, -1, self.hidden_size)  # (B, target_tokens, C)
+            x = self.upsample(x)  # MLP refinement
+            
+        elif self.method == 'transformer':
             # Transformer 方法: 先插值到目标大小，再用 Transformer 精炼
             x = F.interpolate(x, size=(self.target_size, self.target_size), 
                              mode='bilinear', align_corners=False)
-            # 转为 token 序列
             x = x.flatten(2).transpose(1, 2)  # (B, target_tokens, C)
             x = self.upsample(x)
         else:
-            # Conv 方法
+            # Conv 方法 (deconv, pixelshuffle)
             x = self.upsample(x)  # (B, C, H', W')
             
             # 精确调整到目标大小
