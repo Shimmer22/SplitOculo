@@ -166,6 +166,15 @@ python scripts/edge_client.py \
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Edge vs Cloud Comparison
+
+| | Edge | Cloud |
+|---|---|---|
+| **Components** | MobileNetV2 + StridedProjector + Bottleneck.encoder | Bottleneck.decoder + TransformerUpsampler |
+| **Weight File** | 11 MB | 486 MB |
+| **Active Params** | 2.87M | 126.63M |
+| **Extra Compute** | - | Qwen ViT [4:32] + Merger + LLM |
+
 ---
 
 ## 📝 Key Arguments

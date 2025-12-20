@@ -166,6 +166,15 @@ python scripts/edge_client.py \
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 端侧 vs 云端对比
+
+| | 端侧 | 云端 |
+|---|---|---|
+| **模型构成** | MobileNetV2 + StridedProjector + Bottleneck.encoder | Bottleneck.decoder + TransformerUpsampler |
+| **权重文件** | 11 MB | 486 MB |
+| **激活参数量** | 2.87M | 126.63M |
+| **额外计算** | - | Qwen ViT [4:32] + Merger + LLM |
+
 ---
 
 ## 📝 关键参数
