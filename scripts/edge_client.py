@@ -260,6 +260,8 @@ def main():
                         help='Prompt for the model')
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--timeout', type=int, default=300,
+                        help='Request timeout in seconds (default: 300)')
     
     args = parser.parse_args()
     
@@ -285,6 +287,7 @@ def main():
     
     # 发送到云端
     print(f"\n🌐 Sending to cloud server: {args.server}")
+    print(f"   Timeout: {args.timeout}s")
     
     try:
         start_time = time.time()
@@ -292,7 +295,7 @@ def main():
             f"{args.server}/infer",
             json=payload,
             headers={'Content-Type': 'application/json'},
-            timeout=60
+            timeout=args.timeout
         )
         network_time = time.time() - start_time
         

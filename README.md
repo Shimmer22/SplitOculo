@@ -13,41 +13,21 @@
 ## 📖 Overview
 
 SplitOculo enables **edge-cloud collaborative VLM inference**:
-- 🖥️ **Edge**: CNN + Projector → 49 tokens (61 KB)
-- ☁️ **Cloud**: Learned Upsampler → 256 tokens → Qwen blocks → LLM
+- 🖥️ **Edge**: CNN + Projector + Bottleneck → 3 KB compressed features
+- ☁️ **Cloud**: Decompress + Upsampler → 256 tokens → Qwen → LLM
 
 ---
 
-## 🆕 v2.0 Update: TransformerUpsampler + GAN Training
+## 🆕 v2.2 Update: Real Network-Split Deployment
 
 > [!TIP]
-> **v2.0 achieves cos_sim=0.89 with correct LLM outputs on training set images!**
+> **v2.2 supports real edge-cloud deployment via HTTP!**
 
 ### What's New
-- **TransformerUpsampler**: 4-layer Transformer with learned positional embedding (67M params)
-- **GAN Training**: Adversarial training produces sharper features
-- **FeatureDiscriminator**: Spectral-normalized discriminator for stable GAN training
-
-### Training Results
-
-| Phase | cos_sim | val_std | LLM Output |
-|-------|---------|---------|------------|
-| Warmup (MSE only) | 0.891 | 0.748 | - |
-| **GAN Finetuning** | **0.893** | **0.768** | ✅ Correct on training images |
-
-### Current Limitations
-
-> [!CAUTION]
-> **Generalization gap**: Works well on training set images, but **out-of-distribution images still produce incorrect outputs**.
-
-| Image Source | LLM Output Quality |
-|--------------|-------------------|
-| Training set | ✅ Correct (e.g., "a bear", "kitchen scene with cabinets") |
-| OOD images | ❌ Often incorrect or generic |
-
-### Root Cause
-- CNN features fundamentally differ from ViT global attention patterns
-- 0.89 cos_sim is still insufficient for robust cross-domain generalization
+- **Network Split**: `cloud_server.py` + `edge_client.py` for real edge-cloud separation
+- **Static Weight Splitting**: Use `split_checkpoint.py` to split AIO weights into edge (~11 MB) and cloud (~486 MB)
+- **Bottleneck Compression**: 61 KB → 3 KB, 20× compression ratio
+- **Offline Mode**: `--offline` flag for loading Qwen without internet
 
 ---
 
@@ -62,7 +42,7 @@ cd SplitOculo
 conda create -n cnn_vit python=3.10 -y
 conda activate cnn_vit
 
-pip install torch torchvision transformers timm tqdm pillow matplotlib
+pip install -r requirements.txt
 ```
 
 ### Step 1: Download Dataset (COCO val2017)
@@ -110,78 +90,114 @@ python scripts/precompute_qwen_features.py \
     --layer 4 --split val --batch_size 4
 ```
 
-### Step 3: Train with GAN (v2.0)
+### Step 3: Train (with Bottleneck)
 
-**Phase 1: Warmup (MSE only)**
 ```bash
+# Phase 1: Warmup
 python scripts/train_gan.py \
     --features_dir ./data/qwen_features \
     --data_dir ./data/coco \
     --phase warmup \
     --epochs 20 \
-    --batch_size 16 \
-    --output_dir ./checkpoints/gan_layer4
-```
+    --bottleneck_dim 64 \
+    --bottleneck_method linear \
+    --output_dir ./checkpoints/gan_bottleneck
 
-**Phase 2: GAN Finetuning**
-```bash
+# Phase 2: GAN Finetuning
 python scripts/train_gan.py \
     --features_dir ./data/qwen_features \
     --data_dir ./data/coco \
     --phase gan \
-    --warmup_checkpoint ./checkpoints/gan_layer4/warmup_best.pth \
-    --epochs 50 \
-    --lambda_mse 10.0 \
-    --lambda_adv 0.1 \
-    --output_dir ./checkpoints/gan_layer4
+    --warmup_checkpoint ./checkpoints/gan_bottleneck/warmup_best.pth \
+    --epochs 30 \
+    --bottleneck_dim 64 \
+    --output_dir ./checkpoints/gan_bottleneck
 ```
 
-### Step 4: Inference
+### Step 4: Split Weights
 
 ```bash
-python scripts/infer_hybrid.py \
-    --checkpoint ./checkpoints/gan_layer4/gan_best.pth \
-    --image ./data/coco/train/000000000285.jpg \
-    --full_inference
+python scripts/split_checkpoint.py \
+    --input ./checkpoints/gan_bottleneck/gan_best.pth \
+    --output_dir ./checkpoints/gan_bottleneck/split/
+```
+
+Output:
+- `edge_weights.pth` (~11 MB): CNN + Projector + Bottleneck.encoder
+- `cloud_weights.pth` (~486 MB): Bottleneck.decoder + Upsampler
+
+### Step 5: Network-Split Deployment
+
+**Cloud Server**:
+```bash
+python scripts/cloud_server.py \
+    --checkpoint ./checkpoints/gan_bottleneck/split/cloud_weights.pth \
+    --port 8080 \
+    --offline
+```
+
+**Edge Client**:
+```bash
+python scripts/edge_client.py \
+    --checkpoint ./checkpoints/gan_bottleneck/split/edge_weights.pth \
+    --image ./test.jpg \
+    --server http://CLOUD_IP:8080 \
+    --timeout 300
 ```
 
 ---
 
-## 📐 Architecture (v2.0)
+## 📐 Architecture (v2.2)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ EDGE                                                         │
-│  Image → CNN → Projector → 49 tokens (7×7, 1280 dim)        │
-└────────────────────────┬────────────────────────────────────┘
-                         │ ~61 KB int8
-┌────────────────────────▼────────────────────────────────────┐
-│ CLOUD                                                        │
-│  TransformerUpsampler → 256 tokens → Qwen[4:] → LLM         │
-│  (Bilinear + 4-layer Transformer + Learned PosEmbed)        │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│ EDGE                                      [edge_client.py]              │
+│  Image → MobileNet → Projector → Bottleneck.encode()                    │
+│                           ↓                                              │
+│              [49 × 64] int8 quantized → base64 encoded                  │
+└───────────────────────────────────────┬─────────────────────────────────┘
+                                        │ HTTP POST (~3 KB payload)
+┌───────────────────────────────────────▼─────────────────────────────────┐
+│ CLOUD                                     [cloud_server.py]             │
+│  Flask Server @ :8080                                                    │
+│  Dequantize → Bottleneck.decode() → Upsampler → Qwen[4:] → LLM         │
+│                           ↓                                              │
+│              JSON Response: {"response": "Image description..."}        │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
-
----
-
-## 🔬 Key Findings
-
-| Method | cos_sim | val_std | Works? |
-|--------|---------|---------|--------|
-| MLP (v1.0) | 0.87 | 0.74 | ❌ |
-| **TransformerUpsampler + GAN (v2.0)** | **0.89** | **0.77** | ✅ (training set) |
 
 ---
 
 ## 📝 Key Arguments
 
+### Training Arguments
+
 | Argument | Default | Description |
 |----------|---------|-------------|
+| `--bottleneck_dim` | 0 | Bottleneck dimension (recommended: 64/128) |
+| `--bottleneck_method` | linear | linear / mlp / autoencoder |
+| `--lambda_recon` | 0.1 | Reconstruction loss weight |
 | `--upsampler_type` | transformer | transformer / mlp / deconv |
 | `--phase` | - | warmup (MSE) / gan (adversarial) |
-| `--lambda_mse` | 10.0 | MSE loss weight (content) |
-| `--lambda_adv` | 0.1 | Adversarial loss weight (style) |
-| `--transformer_layers` | 4 | TransformerUpsampler depth |
+
+### Deployment Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--offline` | Offline mode, no HuggingFace connection |
+| `--qwen_path` | Qwen model path |
+| `--timeout` | Request timeout in seconds |
+
+---
+
+## 📊 Transmission Size Comparison
+
+| bottleneck_dim | Size (int8) | Compression |
+|----------------|-------------|-------------|
+| Disabled (1280) | 61 KB | 1× |
+| 128 | 6.1 KB | 10× |
+| **64** | **3.1 KB** | **20×** |
+| 32 | 1.5 KB | 40× |
 
 ---
 
