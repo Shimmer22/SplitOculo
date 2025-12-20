@@ -28,6 +28,7 @@ import math
 
 from models.cloud_upsampler import CloudUpsampler
 from models.projector_v3 import StridedProjector
+from models.bottleneck import DimensionBottleneck
 
 
 class EdgeProjector(nn.Module):
@@ -162,6 +163,26 @@ class HybridUpsamplerVLM:
         self.upsampler.load_state_dict(ckpt['upsampler_state_dict'])
         self.upsampler.eval()
         
+        # 瓶颈层 (可选)
+        bottleneck_dim = args.get('bottleneck_dim', 0)
+        self.hidden_size = hidden_size
+        self.bottleneck_dim = bottleneck_dim
+        
+        if bottleneck_dim > 0 and 'bottleneck_state_dict' in ckpt:
+            bottleneck_method = args.get('bottleneck_method', 'linear')
+            self.bottleneck = DimensionBottleneck(
+                hidden_size=hidden_size,
+                bottleneck_dim=bottleneck_dim,
+                method=bottleneck_method
+            ).to(device)
+            self.bottleneck.load_state_dict(ckpt['bottleneck_state_dict'])
+            self.bottleneck.eval()
+            print(f"   瓶颈层: {hidden_size} → {bottleneck_dim} → {hidden_size} ({bottleneck_method})")
+            print(f"   传输大小 (int8): {self.bottleneck.get_transmission_size_kb(self.transmission_tokens):.2f} KB")
+        else:
+            self.bottleneck = None
+            print(f"   无瓶颈层 (全维度传输)")
+        
         print(f"✅ 模型加载完成")
         
         self.qwen_model = None
@@ -195,14 +216,33 @@ class HybridUpsamplerVLM:
     
     @torch.no_grad()
     def encode_edge(self, image_tensor):
-        """端侧编码: Image → 49 tokens"""
+        """端侧编码: Image → 49 tokens (可选压缩)
+        
+        Returns:
+            tokens: 原始 tokens [B, 49, 1280] 或压缩后 [B, 49, bottleneck_dim]
+            compressed: 是否压缩
+        """
         feat = self.student(image_tensor)[-1]
         tokens = self.projector(feat)
-        return tokens
+        
+        # 如果有瓶颈层，进行压缩
+        if self.bottleneck is not None:
+            compressed_tokens = self.bottleneck.encode(tokens)
+            return compressed_tokens, True
+        return tokens, False
     
     @torch.no_grad()
-    def upsample_cloud(self, edge_tokens):
-        """云端上采样: 49 tokens → 256 tokens"""
+    def upsample_cloud(self, edge_tokens, is_compressed=False):
+        """云端上采样: tokens → 256 tokens
+        
+        Args:
+            edge_tokens: 端侧传输的 tokens
+            is_compressed: 是否是压缩后的 tokens
+        """
+        # 如果是压缩的，先解压
+        if is_compressed and self.bottleneck is not None:
+            edge_tokens = self.bottleneck.decode(edge_tokens)
+        
         upsampled = self.upsampler(edge_tokens)
         
         # 特征缩放以匹配 Qwen Layer 4 分布
@@ -410,19 +450,22 @@ def main():
     print(f"\nLoading image: {args.image}")
     
     # 端侧编码
-    print("\nEdge Encoding...")
-    edge_tokens = model.encode_edge(image)
-    print(f"   输出: {edge_tokens.shape} tokens")
+    print("\n📡 Edge Encoding...")
+    edge_tokens, is_compressed = model.encode_edge(image)
+    
+    if is_compressed:
+        print(f"   输出 (压缩): {edge_tokens.shape} tokens")
+        edge_size_kb = edge_tokens.numel() * 1 / 1024  # int8
+    else:
+        print(f"   输出 (未压缩): {edge_tokens.shape} tokens")
+        edge_size_kb = edge_tokens.numel() * 1 / 1024  # int8
+    
+    print(f"   传输大小 (int8): {edge_size_kb:.2f} KB")
     
     # 云端上采样
     print("\n☁️  云端上采样...")
-    upsampled_tokens = model.upsample_cloud(edge_tokens)
+    upsampled_tokens = model.upsample_cloud(edge_tokens, is_compressed=is_compressed)
     print(f"   上采样: {edge_tokens.shape[1]} → {upsampled_tokens.shape[1]} tokens")
-    
-    # 计算大小
-    edge_size_kb = edge_tokens.numel() * 1 / 1024  # int8
-    upsampled_size_kb = upsampled_tokens.numel() * 1 / 1024
-    print(f"   传输大小 (int8): {edge_size_kb:.2f} KB")
     
     if args.full_inference:
         print("\n☁️  云端完成推理 (Hybrid)...")

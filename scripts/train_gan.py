@@ -41,6 +41,7 @@ from core.utils import set_seed, get_logger, count_parameters
 from models.cloud_upsampler import CloudUpsampler, TransformerUpsampler
 from models.projector_v3 import StridedProjector
 from models.discriminator import FeatureDiscriminator
+from models.bottleneck import DimensionBottleneck
 
 
 class EdgeProjector(nn.Module):
@@ -146,14 +147,19 @@ class GANTrainer:
         self.bce_loss = nn.BCEWithLogitsLoss()
         
         # 记录参数量
+        bottleneck_params = count_parameters(self.bottleneck) if self.bottleneck else 0
         g_params = (count_parameters(self.student) + 
                    count_parameters(self.projector) + 
+                   bottleneck_params +
                    count_parameters(self.upsampler))
         d_params = count_parameters(self.discriminator)
         
         self.logger.info(f"Generator params: {g_params / 1e6:.2f}M")
         self.logger.info(f"  Student: {count_parameters(self.student) / 1e6:.2f}M")
         self.logger.info(f"  Projector: {count_parameters(self.projector) / 1e6:.2f}M")
+        if self.bottleneck:
+            self.logger.info(f"  Bottleneck: {bottleneck_params / 1e6:.2f}M (dim={args.bottleneck_dim}, method={args.bottleneck_method})")
+            self.logger.info(f"  Transmission size: {self.bottleneck.get_transmission_size_kb(args.transmission_tokens):.2f} KB")
         self.logger.info(f"  Upsampler: {count_parameters(self.upsampler) / 1e6:.2f}M")
         self.logger.info(f"Discriminator params: {d_params / 1e6:.2f}M")
     
@@ -215,6 +221,18 @@ class GANTrainer:
             ).to(self.device)
             self.logger.info(f"Using CloudUpsampler ({args.upsampler_type})")
         
+        # 瓶颈层 (可选)
+        if args.bottleneck_dim > 0:
+            self.bottleneck = DimensionBottleneck(
+                hidden_size=args.target_hidden_size,
+                bottleneck_dim=args.bottleneck_dim,
+                method=args.bottleneck_method
+            ).to(self.device)
+            self.logger.info(f"Using Bottleneck: {args.target_hidden_size} → {args.bottleneck_dim} → {args.target_hidden_size}")
+        else:
+            self.bottleneck = None
+            self.logger.info("No bottleneck (full dimension transmission)")
+        
         # Discriminator
         self.discriminator = FeatureDiscriminator(
             hidden_size=args.target_hidden_size,
@@ -233,6 +251,10 @@ class GANTrainer:
             list(self.projector.parameters()) +
             list(self.upsampler.parameters())
         )
+        
+        # 添加瓶颈层参数
+        if self.bottleneck is not None:
+            g_params += list(self.bottleneck.parameters())
         
         # Generator 优化器
         self.opt_G = optim.AdamW(g_params, lr=args.lr_g, weight_decay=args.weight_decay,
@@ -254,6 +276,10 @@ class GANTrainer:
         self.student.load_state_dict(ckpt['student_state_dict'])
         self.projector.load_state_dict(ckpt['projector_state_dict'])
         self.upsampler.load_state_dict(ckpt['upsampler_state_dict'])
+        
+        if 'bottleneck_state_dict' in ckpt and self.bottleneck is not None:
+            self.bottleneck.load_state_dict(ckpt['bottleneck_state_dict'])
+            self.logger.info("Loaded bottleneck weights")
         
         if 'discriminator_state_dict' in ckpt:
             self.discriminator.load_state_dict(ckpt['discriminator_state_dict'])
@@ -288,7 +314,14 @@ class GANTrainer:
             # Forward
             student_feat = self.student(images)[-1]
             edge_tokens = self.projector(student_feat)
-            output_tokens = self.upsampler(edge_tokens)
+            
+            # 瓶颈层压缩/解压
+            if self.bottleneck is not None:
+                decompressed, compressed = self.bottleneck(edge_tokens)
+                output_tokens = self.upsampler(decompressed)
+            else:
+                output_tokens = self.upsampler(edge_tokens)
+                compressed = None
             
             # 对齐 token 数量
             if output_tokens.shape[1] != teacher_tokens.shape[1]:
@@ -296,6 +329,11 @@ class GANTrainer:
             
             # MSE Loss
             loss = self.mse_loss(output_tokens, teacher_tokens)
+            
+            # 重建损失 (瓶颈层)
+            if self.bottleneck is not None and self.args.lambda_recon > 0:
+                loss_recon = self.mse_loss(decompressed, edge_tokens.detach())
+                loss = loss + self.args.lambda_recon * loss_recon
             
             self.opt_G.zero_grad()
             loss.backward()
@@ -352,6 +390,9 @@ class GANTrainer:
             with torch.no_grad():
                 student_feat = self.student(images)[-1]
                 edge_tokens = self.projector(student_feat)
+                if self.bottleneck is not None:
+                    decompressed, _ = self.bottleneck(edge_tokens)
+                    edge_tokens = decompressed
             fake_tokens = self.upsampler(edge_tokens).detach()
             
             pred_fake = self.discriminator(fake_tokens)
@@ -369,8 +410,15 @@ class GANTrainer:
             
             # 重新生成 (带梯度)
             student_feat = self.student(images)[-1]
-            edge_tokens = self.projector(student_feat)
-            fake_tokens = self.upsampler(edge_tokens)
+            edge_tokens_raw = self.projector(student_feat)
+            
+            # 瓶颈层
+            if self.bottleneck is not None:
+                decompressed, compressed = self.bottleneck(edge_tokens_raw)
+                fake_tokens = self.upsampler(decompressed)
+            else:
+                fake_tokens = self.upsampler(edge_tokens_raw)
+                decompressed = None
             
             # 内容损失 (MSE)
             loss_mse = self.mse_loss(fake_tokens, teacher_tokens)
@@ -379,8 +427,13 @@ class GANTrainer:
             pred_fake = self.discriminator(fake_tokens)
             loss_adv = self.bce_loss(pred_fake, torch.ones_like(pred_fake))
             
+            # 重建损失
+            loss_recon = 0
+            if self.bottleneck is not None and self.args.lambda_recon > 0:
+                loss_recon = self.mse_loss(decompressed, edge_tokens_raw.detach())
+            
             # 组合损失
-            loss_g = loss_mse * self.args.lambda_mse + loss_adv * self.args.lambda_adv
+            loss_g = loss_mse * self.args.lambda_mse + loss_adv * self.args.lambda_adv + loss_recon * self.args.lambda_recon
             
             loss_g.backward()
             self.opt_G.step()
@@ -429,7 +482,13 @@ class GANTrainer:
             
             student_feat = self.student(images)[-1]
             edge_tokens = self.projector(student_feat)
-            output_tokens = self.upsampler(edge_tokens)
+            
+            # 瓶颈层
+            if self.bottleneck is not None:
+                decompressed, _ = self.bottleneck(edge_tokens)
+                output_tokens = self.upsampler(decompressed)
+            else:
+                output_tokens = self.upsampler(edge_tokens)
             
             if output_tokens.shape[1] != teacher_tokens.shape[1]:
                 teacher_tokens = self._align_tokens(teacher_tokens, output_tokens.shape[1])
@@ -467,6 +526,10 @@ class GANTrainer:
             'metrics': metrics,
             'args': vars(self.args)
         }
+        
+        # 保存瓶颈层权重
+        if self.bottleneck is not None:
+            checkpoint['bottleneck_state_dict'] = self.bottleneck.state_dict()
         
         torch.save(checkpoint, self.output_dir / f'{prefix}latest.pth')
         
@@ -599,6 +662,15 @@ def main():
                         help='MSE 损失权重 (内容)')
     parser.add_argument('--lambda_adv', type=float, default=0.1,
                         help='对抗损失权重 (样式)')
+    parser.add_argument('--lambda_recon', type=float, default=0.1,
+                        help='瓶颈层重建损失权重')
+    
+    # 瓶颈层参数
+    parser.add_argument('--bottleneck_dim', type=int, default=0,
+                        help='瓶颈层维度 (0 = 禁用瓶颈层)')
+    parser.add_argument('--bottleneck_method', type=str, default='linear',
+                        choices=['linear', 'mlp', 'autoencoder'],
+                        help='瓶颈层方法')
     
     # 其他
     parser.add_argument('--device', type=str,

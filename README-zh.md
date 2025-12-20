@@ -136,6 +136,20 @@ python scripts/train_gan.py \
     --output_dir ./checkpoints/gan_layer4
 ```
 
+**启用瓶颈层压缩 (v2.1)** 🆕
+```bash
+# 使用线性瓶颈层，压缩到 64 维 (~3 KB 传输)
+python scripts/train_gan.py \
+    --features_dir ./data/qwen_features \
+    --data_dir ./data/coco \
+    --phase warmup \
+    --epochs 20 \
+    --bottleneck_dim 64 \
+    --bottleneck_method linear \
+    --lambda_recon 0.1 \
+    --output_dir ./checkpoints/gan_bottleneck
+```
+
 ### 步骤 4: 推理
 
 ```bash
@@ -147,19 +161,22 @@ python scripts/infer_hybrid.py \
 
 ---
 
-## 📐 架构 (v2.0)
+## 📐 架构 (v2.1)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ 端侧 (EDGE)                                                  │
-│  图像 → CNN → Projector → 49 tokens (7×7, 1280 维)           │
-└────────────────────────┬────────────────────────────────────┘
-                         │ ~61 KB int8
-┌────────────────────────▼────────────────────────────────────┐
-│ 云端 (CLOUD)                                                 │
-│  TransformerUpsampler → 256 tokens → Qwen[4:] → LLM         │
-│  (双线性插值 + 4层 Transformer + Learned PosEmbed)           │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 端侧 (EDGE)                                                              │
+│  图像 → CNN → Projector → 49 tokens (7×7, 1280 维)                       │
+│                    ↓                                                     │
+│           Bottleneck.encode() → 49 tokens (7×7, 64 维) 🆕                │
+└───────────────────────────────────────┬─────────────────────────────────┘
+                                        │ ~3 KB int8 (压缩 20×)
+┌───────────────────────────────────────▼─────────────────────────────────┐
+│ 云端 (CLOUD)                                                             │
+│  Bottleneck.decode() → 49 tokens (1280 维) 🆕                            │
+│                    ↓                                                     │
+│  TransformerUpsampler → 256 tokens → Qwen[4:] → LLM                     │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -182,6 +199,9 @@ python scripts/infer_hybrid.py \
 | `--lambda_mse` | 10.0 | MSE 损失权重 (内容) |
 | `--lambda_adv` | 0.1 | 对抗损失权重 (风格) |
 | `--transformer_layers` | 4 | TransformerUpsampler 层数 |
+| `--bottleneck_dim` | 0 | 瓶颈层维度 (0=禁用, 推荐 64/128) 🆕 |
+| `--bottleneck_method` | linear | linear / mlp / autoencoder 🆕 |
+| `--lambda_recon` | 0.1 | 瓶颈层重建损失权重 🆕 |
 
 ---
 
