@@ -125,16 +125,27 @@ class EdgeEncoder:
         bottleneck_dim = args.get('bottleneck_dim', 0)
         self.bottleneck_dim = bottleneck_dim
         
-        if bottleneck_dim > 0 and 'bottleneck_state_dict' in ckpt:
+        if bottleneck_dim > 0:
             bottleneck_method = args.get('bottleneck_method', 'linear')
             self.bottleneck = DimensionBottleneck(
                 hidden_size=hidden_size,
                 bottleneck_dim=bottleneck_dim,
                 method=bottleneck_method
             ).to(device)
-            self.bottleneck.load_state_dict(ckpt['bottleneck_state_dict'])
+            
+            # 支持拆分权重和 AIO 权重
+            if 'bottleneck_encoder_state_dict' in ckpt:
+                # 拆分权重: 只有 encoder 部分
+                self.bottleneck.encoder.load_state_dict(ckpt['bottleneck_encoder_state_dict'])
+                print(f"   Bottleneck encoder (split): {hidden_size} → {bottleneck_dim}")
+            elif 'bottleneck_state_dict' in ckpt:
+                # AIO 权重: 完整 bottleneck
+                self.bottleneck.load_state_dict(ckpt['bottleneck_state_dict'])
+                print(f"   Bottleneck encoder (AIO): {hidden_size} → {bottleneck_dim}")
+            else:
+                print(f"   ⚠️ No bottleneck weights found, using random init")
+            
             self.bottleneck.eval()
-            print(f"   Bottleneck encoder: {hidden_size} → {bottleneck_dim}")
         else:
             self.bottleneck = None
             print(f"   No bottleneck (full dimension)")
