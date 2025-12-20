@@ -27,6 +27,7 @@ from torchvision import transforms
 import math
 
 from models.cloud_upsampler import CloudUpsampler
+from models.projector_v3 import StridedProjector
 
 
 class EdgeProjector(nn.Module):
@@ -105,12 +106,25 @@ class HybridUpsamplerVLM:
             student_channels = self.student(dummy)[-1].shape[1]
         
         # 端侧 Projector
-        self.projector = EdgeProjector(
-            in_channels=student_channels,
-            hidden_size=hidden_size,
-            hidden_channels=args.get('projector_hidden', 512),
-            transmission_tokens=self.transmission_tokens
-        ).to(device)
+        # 端侧 Projector
+        projector_type = args.get('projector_type', 'pooling')
+        if projector_type == 'strided':
+            self.projector = StridedProjector(
+                in_channels=student_channels,
+                hidden_size=hidden_size,
+                hidden_channels=args.get('projector_hidden', 512),
+                transmission_tokens=self.transmission_tokens
+            ).to(device)
+            print(f"   Using StridedProjector (v3)")
+        else:
+            self.projector = EdgeProjector(
+                in_channels=student_channels,
+                hidden_size=hidden_size,
+                hidden_channels=args.get('projector_hidden', 512),
+                transmission_tokens=self.transmission_tokens
+            ).to(device)
+            print(f"   Using EdgeProjector (pooling)")
+            
         self.projector.load_state_dict(ckpt['projector_state_dict'])
         self.projector.eval()
         
@@ -127,6 +141,16 @@ class HybridUpsamplerVLM:
                 num_layers=transformer_layers
             ).to(device)
             print(f"   使用 TransformerUpsampler ({transformer_layers} layers)")
+            
+            # 重新实例化以包含 initial_upsample 参数
+            initial_upsample = args.get('initial_upsample', 'bilinear')
+            self.upsampler = TransformerUpsampler(
+                hidden_size=hidden_size,
+                input_tokens=self.transmission_tokens,
+                target_tokens=self.target_tokens,
+                num_layers=transformer_layers,
+                initial_upsample=initial_upsample
+            ).to(device)
         else:
             self.upsampler = CloudUpsampler(
                 hidden_size=hidden_size,
@@ -298,6 +322,50 @@ class HybridUpsamplerVLM:
         
         return response
 
+    @torch.no_grad()
+    def generate_original(self, image_path, prompt):
+        """标准 Qwen 完整推理"""
+        if self.qwen_model is None:
+            self.load_qwen()
+            
+        from qwen_vl_utils import process_vision_info
+        
+        # 准备消息格式
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image_path},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        
+        # 处理输入
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(self.device)
+        
+        # 生成
+        generated_ids = self.qwen_model.generate(**inputs, max_new_tokens=256)
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        response = self.processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+        
+        return response
+
 
 def get_image_transform(size=224):
     return transforms.Compose([
@@ -317,13 +385,15 @@ def main():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--full_inference', action='store_true',
                         help='Run complete inference including Qwen')
+    parser.add_argument('--original', action='store_true',
+                        help='Run standard Qwen inference for comparison')
     parser.add_argument('--prompt', type=str, default='这张图里有什么?')
     
     args = parser.parse_args()
     device = torch.device(args.device)
     
     print("=" * 60)
-    print("🔧 Hybrid Inference with Learned Upsampler")
+    print("Hybrid Inference with Learned Upsampler")
     print("=" * 60)
     
     # 加载模型
@@ -337,10 +407,10 @@ def main():
     transform = get_image_transform(224)
     img = Image.open(args.image).convert('RGB')
     image = transform(img).unsqueeze(0).to(device)
-    print(f"\n📷 加载图像: {args.image}")
+    print(f"\nLoading image: {args.image}")
     
     # 端侧编码
-    print("\n🖥️  端侧 (Edge) 编码...")
+    print("\nEdge Encoding...")
     edge_tokens = model.encode_edge(image)
     print(f"   输出: {edge_tokens.shape} tokens")
     
@@ -355,17 +425,24 @@ def main():
     print(f"   传输大小 (int8): {edge_size_kb:.2f} KB")
     
     if args.full_inference:
-        print("\n☁️  云端完成推理...")
-        model.load_qwen()
+        print("\n☁️  云端完成推理 (Hybrid)...")
+        if model.qwen_model is None:
+            model.load_qwen()
         
         visual_tokens = model.complete_visual_encoding(upsampled_tokens)
         print(f"   视觉 tokens: {visual_tokens.shape}")
         
-        print(f"\n💬 生成回复 (prompt: {args.prompt})")
+        print(f"\n💬 生成回复 (Hybrid, prompt: {args.prompt})")
         response = model.generate(visual_tokens, args.prompt)
         
-        print(f"\n🤖 回复:")
+        print(f"\n🤖 Hybrid 回复:")
         print(response)
+
+    if args.original:
+        print("\n🚀 运行标准 Qwen 推理 (Original)...")
+        response_ori = model.generate_original(args.image, args.prompt)
+        print(f"\n🤖 Original Qwen 回复:")
+        print(response_ori)
     
     print("\n" + "=" * 60)
 

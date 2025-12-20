@@ -39,6 +39,7 @@ import math
 
 from core.utils import set_seed, get_logger, count_parameters
 from models.cloud_upsampler import CloudUpsampler, TransformerUpsampler
+from models.projector_v3 import StridedProjector
 from models.discriminator import FeatureDiscriminator
 
 
@@ -178,12 +179,22 @@ class GANTrainer:
         self.logger.info(f"Student output: {student_channels} channels")
         
         # 端侧 Projector
-        self.projector = EdgeProjector(
-            in_channels=student_channels,
-            hidden_size=args.target_hidden_size,
-            hidden_channels=args.projector_hidden,
-            transmission_tokens=args.transmission_tokens
-        ).to(self.device)
+        if args.projector_type == 'strided':
+            self.projector = StridedProjector(
+                in_channels=student_channels,
+                hidden_size=args.target_hidden_size,
+                hidden_channels=args.projector_hidden,
+                transmission_tokens=args.transmission_tokens
+            ).to(self.device)
+            self.logger.info(f"Using StridedProjector (v3)")
+        else:
+            self.projector = EdgeProjector(
+                in_channels=student_channels,
+                hidden_size=args.target_hidden_size,
+                hidden_channels=args.projector_hidden,
+                transmission_tokens=args.transmission_tokens
+            ).to(self.device)
+            self.logger.info(f"Using EdgeProjector (pooling, v2)")
         
         # 云端 Upsampler (使用 TransformerUpsampler)
         if args.upsampler_type == 'transformer':
@@ -191,9 +202,10 @@ class GANTrainer:
                 hidden_size=args.target_hidden_size,
                 input_tokens=args.transmission_tokens,
                 target_tokens=args.target_tokens,
-                num_layers=args.transformer_layers
+                num_layers=args.transformer_layers,
+                initial_upsample=args.initial_upsample
             ).to(self.device)
-            self.logger.info(f"Using TransformerUpsampler with {args.transformer_layers} layers")
+            self.logger.info(f"Using TransformerUpsampler with {args.transformer_layers} layers ({args.initial_upsample})")
         else:
             self.upsampler = CloudUpsampler(
                 hidden_size=args.target_hidden_size,
@@ -460,7 +472,7 @@ class GANTrainer:
         
         if is_best:
             torch.save(checkpoint, self.output_dir / f'{prefix}best.pth')
-            self.logger.info(f"💾 Saved best model (cos_sim: {metrics['val_cos_sim']:.4f})")
+            self.logger.info(f"[Saved best model] cos_sim: {metrics['val_cos_sim']:.4f}")
     
     def train_warmup(self, train_loader, val_loader):
         """Phase 1: Warmup 训练"""
@@ -553,6 +565,12 @@ def main():
     # Token 参数
     parser.add_argument('--transmission_tokens', type=int, default=49)
     parser.add_argument('--target_tokens', type=int, default=256)
+    
+    # Architecture variants
+    parser.add_argument('--projector_type', type=str, default='strided',
+                        choices=['pooling', 'strided'])
+    parser.add_argument('--initial_upsample', type=str, default='pixelshuffle',
+                        choices=['bilinear', 'pixelshuffle'])
     
     # Upsampler 参数
     parser.add_argument('--upsampler_type', type=str, default='transformer',

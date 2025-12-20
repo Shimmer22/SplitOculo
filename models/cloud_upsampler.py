@@ -151,24 +151,35 @@ class TransformerUpsampler(nn.Module):
     Transformer-based Upsampler for SplitOculo v2.0
     
     核心思想:
-    1. 先用双线性插值将 49 tokens 拉伸到 256 tokens（空间对齐）
+    1. 先用双线性插值或PixelShuffle将 49 tokens 拉伸到 256 tokens（空间对齐）
     2. 用 Transformer Encoder 进行全局上下文混合（模拟 ViT 的 Self-Attention）
     3. 加入 Learned Positional Embedding（因为上采样后位置信息需要重新注入）
     
     这让 CNN 特征能够"看到"全局信息，弥补 CNN 只能看局部的缺陷。
     """
-    def __init__(self, hidden_size=1280, input_tokens=49, target_tokens=256, num_layers=4):
+    def __init__(self, hidden_size=1280, input_tokens=49, target_tokens=256, num_layers=4,
+                 initial_upsample='bilinear'):
         super().__init__()
         self.input_size = int(input_tokens ** 0.5)   # 7
         self.target_size = int(target_tokens ** 0.5)  # 16
         self.hidden_size = hidden_size
         self.target_tokens = target_tokens
+        self.initial_upsample = initial_upsample
         
         # 1. 预处理: 简单的 Conv 层，在空间维度上做一些平滑
         self.pre_process = nn.Sequential(
             nn.Conv2d(hidden_size, hidden_size, kernel_size=3, padding=1),
             nn.GELU()
         )
+        
+        # PixelShuffle 模块 (如果是 pixelshuffle 模式)
+        if initial_upsample == 'pixelshuffle':
+            # 7x7 -> 14x14
+            self.pixel_shuffle = nn.Sequential(
+                nn.Conv2d(hidden_size, hidden_size * 4, kernel_size=3, padding=1),
+                nn.PixelShuffle(2),
+                nn.GELU()
+            )
         
         # 2. Transformer Encoder: 核心是让每个 token 能看到所有其他 token
         encoder_layer = nn.TransformerEncoderLayer(
@@ -205,9 +216,18 @@ class TransformerUpsampler(nn.Module):
         # 1. 预处理
         x = self.pre_process(x)
         
-        # 2. 双线性插值: 7x7 → 16x16
-        x = F.interpolate(x, size=(self.target_size, self.target_size), 
-                         mode='bilinear', align_corners=False)
+        # 2. 上采样
+        if self.initial_upsample == 'pixelshuffle':
+            # 7x7 -> 14x14 (Learned)
+            x = self.pixel_shuffle(x)
+            # 14x14 -> 16x16 (Bilinear)
+            if x.shape[2] != self.target_size:
+                 x = F.interpolate(x, size=(self.target_size, self.target_size), 
+                                  mode='bilinear', align_corners=False)
+        else:
+            # 7x7 -> 16x16 (Bilinear only)
+            x = F.interpolate(x, size=(self.target_size, self.target_size), 
+                             mode='bilinear', align_corners=False)
         
         # 3. 转为 token 序列: [B, 256, 1280]
         x = x.flatten(2).transpose(1, 2)
