@@ -7,3 +7,7 @@ pandas
 numpy
 matplotlib
 tqdm
+
+# Edge-Cloud communication
+flask
+requests
