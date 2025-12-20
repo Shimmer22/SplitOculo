@@ -135,8 +135,9 @@ class EdgeEncoder:
             
             # 支持拆分权重和 AIO 权重
             if 'bottleneck_encoder_state_dict' in ckpt:
-                # 拆分权重: 只有 encoder 部分
-                self.bottleneck.encoder.load_state_dict(ckpt['bottleneck_encoder_state_dict'])
+                # 拆分权重: 只有 encoder 部分，需要去掉 'encoder.' 前缀
+                encoder_sd = {k.replace('encoder.', ''): v for k, v in ckpt['bottleneck_encoder_state_dict'].items()}
+                self.bottleneck.encoder.load_state_dict(encoder_sd)
                 print(f"   Bottleneck encoder (split): {hidden_size} → {bottleneck_dim}")
             elif 'bottleneck_state_dict' in ckpt:
                 # AIO 权重: 完整 bottleneck

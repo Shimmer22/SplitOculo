@@ -64,8 +64,9 @@ class CloudInferenceEngine:
             
             # 支持拆分权重和 AIO 权重
             if 'bottleneck_decoder_state_dict' in ckpt:
-                # 拆分权重: 只有 decoder 部分
-                self.bottleneck.decoder.load_state_dict(ckpt['bottleneck_decoder_state_dict'])
+                # 拆分权重: 只有 decoder 部分，需要去掉 'decoder.' 前缀
+                decoder_sd = {k.replace('decoder.', ''): v for k, v in ckpt['bottleneck_decoder_state_dict'].items()}
+                self.bottleneck.decoder.load_state_dict(decoder_sd)
                 print(f"   Bottleneck decoder (split): {bottleneck_dim} → {hidden_size}")
             elif 'bottleneck_state_dict' in ckpt:
                 # AIO 权重: 完整 bottleneck
