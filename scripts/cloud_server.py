@@ -112,12 +112,15 @@ class CloudInferenceEngine:
         self.qwen_model = None
         self.processor = None
     
-    def load_qwen(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct"):
+    def load_qwen(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct", local_only=False):
         """加载 Qwen 模型"""
         if self.qwen_model is not None:
             return
         
         print(f"📥 Loading Qwen from {model_name}...")
+        if local_only:
+            print("   (离线模式，不连接 HuggingFace)")
+        
         from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
         
         self.qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -125,10 +128,12 @@ class CloudInferenceEngine:
             torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
+            local_files_only=local_only,
         )
         self.processor = AutoProcessor.from_pretrained(
             model_name,
-            trust_remote_code=True
+            trust_remote_code=True,
+            local_files_only=local_only,
         )
         
         for param in self.qwen_model.parameters():
@@ -195,7 +200,9 @@ class CloudInferenceEngine:
         
         # 4. Qwen 后续处理
         if self.qwen_model is None:
-            self.load_qwen()
+            model_path = getattr(self, 'qwen_path', "Qwen/Qwen2.5-VL-3B-Instruct")
+            offline = getattr(self, 'offline_mode', False)
+            self.load_qwen(model_name=model_path, local_only=offline)
         
         visual = self.qwen_model.visual
         B = upsampled.shape[0]
@@ -344,6 +351,10 @@ def main():
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--preload_qwen', action='store_true',
                         help='Preload Qwen model on startup')
+    parser.add_argument('--offline', action='store_true',
+                        help='Use cached Qwen model, do not connect to HuggingFace')
+    parser.add_argument('--qwen_path', type=str, default="Qwen/Qwen2.5-VL-3B-Instruct",
+                        help='Qwen model path (local path or HuggingFace ID)')
     
     args = parser.parse_args()
     
@@ -356,8 +367,12 @@ def main():
         device=args.device
     )
     
+    # 存储配置供后续使用
+    engine.qwen_path = args.qwen_path
+    engine.offline_mode = args.offline
+    
     if args.preload_qwen:
-        engine.load_qwen()
+        engine.load_qwen(model_name=args.qwen_path, local_only=args.offline)
     
     print(f"\n🚀 Starting server on {args.host}:{args.port}")
     print(f"   POST /infer - Run inference")
