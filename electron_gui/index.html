@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SplitOculo - Edge-Cloud VLM Monitor</title>
+  <link rel="stylesheet" href="styles/main.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="app-header">
+    <div class="logo-section">
+      <h1>🔮 SplitOculo</h1>
+      <span class="subtitle">Edge-Cloud VLM Inference</span>
+    </div>
+    <div class="status-indicators">
+      <div class="status-item" id="edge-status">
+        <span class="status-dot offline"></span>
+        <span>Edge: Offline</span>
+      </div>
+      <div class="status-item" id="cloud-status">
+        <span class="status-dot offline"></span>
+        <span>Cloud: Offline</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Navigation Tabs -->
+  <nav class="tab-nav">
+    <button class="tab-button active" data-tab="dashboard">
+      📊 Dashboard
+    </button>
+    <button class="tab-button" data-tab="testing">
+      🧪 Testing
+    </button>
+    <button class="tab-button" data-tab="config">
+      ⚙️ Config
+    </button>
+    <button class="tab-button" data-tab="logs">
+      📝 Logs
+    </button>
+  </nav>
+
+  <!-- Main Content Area -->
+  <main class="content-area">
+    <!-- Dashboard View -->
+    <section class="tab-content active" id="dashboard-tab">
+      <div class="dashboard-grid">
+        <!-- Service Status Cards -->
+        <div class="card status-card">
+          <h3>☁️ Cloud Server</h3>
+          <div class="status-content">
+            <div class="status-indicator" id="cloud-indicator">
+              <div class="status-circle offline"></div>
+              <span id="cloud-status-text">Offline</span>
+            </div>
+            <div class="server-info">
+              <p><strong>Weights:</strong> <span id="cloud-weight-size">N/A</span></p>
+              <p><strong>Port:</strong> <span id="cloud-port">8080</span></p>
+            </div>
+            <button class="btn btn-primary" id="toggle-cloud-server">Start Server</button>
+          </div>
+        </div>
+
+        <div class="card status-card">
+          <h3>📱 Edge Client</h3>
+          <div class="status-content">
+            <div class="status-indicator" id="edge-indicator">
+              <div class="status-circle ready"></div>
+              <span id="edge-status-text">Ready</span>
+            </div>
+            <div class="server-info">
+              <p><strong>Weights:</strong> <span id="edge-weight-size">N/A</span></p>
+              <p><strong>Device:</strong> <span id="edge-device">cuda</span></p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Quick Inference -->
+        <div class="card quick-inference-card">
+          <h3>⚡ Quick Inference</h3>
+          <div class="dropzone" id="quick-dropzone">
+            <div class="dropzone-content">
+              <p class="dropzone-icon">🖼️</p>
+              <p class="dropzone-text">Drop image here or click to select</p>
+              <input type="file" id="quick-file-input" accept="image/*" hidden>
+            </div>
+          </div>
+          <div id="quick-result" class="inference-result hidden">
+            <p class="result-text"></p>
+            <div class="result-metrics">
+              <span class="metric">⏱️ <span id="quick-latency">0</span>ms</span>
+              <span class="metric">📦 <span id="quick-payload">0</span>KB</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Performance Charts -->
+        <div class="card chart-card">
+          <h3>📈 Latency Trend</h3>
+          <canvas id="latency-chart"></canvas>
+        </div>
+
+        <div class="card chart-card">
+          <h3>📊 Compression Ratio</h3>
+          <canvas id="compression-chart"></canvas>
+        </div>
+
+        <div class="card metrics-card">
+          <h3>📊 Performance Metrics</h3>
+          <div class="metrics-grid">
+            <div class="metric-item">
+              <span class="metric-label">Avg Latency</span>
+              <span class="metric-value" id="avg-latency">--</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">Compression</span>
+              <span class="metric-value" id="compression-ratio">--</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">Throughput</span>
+              <span class="metric-value" id="throughput">--</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">Total Inferences</span>
+              <span class="metric-value" id="total-inferences">0</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Testing View -->
+    <section class="tab-content" id="testing-tab">
+      <div class="testing-grid">
+        <!-- Image Upload -->
+        <div class="card upload-card">
+          <h3>📷 Image Upload</h3>
+          <div class="dropzone large" id="test-dropzone">
+            <div class="dropzone-content">
+              <p class="dropzone-icon">🖼️</p>
+              <p class="dropzone-text">Drop image here or click to select</p>
+              <input type="file" id="test-file-input" accept="image/*" hidden>
+            </div>
+            <img id="preview-image" class="preview-image hidden" alt="Preview">
+          </div>
+        </div>
+
+        <!-- Inference Settings -->
+        <div class="card settings-card">
+          <h3>⚙️ Inference Settings</h3>
+          <div class="form-group">
+            <label>Edge Checkpoint</label>
+            <div class="file-selector">
+              <input type="text" id="test-edge-checkpoint" placeholder="Select checkpoint file" readonly>
+              <button class="btn-icon" id="select-edge-checkpoint">📁</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Server URL</label>
+            <input type="text" id="test-server-url" value="http://localhost:8080">
+          </div>
+          <div class="form-group">
+            <label>Prompt</label>
+            <input type="text" id="test-prompt" value="这张图里有什么?">
+          </div>
+          <div class="form-group">
+            <label>Timeout (seconds)</label>
+            <input type="number" id="test-timeout" value="300">
+          </div>
+          <button class="btn btn-primary btn-large" id="run-inference-btn" disabled>
+            Run Inference
+          </button>
+        </div>
+
+        <!-- Results Display -->
+        <div class="card result-card">
+          <h3>💬 Inference Result</h3>
+          <div id="test-result-container" class="result-container">
+            <p class="placeholder-text">Run an inference to see results here</p>
+          </div>
+          <div id="test-metrics" class="metrics-display hidden">
+            <div class="metric-row">
+              <span class="label">Edge Encode:</span>
+              <span class="value" id="result-encode-time">--</span>
+            </div>
+            <div class="metric-row">
+              <span class="label">Payload Size:</span>
+              <span class="value" id="result-payload">--</span>
+            </div>
+            <div class="metric-row">
+              <span class="label">Network Time:</span>
+              <span class="value" id="result-network">--</span>
+            </div>
+            <div class="metric-row">
+              <span class="label">Cloud Latency:</span>
+              <span class="value" id="result-cloud">--</span>
+            </div>
+            <div class="metric-row">
+              <span class="label">Total Time:</span>
+              <span class="value" id="result-total">--</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Config View -->
+    <section class="tab-content" id="config-tab">
+      <div class="config-grid">
+        <div class="card config-card">
+          <h3>☁️ Cloud Server Configuration</h3>
+          <div class="form-group">
+            <label>Checkpoint Path</label>
+            <div class="file-selector">
+              <input type="text" id="config-cloud-checkpoint" placeholder="Select checkpoint file">
+              <button class="btn-icon" id="select-cloud-checkpoint">📁</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Host</label>
+            <input type="text" id="config-cloud-host" value="0.0.0.0">
+          </div>
+          <div class="form-group">
+            <label>Port</label>
+            <input type="number" id="config-cloud-port" value="8080">
+          </div>
+          <div class="form-group">
+            <label>Qwen Model Path</label>
+            <input type="text" id="config-qwen-path" value="Qwen/Qwen2.5-VL-3B-Instruct">
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="config-offline-mode">
+              Offline Mode (use cached model)
+            </label>
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="config-preload-qwen">
+              Preload Qwen on startup
+            </label>
+          </div>
+        </div>
+
+        <div class="card config-card">
+          <h3>📱 Edge Client Configuration</h3>
+          <div class="form-group">
+            <label>Default Checkpoint Path</label>
+            <div class="file-selector">
+              <input type="text" id="config-edge-checkpoint" placeholder="Select checkpoint file">
+              <button class="btn-icon" id="select-edge-config-checkpoint">📁</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Device</label>
+            <select id="config-edge-device">
+              <option value="cuda">CUDA (GPU)</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Default Timeout (seconds)</label>
+            <input type="number" id="config-edge-timeout" value="300">
+          </div>
+        </div>
+
+        <div class="card config-actions">
+          <button class="btn btn-success btn-large" id="save-config-btn">💾 Save Configuration</button>
+          <button class="btn btn-secondary btn-large" id="load-config-btn">📂 Load Configuration</button>
+          <div id="config-message" class="config-message hidden"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Logs View -->
+    <section class="tab-content" id="logs-tab">
+      <div class="logs-container">
+        <div class="logs-header">
+          <h3>📝 System Logs</h3>
+          <div class="logs-controls">
+            <button class="btn btn-small" id="clear-logs-btn">Clear</button>
+            <button class="btn btn-small" id="export-logs-btn">Export</button>
+          </div>
+        </div>
+        <div class="logs-content" id="logs-content">
+          <p class="log-entry info">[INFO] SplitOculo GUI started</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Scripts -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="renderer/dashboard.js"></script>
+  <script src="renderer/testing.js"></script>
+  <script src="renderer/config.js"></script>
+  <script src="renderer/logs.js"></script>
+  <script src="renderer/navigation.js"></script>
+</body>
+</html>
