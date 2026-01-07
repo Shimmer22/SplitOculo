@@ -33,6 +33,24 @@ SplitOculo enables **edge-cloud collaborative VLM inference**:
 
 ## 🚀 Quick Start
 
+### 📥 Download Pretrained Weights (Optional)
+
+If you want to skip training and use pretrained split weights directly:
+
+```bash
+# Download split weights
+wget https://github.com/Shimmer22/SplitOculo/releases/download/v2.2/edge_weights.pth -O checkpoints/split/edge_weights.pth
+wget https://github.com/Shimmer22/SplitOculo/releases/download/v2.2/cloud_weights.pth -O checkpoints/split/cloud_weights.pth
+```
+
+Or manually download:
+- **[edge_weights.pth](https://github.com/Shimmer22/SplitOculo/releases/download/v2.2/edge_weights.pth)** (11 MB) - Edge weights
+- **[cloud_weights.pth](https://github.com/Shimmer22/SplitOculo/releases/download/v2.2/cloud_weights.pth)** (486 MB) - Cloud weights
+
+Place the downloaded files in `checkpoints/split/` and jump directly to **Step 5: Network-Split Deployment**.
+
+---
+
 ### Step 0: Setup Environment
 
 ```bash

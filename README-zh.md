@@ -33,6 +33,24 @@ SplitOculo 实现 **边端-云端协同 VLM 推理**：
 
 ## 🚀 快速开始
 
+### 📥 下载预训练权重 (可选)
+
+如果你想跳过训练步骤直接使用预训练的拆分权重：
+
+```bash
+# 下载拆分后的权重文件
+wget https://github.com/Shimmer22/SplitOculo/releases/download/v2.2/edge_weights.pth -O checkpoints/split/edge_weights.pth
+wget https://github.com/Shimmer22/SplitOculo/releases/download/v2.2/cloud_weights.pth -O checkpoints/split/cloud_weights.pth
+```
+
+或手动下载：
+- **[edge_weights.pth](https://github.com/Shimmer22/SplitOculo/releases/download/v2.2/edge_weights.pth)** (11 MB) - 端侧权重
+- **[cloud_weights.pth](https://github.com/Shimmer22/SplitOculo/releases/download/v2.2/cloud_weights.pth)** (486 MB) - 云端权重
+
+下载后将文件放置到 `checkpoints/split/` 目录，然后直接跳到 **步骤 5: 网络分离部署**。
+
+---
+
 ### 步骤 0: 环境配置
 
 ```bash
