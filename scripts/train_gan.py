@@ -5,21 +5,35 @@ SplitOculo v2.0 GAN Training Script
 - Phase 1 (Warmup): 只用 MSE Loss 预热，让 Upsampler 学会基本的上采样
 - Phase 2 (GAN): Generator vs Discriminator 对抗训练，让特征更 sharp
 
+支持两种模式:
+- Static (默认): 从预计算的 .pt 文件加载特征，训练快，显存低
+- Dynamic: 训练时实时计算 Qwen 特征，无需预计算，但显存需求高
+
 Usage:
-    # Phase 1: Warmup
+    # Static 模式 (默认) - Phase 1: Warmup
     python scripts/train_gan.py \
         --features_dir ./data/qwen_features \
         --data_dir ./data/coco \
         --phase warmup \
         --epochs 20
 
-    # Phase 2: GAN finetuning
+    # Static 模式 - Phase 2: GAN finetuning
     python scripts/train_gan.py \
         --features_dir ./data/qwen_features \
         --data_dir ./data/coco \
         --phase gan \
         --warmup_checkpoint ./checkpoints/gan/warmup_best.pth \
         --epochs 50
+    
+    # Dynamic 模式 (无需预计算) - Phase 1: Warmup
+    python scripts/train_gan.py \
+        --dynamic \
+        --data_dir ./data/coco \
+        --qwen_model Qwen/Qwen2.5-VL-3B-Instruct \
+        --qwen_layer 4 \
+        --phase warmup \
+        --batch_size 8 \
+        --epochs 20
 """
 import argparse
 import sys
@@ -38,6 +52,7 @@ import timm
 import math
 
 from core.utils import set_seed, get_logger, count_parameters
+from core.qwen_extractor import QwenFeatureExtractor
 from models.cloud_upsampler import CloudUpsampler, TransformerUpsampler
 from models.projector_v3 import StridedProjector
 from models.discriminator import FeatureDiscriminator
@@ -94,7 +109,7 @@ class PrecomputedFeatureDataset(Dataset):
             self.metadata = json.load(f)
         
         self.feature_files = sorted(self.features_dir.glob("*.pt"))
-        print(f"📂 Found {len(self.feature_files)} precomputed features")
+        print(f"Found {len(self.feature_files)} precomputed features")
         
         from torchvision import transforms
         self.transform = transforms.Compose([
@@ -115,6 +130,64 @@ class PrecomputedFeatureDataset(Dataset):
         from PIL import Image
         img = Image.open(img_path).convert('RGB')
         img_tensor = self.transform(img)
+        
+        return img_tensor, teacher_features
+
+
+class DynamicFeatureDataset(Dataset):
+    """动态模式: 训练时实时计算 Qwen 特征
+    
+    无需预计算，但需要更多显存和计算时间
+    """
+    
+    def __init__(self, images_dir, extractor, split='train', image_size=224):
+        """
+        Args:
+            images_dir: 图像目录
+            extractor: QwenFeatureExtractor 实例
+            split: train 或 val
+            image_size: 输入图像大小
+        """
+        self.images_dir = Path(images_dir) / split
+        self.extractor = extractor
+        
+        # 扫描图像文件
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+        self.image_files = sorted([
+            f for f in self.images_dir.iterdir() 
+            if f.is_file() and f.suffix.lower() in image_extensions
+        ])
+        print(f"Found {len(self.image_files)} images in {self.images_dir}")
+        
+        from torchvision import transforms
+        self.transform = transforms.Compose([
+            transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        
+        # Qwen 预处理 (只做 resize + crop,不做 normalize)
+        self.qwen_transform = transforms.Compose([
+            transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(image_size),
+        ])
+    
+    def __len__(self):
+        return len(self.image_files)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_files[idx]
+        
+        from PIL import Image
+        pil_img = Image.open(img_path).convert('RGB')
+        
+        # CNN 输入
+        img_tensor = self.transform(pil_img)
+        
+        # Qwen 特征 (实时计算)
+        qwen_img = self.qwen_transform(pil_img)
+        teacher_features = self.extractor.extract_features(qwen_img)
         
         return img_tensor, teacher_features
 
@@ -145,6 +218,15 @@ class GANTrainer:
         # 损失函数
         self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCEWithLogitsLoss()
+        
+        # AMP (Automatic Mixed Precision)
+        self.use_amp = getattr(args, 'amp', False) and self.device.type == 'cuda'
+        if self.use_amp:
+            self.scaler_G = torch.amp.GradScaler('cuda')
+            self.scaler_D = torch.amp.GradScaler('cuda')
+        else:
+            self.scaler_G = None
+            self.scaler_D = None
         
         # 记录参数量
         bottleneck_params = count_parameters(self.bottleneck) if self.bottleneck else 0
@@ -311,33 +393,41 @@ class GANTrainer:
             images = images.to(self.device)
             teacher_tokens = teacher_tokens.to(self.device).float()
             
-            # Forward
-            student_feat = self.student(images)[-1]
-            edge_tokens = self.projector(student_feat)
-            
-            # 瓶颈层压缩/解压
-            if self.bottleneck is not None:
-                decompressed, compressed = self.bottleneck(edge_tokens)
-                output_tokens = self.upsampler(decompressed)
-            else:
-                output_tokens = self.upsampler(edge_tokens)
-                compressed = None
-            
-            # 对齐 token 数量
-            if output_tokens.shape[1] != teacher_tokens.shape[1]:
-                teacher_tokens = self._align_tokens(teacher_tokens, output_tokens.shape[1])
-            
-            # MSE Loss
-            loss = self.mse_loss(output_tokens, teacher_tokens)
-            
-            # 重建损失 (瓶颈层)
-            if self.bottleneck is not None and self.args.lambda_recon > 0:
-                loss_recon = self.mse_loss(decompressed, edge_tokens.detach())
-                loss = loss + self.args.lambda_recon * loss_recon
-            
             self.opt_G.zero_grad()
-            loss.backward()
-            self.opt_G.step()
+            
+            # Forward with AMP
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                student_feat = self.student(images)[-1]
+                edge_tokens = self.projector(student_feat)
+                
+                # 瓶颈层压缩/解压
+                if self.bottleneck is not None:
+                    decompressed, compressed = self.bottleneck(edge_tokens)
+                    output_tokens = self.upsampler(decompressed)
+                else:
+                    output_tokens = self.upsampler(edge_tokens)
+                    compressed = None
+                
+                # 对齐 token 数量
+                if output_tokens.shape[1] != teacher_tokens.shape[1]:
+                    teacher_tokens = self._align_tokens(teacher_tokens, output_tokens.shape[1])
+                
+                # MSE Loss
+                loss = self.mse_loss(output_tokens, teacher_tokens)
+                
+                # 重建损失 (瓶颈层)
+                if self.bottleneck is not None and self.args.lambda_recon > 0:
+                    loss_recon = self.mse_loss(decompressed, edge_tokens.detach())
+                    loss = loss + self.args.lambda_recon * loss_recon
+            
+            # Backward with AMP
+            if self.use_amp:
+                self.scaler_G.scale(loss).backward()
+                self.scaler_G.step(self.opt_G)
+                self.scaler_G.update()
+            else:
+                loss.backward()
+                self.opt_G.step()
             
             # 计算 cos_sim
             with torch.no_grad():
@@ -381,62 +471,75 @@ class GANTrainer:
             # ===================
             self.opt_D.zero_grad()
             
-            # 真实样本
-            pred_real = self.discriminator(teacher_tokens)
-            label_real = torch.ones_like(pred_real)
-            loss_d_real = self.bce_loss(pred_real, label_real)
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                # 真实样本
+                pred_real = self.discriminator(teacher_tokens)
+                label_real = torch.ones_like(pred_real)
+                loss_d_real = self.bce_loss(pred_real, label_real)
+                
+                # 假样本 (detach 防止梯度传回 G)
+                with torch.no_grad():
+                    student_feat = self.student(images)[-1]
+                    edge_tokens = self.projector(student_feat)
+                    if self.bottleneck is not None:
+                        decompressed, _ = self.bottleneck(edge_tokens)
+                        edge_tokens = decompressed
+                    fake_tokens_d = self.upsampler(edge_tokens)
+                
+                pred_fake = self.discriminator(fake_tokens_d.detach())
+                label_fake = torch.zeros_like(pred_fake)
+                loss_d_fake = self.bce_loss(pred_fake, label_fake)
+                
+                loss_d = (loss_d_real + loss_d_fake) / 2
             
-            # 假样本 (detach 防止梯度传回 G)
-            with torch.no_grad():
-                student_feat = self.student(images)[-1]
-                edge_tokens = self.projector(student_feat)
-                if self.bottleneck is not None:
-                    decompressed, _ = self.bottleneck(edge_tokens)
-                    edge_tokens = decompressed
-            fake_tokens = self.upsampler(edge_tokens).detach()
-            
-            pred_fake = self.discriminator(fake_tokens)
-            label_fake = torch.zeros_like(pred_fake)
-            loss_d_fake = self.bce_loss(pred_fake, label_fake)
-            
-            loss_d = (loss_d_real + loss_d_fake) / 2
-            loss_d.backward()
-            self.opt_D.step()
+            if self.use_amp:
+                self.scaler_D.scale(loss_d).backward()
+                self.scaler_D.step(self.opt_D)
+                self.scaler_D.update()
+            else:
+                loss_d.backward()
+                self.opt_D.step()
             
             # ===================
             # 2. Train Generator
             # ===================
             self.opt_G.zero_grad()
             
-            # 重新生成 (带梯度)
-            student_feat = self.student(images)[-1]
-            edge_tokens_raw = self.projector(student_feat)
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                # 重新生成 (带梯度)
+                student_feat = self.student(images)[-1]
+                edge_tokens_raw = self.projector(student_feat)
+                
+                # 瓶颈层
+                if self.bottleneck is not None:
+                    decompressed, compressed = self.bottleneck(edge_tokens_raw)
+                    fake_tokens = self.upsampler(decompressed)
+                else:
+                    fake_tokens = self.upsampler(edge_tokens_raw)
+                    decompressed = None
+                
+                # 内容损失 (MSE)
+                loss_mse = self.mse_loss(fake_tokens, teacher_tokens)
+                
+                # 对抗损失 (GAN) - 骗过 D
+                pred_fake = self.discriminator(fake_tokens)
+                loss_adv = self.bce_loss(pred_fake, torch.ones_like(pred_fake))
+                
+                # 重建损失
+                loss_recon = 0
+                if self.bottleneck is not None and self.args.lambda_recon > 0:
+                    loss_recon = self.mse_loss(decompressed, edge_tokens_raw.detach())
+                
+                # 组合损失
+                loss_g = loss_mse * self.args.lambda_mse + loss_adv * self.args.lambda_adv + loss_recon * self.args.lambda_recon
             
-            # 瓶颈层
-            if self.bottleneck is not None:
-                decompressed, compressed = self.bottleneck(edge_tokens_raw)
-                fake_tokens = self.upsampler(decompressed)
+            if self.use_amp:
+                self.scaler_G.scale(loss_g).backward()
+                self.scaler_G.step(self.opt_G)
+                self.scaler_G.update()
             else:
-                fake_tokens = self.upsampler(edge_tokens_raw)
-                decompressed = None
-            
-            # 内容损失 (MSE)
-            loss_mse = self.mse_loss(fake_tokens, teacher_tokens)
-            
-            # 对抗损失 (GAN) - 骗过 D
-            pred_fake = self.discriminator(fake_tokens)
-            loss_adv = self.bce_loss(pred_fake, torch.ones_like(pred_fake))
-            
-            # 重建损失
-            loss_recon = 0
-            if self.bottleneck is not None and self.args.lambda_recon > 0:
-                loss_recon = self.mse_loss(decompressed, edge_tokens_raw.detach())
-            
-            # 组合损失
-            loss_g = loss_mse * self.args.lambda_mse + loss_adv * self.args.lambda_adv + loss_recon * self.args.lambda_recon
-            
-            loss_g.backward()
-            self.opt_G.step()
+                loss_g.backward()
+                self.opt_G.step()
             
             # 计算 cos_sim
             with torch.no_grad():
@@ -611,8 +714,8 @@ def main():
     parser = argparse.ArgumentParser(description='SplitOculo v2.0 GAN Training')
     
     # 数据参数
-    parser.add_argument('--features_dir', type=str, required=True,
-                        help='预计算特征目录')
+    parser.add_argument('--features_dir', type=str, default=None,
+                        help='预计算特征目录 (静态模式必需)')
     parser.add_argument('--data_dir', type=str, required=True,
                         help='原始图像目录')
     parser.add_argument('--image_size', type=int, default=224)
@@ -672,39 +775,83 @@ def main():
                         choices=['linear', 'mlp', 'autoencoder'],
                         help='瓶颈层方法')
     
+    # 动态模式参数
+    parser.add_argument('--dynamic', action='store_true',
+                        help='启用动态模式: 训练时实时计算 Qwen 特征 (无需预计算)')
+    parser.add_argument('--qwen_model', type=str, default='Qwen/Qwen2.5-VL-3B-Instruct',
+                        help='Qwen 模型名称或路径 (动态模式)')
+    parser.add_argument('--qwen_layer', type=int, default=4,
+                        help='Qwen ViT 提取层 (1-32, 默认 4)')
+    
     # 其他
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--output_dir', type=str, default='./checkpoints/gan')
     parser.add_argument('--save_freq', type=int, default=5)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--amp', action='store_true',
+                        help='启用 AMP 混合精度训练 (加速 1.5-2x)')
     
     args = parser.parse_args()
     set_seed(args.seed)
     
     # 加载数据
-    train_dataset = PrecomputedFeatureDataset(
-        features_dir=args.features_dir,
-        images_dir=args.data_dir,
-        split='train',
-        image_size=args.image_size
-    )
-    
-    val_dataset = PrecomputedFeatureDataset(
-        features_dir=args.features_dir,
-        images_dir=args.data_dir,
-        split='val',
-        image_size=args.image_size
-    )
+    if args.dynamic:
+        # 动态模式: 实时计算 Qwen 特征
+        print(f"[Dynamic Mode] qwen_model={args.qwen_model}, layer={args.qwen_layer}")
+        
+        # 创建 Qwen 特征提取器
+        extractor = QwenFeatureExtractor(
+            model_name=args.qwen_model,
+            device=args.device,
+            extract_layer=args.qwen_layer
+        ).load()
+        
+        train_dataset = DynamicFeatureDataset(
+            images_dir=args.data_dir,
+            extractor=extractor,
+            split='train',
+            image_size=args.image_size
+        )
+        
+        val_dataset = DynamicFeatureDataset(
+            images_dir=args.data_dir,
+            extractor=extractor,
+            split='val',
+            image_size=args.image_size
+        )
+        
+        # 动态模式不使用多进程 (Qwen 模型不可 pickle)
+        num_workers = 0
+    else:
+        # 静态模式: 从预计算文件加载
+        if not args.features_dir:
+            raise ValueError("静态模式需要 --features_dir 参数，或使用 --dynamic 启用动态模式")
+        
+        train_dataset = PrecomputedFeatureDataset(
+            features_dir=args.features_dir,
+            images_dir=args.data_dir,
+            split='train',
+            image_size=args.image_size
+        )
+        
+        val_dataset = PrecomputedFeatureDataset(
+            features_dir=args.features_dir,
+            images_dir=args.data_dir,
+            split='val',
+            image_size=args.image_size
+        )
+        
+        num_workers = args.num_workers
     
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn
+        num_workers=num_workers, pin_memory=True, collate_fn=collate_fn
     )
     
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn
+        num_workers=num_workers, pin_memory=True, collate_fn=collate_fn
     )
     
     # 创建训练器
