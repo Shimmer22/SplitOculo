@@ -182,9 +182,13 @@ class TransformerUpsampler(nn.Module):
             )
         
         # 2. Transformer Encoder: 核心是让每个 token 能看到所有其他 token
+        # nhead 自动选最大的能整除 hidden_size 的 2 的幂 (≤16)
+        nhead = 16
+        while hidden_size % nhead != 0:
+            nhead //= 2
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_size,
-            nhead=16,                    # 多头注意力，捕捉不同维度的语义
+            nhead=nhead,                 # 多头注意力，捕捉不同维度的语义
             dim_feedforward=hidden_size * 2,
             dropout=0.1,
             activation='gelu',

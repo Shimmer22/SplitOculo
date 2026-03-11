@@ -769,7 +769,7 @@ def main():
                         help='瓶颈层重建损失权重')
     
     # 瓶颈层参数
-    parser.add_argument('--bottleneck_dim', type=int, default=0,
+    parser.add_argument('--bottleneck_dim', type=int, default=64,
                         help='瓶颈层维度 (0 = 禁用瓶颈层)')
     parser.add_argument('--bottleneck_method', type=str, default='linear',
                         choices=['linear', 'mlp', 'autoencoder'],

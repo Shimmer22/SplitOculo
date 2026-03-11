@@ -174,11 +174,11 @@ class CloudInferenceEngine:
     def infer(self, compressed_features, prompt="这张图里有什么?"):
         """
         完成云端推理
-        
+
         Args:
             compressed_features: [1, 49, bottleneck_dim] 压缩特征
             prompt: 用户提示
-        
+
         Returns:
             LLM 响应文本
         """
@@ -187,17 +187,33 @@ class CloudInferenceEngine:
             edge_tokens = self.bottleneck.decode(compressed_features)
         else:
             edge_tokens = compressed_features
-        
+
         # 2. Upsampler
         upsampled = self.upsampler(edge_tokens)
-        
-        # 3. 特征缩放匹配 Qwen 分布
-        target_std = 0.83
-        target_mean = -0.017
-        current_std = upsampled.std()
-        if current_std > 0:
-            upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
-        
+
+        # 3. 特征缩放匹配 Qwen 分布 (按 split_layer 区分)
+        if self.split_layer == 4:
+            # Layer 4: mean=-0.022, std=0.847 (COCO 100 样本实测)
+            target_std, target_mean = 0.847, -0.022
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+        elif self.split_layer == 8:
+            # Layer 8: mean=-0.021, std=1.066 (COCO 100 样本实测)
+            target_std, target_mean = 1.066, -0.021
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+        elif self.split_layer == 0:
+            # Layer 0 (patch_embed): mean=-0.000, std=0.362
+            target_std, target_mean = 0.362, -0.0001
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+        elif self.split_layer in (-1,):
+            # Layer -1 (pixel patches): 像素空间，不强制归一化
+            pass
+
         # 4. Qwen 后续处理
         if self.qwen_model is None:
             model_path = getattr(self, 'qwen_path', "Qwen/Qwen2.5-VL-3B-Instruct")

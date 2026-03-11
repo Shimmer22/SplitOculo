@@ -1,16 +1,20 @@
 """
 使用可学习上采样器的混合推理脚本
 
-架构:
-- 端侧: Image → CNN → Projector → 49 tokens (7×7)
-- 传输: 49 tokens (~61 KB int8)
-- 云端: Upsampler → 256 tokens → Qwen[4:] → Merger → LLM
+层级语义 (split_layer):
+  -1 : 与 JPEG 像素 patch 对齐 (pixel-space reconstruction)
+       推理: upsampled tokens → patch_embed → blocks[0:] → merger
+   0 : 与 patch_embed 输出对齐
+       推理: upsampled tokens → blocks[0:] → merger
+   4 : 与 block 4 输出对齐 (默认)
+       推理: upsampled tokens → blocks[4:] → merger
+   8 : 与 block 8 输出对齐
+       推理: upsampled tokens → blocks[8:] → merger
 
 Usage:
-    python scripts/infer_with_upsampler.py \
-        --checkpoint checkpoints/upsampler/best_model.pth \
-        --image photo.jpg \
-        --full_inference
+    python scripts/infer_hybrid.py \\
+        --checkpoint checkpoints/upsampler/best_model.pth \\
+        --image photo.jpg --split_layer 4 --full_inference
 """
 import argparse
 import sys
@@ -233,85 +237,133 @@ class HybridUpsamplerVLM:
     
     @torch.no_grad()
     def upsample_cloud(self, edge_tokens, is_compressed=False):
-        """云端上采样: tokens → 256 tokens
-        
-        Args:
-            edge_tokens: 端侧传输的 tokens
-            is_compressed: 是否是压缩后的 tokens
+        """云端上采样: tokens → 256 tokens，并按 split_layer 匹配分布
+
+        分布 magic numbers (COCO val2017, 100 样本实测):
+          layer -1 (pixel patches): mean=-0.041, std=1.015  dim=1176 (3×2×14×14)
+          layer  0 (patch_embed)  : mean=-0.000, std=0.362  dim=1280
+          layer  4                 : mean=-0.022, std=0.847  dim=1280
+          layer  8                 : mean=-0.021, std=1.066  dim=1280
+          layer 16                 : mean=-0.030, std=2.255  dim=1280
         """
         # 如果是压缩的，先解压
         if is_compressed and self.bottleneck is not None:
             edge_tokens = self.bottleneck.decode(edge_tokens)
-        
+
         upsampled = self.upsampler(edge_tokens)
-        
-        # 特征缩放以匹配 Qwen Layer 4 分布
-        # Qwen Layer 4: mean≈-0.017, std≈0.83
-        target_std = 0.83
-        target_mean = -0.017
-        
-        current_std = upsampled.std()
-        if current_std > 0:
-            upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
-        
+
+        # 特征缩放以匹配目标 Qwen 层的分布
+        if self.split_layer == 4:
+            # Layer 4: mean=-0.022, std=0.847 (COCO 100 样本实测)
+            target_std, target_mean = 0.847, -0.022
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+        elif self.split_layer == 8:
+            # Layer 8: mean=-0.021, std=1.066 (COCO 100 样本实测)
+            target_std, target_mean = 1.066, -0.021
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+        elif self.split_layer == 16:
+            # Layer 16: mean=-0.030, std=2.255 (COCO 1000 样本实测)
+            target_std, target_mean = 2.255, -0.030
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+        elif self.split_layer == 0:
+            # Layer 0 (patch_embed): mean=-0.000, std=0.362
+            target_std, target_mean = 0.362, -0.0001
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+        elif self.split_layer == -1:
+            # Layer -1 (pixel patches): mean=-0.041, std=1.015
+            # 像素空间分布不平稳，不强制归一化
+            pass
+
         return upsampled
     
     @torch.no_grad()
     def complete_visual_encoding(self, upsampled_tokens):
-        """继续 Qwen blocks → merger"""
+        """继续 Qwen blocks → merger
+
+        split_layer 语义:
+          -1: upsampled 代表 pixel patches → 先过 patch_embed → 再过所有 blocks
+           0: upsampled 代表 patch_embed 输出 → 直接从 block 0 开始
+           N: upsampled 代表 block N 输出 → 从 block N 开始
+        """
         if self.qwen_model is None:
             raise RuntimeError("请先调用 load_qwen()")
-        
+
         visual = self.qwen_model.visual
         B = upsampled_tokens.shape[0]
         target_h = target_w = int(self.target_tokens ** 0.5)
-        
+
         # 设置 grid
         grid_thw = torch.tensor([[1, target_h, target_w]] * B, dtype=torch.long).to(self.device)
-        
-        # 转为 Qwen 需要的格式
-        hidden_states = upsampled_tokens.view(-1, upsampled_tokens.shape[-1])
-        hidden_states = hidden_states.to(visual.blocks[0].attn.qkv.weight.dtype)
-        
+
+        # --- layer -1: pixel patches → patch_embed ---
+        if self.split_layer == -1:
+            # patch_embed.proj 是 Conv3d: weight.shape = (out=1280, in_ch=3, T=2, H=14, W=14)
+            proj = visual.patch_embed.proj
+            in_ch = proj.weight.shape[1]   # 3
+            kT    = proj.weight.shape[2]   # 2 (temporal)
+            kH    = proj.weight.shape[3]   # 14
+            kW    = proj.weight.shape[4]   # 14
+            N_patches = upsampled_tokens.shape[1]
+            # upsampled_tokens: [B, N, 1176] → [B*N, 3, 2, 14, 14]
+            patches = upsampled_tokens.view(B * N_patches, in_ch, kT, kH, kW)
+            patches = patches.to(proj.weight.dtype)
+            hidden_states = proj(patches).squeeze(-1).squeeze(-1).squeeze(-1)  # [B*N, 1280]
+            if hasattr(visual.patch_embed, 'norm') and visual.patch_embed.norm is not None:
+                hidden_states = visual.patch_embed.norm(hidden_states)
+            start_layer = 0
+        else:
+            # 转为 Qwen 需要的格式
+            hidden_states = upsampled_tokens.view(-1, upsampled_tokens.shape[-1])
+            hidden_states = hidden_states.to(visual.blocks[0].attn.qkv.weight.dtype)
+            start_layer = self.split_layer
+
         # Rotary position embedding
         rotary_pos_emb = visual.rot_pos_emb(grid_thw)
         window_index, cu_window_seqlens = visual.get_window_index(grid_thw)
         cu_window_seqlens = torch.tensor(cu_window_seqlens, device=self.device, dtype=torch.int32)
         cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
-        
+
         seq_len = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
         hidden_states = hidden_states[window_index, :, :]
         hidden_states = hidden_states.reshape(seq_len, -1)
-        
+
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
-        
+
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        
-        # 执行 blocks[split_layer:]
+
+        # 执行 blocks[start_layer:]
         for layer_num, blk in enumerate(visual.blocks):
-            if layer_num < self.split_layer:
+            if layer_num < start_layer:
                 continue
             if layer_num in visual.fullatt_block_indexes:
                 hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
             else:
                 hidden_states = blk(hidden_states, cu_seqlens=cu_window_seqlens, position_embeddings=position_embeddings)
-        
+
         # 反转 window indexing
         reverse_indices = torch.argsort(window_index)
         hidden_states = hidden_states.reshape(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
         hidden_states = hidden_states[reverse_indices, :, :]
         hidden_states = hidden_states.reshape(seq_len, -1)
-        
+
         # Merger
         visual_tokens = visual.merger(hidden_states)
         visual_tokens = visual_tokens.unsqueeze(0) if visual_tokens.dim() == 2 else visual_tokens
-        
+
         return visual_tokens
     
     @torch.no_grad()

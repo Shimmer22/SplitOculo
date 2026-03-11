@@ -99,21 +99,25 @@ print(f'✅ 训练集: {split}, 验证集: {len(images)-split}')
 ### 步骤 2: 预计算 Qwen 特征
 
 ```bash
+# 默认: 对齐到 layer 4 (block 4 输出, 最小练)
 python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco --output_dir ./data/qwen_features \
-    --layer 4 --split train --batch_size 4
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer4 \
+    --layer 4 --split train
 
 python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco --output_dir ./data/qwen_features \
-    --layer 4 --split val --batch_size 4
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer4 \
+    --layer 4 --split val
 ```
+
+> [!TIP]
+> 如需对比不同对齐层级，参考「层级对齐实验」一节。
 
 ### 步骤 3: 训练 (启用瓶颈层)
 
 ```bash
 # Phase 1: Warmup
 python scripts/train_gan.py \
-    --features_dir ./data/qwen_features \
+    --features_dir ./data/coco_features_layer4 \
     --data_dir ./data/coco \
     --phase warmup \
     --epochs 20 \
@@ -123,7 +127,7 @@ python scripts/train_gan.py \
 
 # Phase 2: GAN 微调
 python scripts/train_gan.py \
-    --features_dir ./data/qwen_features \
+    --features_dir ./data/coco_features_layer4 \
     --data_dir ./data/coco \
     --phase gan \
     --warmup_checkpoint ./checkpoints/gan_bottleneck/warmup_best.pth \
@@ -161,6 +165,81 @@ python scripts/edge_client.py \
     --image ./test.jpg \
     --server http://云端IP:8080 \
     --timeout 300
+```
+
+---
+
+## 🧪 层级对齐实验
+
+测试将 CNN+Upsampler 对齐到 Qwen ViT 不同层级的效果。
+
+### 层级语义
+
+| split_layer | 对齐目标 | 推理数据流 | 特征维度 |
+|------------|--------|------------|--------|
+| `-1` | 原始像素 patches (JPEG 级别) | upsampled → patch_embed → blocks[0:] → merger | 3×pH×pW |
+| `0` | patch_embed 输出 | upsampled → blocks[0:] → merger | 1280 |
+| `4` | block 4 输出 (默认) | upsampled → blocks[4:] → merger | 1280 |
+| `8` | block 8 输出 | upsampled → blocks[8:] → merger | 1280 |
+| `16` | block 16 输出 | upsampled → blocks[16:] → merger | 1280 |
+
+### 各层特征分布统计 (COCO, ~200 样本)
+
+| 层级 | mean | std | 备注 |
+|------|------|-----|------|
+| `-1` (pixel, 1176 dim) | -0.041 | 1.015 | 3×2×14×14, 不归一化 |
+| `0` (patch_embed, 1280 dim) | -0.000 | 0.362 | 均已写入代码 |
+| `4` (block 4, 1280 dim) | -0.022 | 0.847 | 默认 |
+| `8` (block 8, 1280 dim) | -0.021 | 1.066 | 均已写入代码 |
+| `16` (block 16, 1280 dim) | -0.030 | 2.255 | 均已写入代码 |
+
+获取待填充的 magic number：
+```bash
+# 从现有 layer4 目录测量
+python scripts/measure_feature_stats.py \
+    --features_dir ./data/coco_features_layer4 --split train
+
+# 一次性测量全部 4 个层级 (需加载 Qwen, 约 10 min)
+python scripts/measure_feature_stats.py \
+    --data_dir ./data/coco --split train --max_files 100 --realtime --all_layers
+```
+
+### 预计算各层特征
+
+```bash
+# Layer 0: patch_embed 输出
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer0 --layer 0 --split train
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer0 --layer 0 --split val
+
+# Layer 8
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer8 --layer 8 --split train
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer8 --layer 8 --split val
+
+# Layer -1 (pixel patches, 无需完整 Qwen 前向)
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer-1 --layer -1 --split train
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer-1 --layer -1 --split val
+```
+
+### 对应训练命令
+
+```bash
+# 以 layer 8 为例
+python scripts/train_gan.py \
+    --features_dir ./data/coco_features_layer8 \
+    --data_dir ./data/coco --phase warmup --epochs 20 \
+    --output_dir ./checkpoints/layer8
+
+# 以 layer 0 为例
+python scripts/train_gan.py \
+    --features_dir ./data/coco_features_layer0 \
+    --data_dir ./data/coco --phase warmup --epochs 20 \
+    --output_dir ./checkpoints/layer0
 ```
 
 ---

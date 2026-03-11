@@ -2,9 +2,14 @@
 Qwen2.5-VL 视觉特征提取器
 
 可复用模块，支持:
-- 中间层特征提取 (layer 1-32)
-- 最终 merger 输出 (layer -1)
+- 像素 patch 提取 (layer -1): patch_embed 之前的原始像素块
+- 中间层特征提取 (layer 0-32): patch_embed 后 / 各 block 后
 - 训练时动态提取或离线预计算
+
+层级语义:
+  layer -1 : 原始像素 patches (patch_embed 输入)  dim = 3*patch_h*patch_w
+  layer  0 : patch_embed 输出 (无 transformer block)  dim = 1280
+  layer  N : 经过 N 个 transformer block 之后的输出   dim = 1280
 """
 import torch
 import torch.nn.functional as F
@@ -24,17 +29,17 @@ class QwenFeatureExtractor:
     """
     
     def __init__(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct", device='cuda', 
-                 extract_layer=8):
+                 extract_layer=4):
         """
         Args:
             model_name: Qwen 模型名称或本地路径
             device: 运行设备
-            extract_layer: 提取哪一层的输出 (1-32)
-                - 4: 非常浅层 (推荐用于训练)
-                - 8: 浅层
-                - 16: 中层
-                - 32: 深层 (原始行为，等同于 merger 输入)
-                - -1: 最终 merger 输出 (2048 dim，非常难)
+            extract_layer: 提取哪一层的输出
+                - -1: 原始像素 patches (patch_embed 输入)，用于 JPEG 级别对齐
+                       dim = 3 * patch_height * patch_width (取决于 Qwen 配置)
+                -  0: patch_embed 输出，不经过任何 transformer block  dim = 1280
+                -  4: 经过 4 个 block 之后 (默认，推荐)  dim = 1280
+                -  8: 经过 8 个 block 之后  dim = 1280
         """
         self.model_name = model_name
         self.device = device
@@ -42,6 +47,7 @@ class QwenFeatureExtractor:
         self.model = None
         self.processor = None
         self.total_layers = 32  # Qwen 3B 有 32 层
+        self._pixel_patch_dim = None  # 延迟初始化，加载模型后确定
         self._loaded = False
         
     def load(self):
@@ -69,9 +75,19 @@ class QwenFeatureExtractor:
             param.requires_grad = False
         self.model.eval()
         
-        # 获取实际层数
+        # 获取实际层数及 patch 维度
         self.total_layers = len(self.model.visual.blocks)
+        # 计算 pixel patch dim: patch_embed 的 proj 权重 shape = (out_ch, in_ch, kH, kW)
+        # in_ch * kH * kW = pixel_patch_dim
+        proj_w = self.model.visual.patch_embed.proj.weight
+        self._pixel_patch_dim = proj_w.shape[1] * proj_w.shape[2] * proj_w.shape[3]
         print(f"Model loaded (ViT has {self.total_layers} layers, extract layer {self.extract_layer})")
+        if self.extract_layer == -1:
+            print(f"  Mode: pixel patches (JPEG level), dim={self._pixel_patch_dim}")
+        elif self.extract_layer == 0:
+            print(f"  Mode: patch_embed output (no blocks), dim=1280")
+        else:
+            print(f"  Mode: after {self.extract_layer} transformer blocks, dim=1280")
         
         self._loaded = True
         return self
@@ -79,7 +95,10 @@ class QwenFeatureExtractor:
     @property
     def hidden_size(self):
         """返回特征维度"""
-        return 2048 if self.extract_layer == -1 else 1280
+        if self.extract_layer == -1:
+            # 像素 patch 维度 (延迟到模型加载后才能确定)
+            return self._pixel_patch_dim if self._pixel_patch_dim else 588  # 3*14*14 fallback
+        return 1280
     
     @torch.no_grad()
     def extract_features(self, pil_image):
@@ -114,13 +133,10 @@ class QwenFeatureExtractor:
         grid_thw = inputs["image_grid_thw"].to(self.device)
         
         if self.extract_layer == -1:
-            # 提取最终 merger 输出 (原始行为)
-            hidden_states = self.model.visual(
-                pixel_values.to(self.model.visual.patch_embed.proj.weight.dtype),
-                grid_thw=grid_thw
-            )
+            # 提取 pixel patches: patch_embed 的输入 (JPEG 级别对齐)
+            hidden_states = self._extract_pixel_patches(pixel_values)
         else:
-            # 提取中间层
+            # 提取中间层 (layer 0 = patch_embed, layer N = after N blocks)
             hidden_states = self._extract_intermediate_layer(
                 pixel_values.to(self.model.visual.patch_embed.proj.weight.dtype),
                 grid_thw=grid_thw
@@ -141,6 +157,23 @@ class QwenFeatureExtractor:
         # 由于不同图片 token 数量可能不同，逐个处理
         return [self.extract_features(img) for img in pil_images]
     
+    def _extract_pixel_patches(self, pixel_values):
+        """
+        提取 pixel patches：patch_embed 输入前的原始像素块。
+
+        在 Qwen2.5-VL 中，pixel_values 的 shape 为:
+            (N_patches, C, patch_h, patch_w)  e.g. (256, 3, 14, 14)
+        展平后即为 (N_patches, C*patch_h*patch_w)。
+
+        Returns:
+            (N_patches, C*patch_h*patch_w) float32 tensor
+        """
+        # pixel_values: (N_patches, C, pH, pW)
+        # 仅做 flatten，不过任何网络层
+        N = pixel_values.shape[0]
+        patches = pixel_values.float().view(N, -1)  # (N, C*pH*pW)
+        return patches.cpu()
+
     def _extract_intermediate_layer(self, pixel_values, grid_thw):
         """
         手动执行 forward 并在指定层停止
@@ -185,22 +218,23 @@ class QwenFeatureExtractor:
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
         
         # 7. 逐层执行 blocks
-        for layer_num, blk in enumerate(visual.blocks):
-            # 选择正确的 cu_seqlens
-            if layer_num in visual.fullatt_block_indexes:
-                cu_seqlens_now = cu_seqlens
-            else:
-                cu_seqlens_now = cu_window_seqlens
-            
-            hidden_states = blk(
-                hidden_states,
-                cu_seqlens=cu_seqlens_now,
-                position_embeddings=position_embeddings,
-            )
-            
-            # 在指定层停止
-            if layer_num == self.extract_layer - 1:
-                break
+        if self.extract_layer > 0:
+            for layer_num, blk in enumerate(visual.blocks):
+                # 选择正确的 cu_seqlens
+                if layer_num in visual.fullatt_block_indexes:
+                    cu_seqlens_now = cu_seqlens
+                else:
+                    cu_seqlens_now = cu_window_seqlens
+
+                hidden_states = blk(
+                    hidden_states,
+                    cu_seqlens=cu_seqlens_now,
+                    position_embeddings=position_embeddings,
+                )
+
+                # 在指定层停止
+                if layer_num == self.extract_layer - 1:
+                    break
         
         # 需要反转 window indexing 以恢复原始顺序
         reverse_indices = torch.argsort(window_index)

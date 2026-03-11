@@ -99,21 +99,25 @@ print(f'✅ Train: {split}, Val: {len(images)-split}')
 ### Step 2: Precompute Qwen Features
 
 ```bash
+# Default: align to layer 4 (after 4 transformer blocks)
 python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco --output_dir ./data/qwen_features \
-    --layer 4 --split train --batch_size 4
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer4 \
+    --layer 4 --split train
 
 python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco --output_dir ./data/qwen_features \
-    --layer 4 --split val --batch_size 4
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer4 \
+    --layer 4 --split val
 ```
+
+> [!TIP]
+> To compare different alignment layers, see the "Layer Alignment Experiments" section.
 
 ### Step 3: Train (with Bottleneck)
 
 ```bash
 # Phase 1: Warmup
 python scripts/train_gan.py \
-    --features_dir ./data/qwen_features \
+    --features_dir ./data/coco_features_layer4 \
     --data_dir ./data/coco \
     --phase warmup \
     --epochs 20 \
@@ -123,7 +127,7 @@ python scripts/train_gan.py \
 
 # Phase 2: GAN Finetuning
 python scripts/train_gan.py \
-    --features_dir ./data/qwen_features \
+    --features_dir ./data/coco_features_layer4 \
     --data_dir ./data/coco \
     --phase gan \
     --warmup_checkpoint ./checkpoints/gan_bottleneck/warmup_best.pth \
@@ -161,6 +165,65 @@ python scripts/edge_client.py \
     --image ./test.jpg \
     --server http://CLOUD_IP:8080 \
     --timeout 300
+```
+
+---
+
+## 🧪 Layer Alignment Experiments
+
+Test the impact of aligning CNN+Upsampler to different Qwen ViT layers.
+
+### Layer Semantics
+
+| split_layer | Alignment Target | Inference Flow | Feature Dim |
+|------------|--------|------------|--------|
+| `-1` | Raw pixel patches (JPEG level) | upsampled → patch_embed → blocks[0:] → merger | 3×pH×pW |
+| `0` | patch_embed output | upsampled → blocks[0:] → merger | 1280 |
+| `4` | block 4 output (default) | upsampled → blocks[4:] → merger | 1280 |
+| `8` | block 8 output | upsampled → blocks[8:] → merger | 1280 |
+| `16` | block 16 output | upsampled → blocks[16:] → merger | 1280 |
+
+### Feature Distribution Stats (COCO, ~200 samples)
+
+| Layer | mean | std | Notes |
+|-------|------|-----|-------|
+| `-1` (pixel, 1176 dim) | -0.041 | 1.015 | 3×2×14×14, no normalization |
+| `0` (patch_embed, 1280 dim) | -0.000 | 0.362 | Written into code |
+| `4` (block 4, 1280 dim) | -0.022 | 0.847 | Default |
+| `8` (block 8, 1280 dim) | -0.021 | 1.066 | Written into code |
+| `16` (block 16, 1280 dim) | -0.030 | 2.255 | Written into code |
+
+Get the missing magic numbers:
+```bash
+# Measure from existing layer 4 dir
+python scripts/measure_feature_stats.py \
+    --features_dir ./data/coco_features_layer4 --split train
+
+# Measure all 4 layers at once (loads Qwen, ~10 min)
+python scripts/measure_feature_stats.py \
+    --data_dir ./data/coco --split train --max_files 100 --realtime --all_layers
+```
+
+### Precompute Each Layer
+
+```bash
+# Layer 0: patch_embed output
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer0 --layer 0 --split train
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer0 --layer 0 --split val
+
+# Layer 8
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer8 --layer 8 --split train
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer8 --layer 8 --split val
+
+# Layer -1 (pixel patches, no full Qwen forward pass needed)
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer-1 --layer -1 --split train
+python scripts/precompute_qwen_features.py \
+    --data_dir ./data/coco --output_dir ./data/coco_features_layer-1 --layer -1 --split val
 ```
 
 ---
