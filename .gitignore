@@ -33,6 +33,9 @@ env/
 *.swo
 *~
 
+# AI CLI
+.npm-cache/
+
 # Jupyter
 .ipynb_checkpoints/
 
@@ -66,3 +69,6 @@ Thumbs.db
 
 # Test images
 test.jpg
+
+# Local research notes
+local_research/

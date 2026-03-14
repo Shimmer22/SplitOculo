@@ -1,296 +1,251 @@
 # SplitOculo
 
-<p align="center">
-  <b>Edge-Cloud Collaborative Vision Feature Splitting for VLM</b>
-</p>
+<div align="center">
 
-<p align="center">
-  <a href="README-zh.md">中文文档</a>
-</p>
+**Edge-cloud collaborative visual feature splitting for vision-language models**
 
----
+[中文说明](./README-zh.md) · [Electron GUI](./electron_gui/README.md) · [C++ Edge Client](./cpp_edge_client/README.md)
 
-## 📖 Overview
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)
+![Status](https://img.shields.io/badge/Status-Research%20Prototype-0F766E)
+![License](https://img.shields.io/badge/License-MIT-black)
 
-SplitOculo enables **edge-cloud collaborative VLM inference**:
-- 🖥️ **Edge**: CNN + Projector + Bottleneck → 3 KB compressed features
-- ☁️ **Cloud**: Decompress + Upsampler → 256 tokens → Qwen → LLM
+</div>
 
----
+SplitOculo is a research prototype for **split VLM inference**. Instead of uploading raw images or running a full multimodal model on-device, it keeps a lightweight visual encoder on the edge, transmits compressed intermediate tokens over the network, and resumes Qwen2.5-VL visual reasoning in the cloud.
 
-## 🆕 v2.2 Update: Real Network-Split Deployment
+The repository combines three things that are often separated in practice: a trainable split pipeline, a real HTTP deployment path, and quantitative analysis of where visual features should be split and transmitted.
 
-> [!TIP]
-> **v2.2 supports real edge-cloud deployment via HTTP!**
+## Highlights
 
-### What's New
-- **Network Split**: `cloud_server.py` + `edge_client.py` for real edge-cloud separation
-- **Static Weight Splitting**: Use `split_checkpoint.py` to split AIO weights into edge (~11 MB) and cloud (~486 MB)
-- **Bottleneck Compression**: 61 KB → 3 KB, 20× compression ratio
-- **Offline Mode**: `--offline` flag for loading Qwen without internet
+- Real edge-cloud deployment with [`scripts/edge_client.py`](./scripts/edge_client.py) and [`scripts/cloud_server.py`](./scripts/cloud_server.py)
+- Trainable split pipeline with CNN encoder, projector, bottleneck, and cloud upsampler
+- Static checkpoint partitioning into edge weights and cloud weights via [`scripts/split_checkpoint.py`](./scripts/split_checkpoint.py)
+- Layer-alignment experiments for Qwen visual layers `-1`, `0`, `4`, `8`, and `16`
+- Optional offline inference path for air-gapped or pre-cached environments
+- Extra surfaces for experimentation: Electron GUI and an ONNX-oriented C++ edge client
 
----
+## Why SplitOculo
 
-## 🚀 Quick Start
+Most practical VLM deployment strategies sit at two extremes: either send the full image to the cloud, or compress the whole model until it can barely fit on the edge. SplitOculo explores a middle path. The edge extracts a compact semantic representation, the cloud reconstructs dense visual tokens, and the original VLM continues from an intermediate layer instead of restarting from pixels.
 
-### 📥 Download Pretrained Weights (Optional)
+This makes SplitOculo useful as both an engineering prototype and an experimental platform for studying split-layer transferability, semantic compression, and bandwidth-aware multimodal inference.
 
-If you want to skip training and use pretrained split weights directly:
+## Architecture
 
-```bash
-# Download split weights
-wget https://github.com/Shimmer22/SplitOculo/releases/download/v2.2/edge_weights.pth -O checkpoints/split/edge_weights.pth
-wget https://github.com/Shimmer22/SplitOculo/releases/download/v2.2/cloud_weights.pth -O checkpoints/split/cloud_weights.pth
+```mermaid
+flowchart LR
+    A["Input image"] --> B["Edge CNN backbone"]
+    B --> C["Projector"]
+    C --> D["Bottleneck encoder"]
+    D --> E["INT8 + base64 payload<br/>~3.1 KB at bottleneck_dim=64"]
+    E --> F["HTTP POST"]
+    F --> G["Cloud decoder"]
+    G --> H["Transformer upsampler"]
+    H --> I["Resume Qwen2.5-VL visual stack"]
+    I --> J["LLM response"]
 ```
 
-Or manually download:
-- **[edge_weights.pth](https://github.com/Shimmer22/SplitOculo/releases/download/v2.2/edge_weights.pth)** (11 MB) - Edge weights
-- **[cloud_weights.pth](https://github.com/Shimmer22/SplitOculo/releases/download/v2.2/cloud_weights.pth)** (486 MB) - Cloud weights
+## System Snapshot
 
-Place the downloaded files in `checkpoints/split/` and jump directly to **Step 5: Network-Split Deployment**.
+| Component | Edge | Cloud |
+|---|---:|---:|
+| Main modules | MobileNetV2 + projector + bottleneck encoder | bottleneck decoder + upsampler + Qwen visual tail + LLM |
+| Weight package | ~11 MB | ~486 MB |
+| Active parameters | 2.87M | 126.63M |
+| Payload size | ~3.1 KB (`bottleneck_dim=64`) | N/A |
 
----
+At `bottleneck_dim=64`, the transmitted feature payload shrinks from roughly `61 KB` to `3.1 KB`, which is about a `20x` reduction before HTTP overhead.
 
-### Step 0: Setup Environment
+## Quantitative Results
+
+The following summary comes from the internal VLMEvalKit evaluation note `定量损失测试VLMEvalKit.pdf` for **SplitOculo v2.2**. VLMEvalKit was used as the benchmark harness, with emphasis on general multimodal capability, OCR-heavy tasks, and hallucination-oriented evaluation.
+
+Important context:
+
+- The text-centric weakness is real: OCR and structured image-text understanding remain the largest quality gap compared with the Qwen baseline.
+- The split-layer ablation below was run **without the bottleneck enabled** because of an experiment configuration mistake noted in the report. Those numbers should therefore be read as a study of layer transferability, not as the final compressed deployment setting.
+
+### Training Recipe Snapshot
+
+| Variant | OCR | Structured Image Text | Image Scene | Identity Reasoning |
+|---|---:|---:|---:|---:|
+| SplitOculo (`CC3M-50k`) | 0.6410 | 0.4103 | 0.9423 | 0.9333 |
+| SplitOculo (`50k + Text/Chart mix`) | 0.6667 | 0.4487 | 0.9423 | 0.9556 |
+| SplitOculo (`LLaVA-558k recipe`) | 0.7436 | 0.4872 | 0.9808 | 0.9556 |
+| Qwen2.5-VL baseline | 0.9744 | 0.6667 | 0.9808 | 1.0000 |
+
+What this suggests:
+
+- Adding text-centric data helps. The report notes that mixing `7k` stronger text samples into the `50k` training set improves OCR-oriented behavior.
+- The strongest SplitOculo recipe already gets close to baseline on scene-heavy categories, but still trails badly on OCR-heavy tasks.
+- Current performance is good enough to justify split inference experiments, but not yet strong enough to claim parity with a full Qwen pipeline on text understanding.
+
+### Split-Layer Ablation on COCO-5k Alignment
+
+| Split layer | OCR | Image Scene | Celebrity Recognition | Image Quality |
+|---|---:|---:|---:|---:|
+| `-1` | 0.2051 | 0.1827 | 0.0505 | 0.3396 |
+| `0` | 0.2564 | 0.3269 | 0.1616 | 0.4340 |
+| `4` | 0.4615 | 0.7885 | 0.6061 | 0.5660 |
+| `8` | 0.5128 | 0.9519 | 0.7172 | 0.6038 |
+| `16` | 0.3590 | 0.8942 | 0.3939 | 0.6415 |
+
+Main takeaway: **layers 4 to 8 are the practical sweet spot**, with layer `8` performing best in the no-bottleneck ablation. Very shallow splits lose too much semantics, while deeper layers become harder to reconstruct after compression due to broader feature distributions.
+
+### Feature Distribution Statistics
+
+Measured on roughly `200` COCO samples:
+
+| Layer | Mean | Std |
+|---|---:|---:|
+| `-1` pixel patches | -0.041 | 1.015 |
+| `0` patch embedding | -0.000 | 0.362 |
+| `4` block 4 | -0.022 | 0.847 |
+| `8` block 8 | -0.021 | 1.066 |
+| `16` block 16 | -0.030 | 2.255 |
+
+The report's conclusion is intuitive and important for future work: deeper features are more dispersed, which makes aggressive low-dimensional compression harder. That is one reason reconstruction error tends to increase as the split layer moves deeper.
+
+## Repository Layout
+
+```text
+SplitOculo/
+├── core/                 # shared framework and Qwen feature extraction
+├── models/               # projector, bottleneck, upsampler, student models
+├── scripts/              # training, preprocessing, deployment, export
+├── electron_gui/         # desktop UI for split inference
+├── cpp_edge_client/      # ONNX-oriented C++ edge client
+├── checkpoints/          # saved training outputs and split weights
+├── data/                 # local datasets and precomputed features
+└── local_research/       # research notes and planning docs
+```
+
+## Quick Start
+
+### 1. Environment
 
 ```bash
 git clone https://github.com/Shimmer22/SplitOculo.git
 cd SplitOculo
 
-conda create -n cnn_vit python=3.10 -y
-conda activate cnn_vit
-
+conda create -n splitoculo python=3.10 -y
+conda activate splitoculo
 pip install -r requirements.txt
 ```
 
-### Step 1: Download Dataset (COCO val2017)
+### 2. Prepare COCO Validation Images
 
 ```bash
 mkdir -p data/coco
 wget http://images.cocodataset.org/zips/val2017.zip -P data/coco/
 unzip data/coco/val2017.zip -d data/coco/
-rm data/coco/val2017.zip
-
-# Split into train/val (80/20)
-python -c "
-import os, shutil, random
-from pathlib import Path
-
-src = Path('data/coco/val2017')
-images = list(src.glob('*.jpg'))
-random.seed(42)
-random.shuffle(images)
-
-train_dir = Path('data/coco/train')
-val_dir = Path('data/coco/val')
-train_dir.mkdir(parents=True, exist_ok=True)
-val_dir.mkdir(parents=True, exist_ok=True)
-
-split = int(len(images) * 0.8)
-for img in images[:split]:
-    shutil.copy(img, train_dir / img.name)
-for img in images[split:]:
-    shutil.copy(img, val_dir / img.name)
-
-print(f'✅ Train: {split}, Val: {len(images)-split}')
-"
 ```
 
-### Step 2: Precompute Qwen Features
+### 3. Precompute Qwen Features
 
 ```bash
-# Default: align to layer 4 (after 4 transformer blocks)
 python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco --output_dir ./data/coco_features_layer4 \
-    --layer 4 --split train
+  --data_dir ./data/coco \
+  --output_dir ./data/coco_features_layer4 \
+  --layer 4 \
+  --split train
 
 python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco --output_dir ./data/coco_features_layer4 \
-    --layer 4 --split val
+  --data_dir ./data/coco \
+  --output_dir ./data/coco_features_layer4 \
+  --layer 4 \
+  --split val
 ```
 
-> [!TIP]
-> To compare different alignment layers, see the "Layer Alignment Experiments" section.
-
-### Step 3: Train (with Bottleneck)
+### 4. Train the Split Pipeline
 
 ```bash
-# Phase 1: Warmup
 python scripts/train_gan.py \
-    --features_dir ./data/coco_features_layer4 \
-    --data_dir ./data/coco \
-    --phase warmup \
-    --epochs 20 \
-    --bottleneck_dim 64 \
-    --bottleneck_method linear \
-    --output_dir ./checkpoints/gan_bottleneck
+  --features_dir ./data/coco_features_layer4 \
+  --data_dir ./data/coco \
+  --phase warmup \
+  --epochs 20 \
+  --bottleneck_dim 64 \
+  --bottleneck_method linear \
+  --output_dir ./checkpoints/gan_bottleneck
 
-# Phase 2: GAN Finetuning
 python scripts/train_gan.py \
-    --features_dir ./data/coco_features_layer4 \
-    --data_dir ./data/coco \
-    --phase gan \
-    --warmup_checkpoint ./checkpoints/gan_bottleneck/warmup_best.pth \
-    --epochs 30 \
-    --bottleneck_dim 64 \
-    --output_dir ./checkpoints/gan_bottleneck
+  --features_dir ./data/coco_features_layer4 \
+  --data_dir ./data/coco \
+  --phase gan \
+  --warmup_checkpoint ./checkpoints/gan_bottleneck/warmup_best.pth \
+  --epochs 30 \
+  --bottleneck_dim 64 \
+  --output_dir ./checkpoints/gan_bottleneck
 ```
 
-### Step 4: Split Weights
+### 5. Split the Checkpoint for Deployment
 
 ```bash
 python scripts/split_checkpoint.py \
-    --input ./checkpoints/gan_bottleneck/gan_best.pth \
-    --output_dir ./checkpoints/gan_bottleneck/split/
+  --input ./checkpoints/gan_bottleneck/gan_best.pth \
+  --output_dir ./checkpoints/gan_bottleneck/split/
 ```
 
-Output:
-- `edge_weights.pth` (~11 MB): CNN + Projector + Bottleneck.encoder
-- `cloud_weights.pth` (~486 MB): Bottleneck.decoder + Upsampler
+### 6. Run Real Edge-Cloud Inference
 
-### Step 5: Network-Split Deployment
+Cloud:
 
-**Cloud Server**:
 ```bash
 python scripts/cloud_server.py \
-    --checkpoint ./checkpoints/gan_bottleneck/split/cloud_weights.pth \
-    --port 8080 \
-    --offline
+  --checkpoint ./checkpoints/gan_bottleneck/split/cloud_weights.pth \
+  --port 8080 \
+  --offline
 ```
 
-**Edge Client**:
+Edge:
+
 ```bash
 python scripts/edge_client.py \
-    --checkpoint ./checkpoints/gan_bottleneck/split/edge_weights.pth \
-    --image ./test.jpg \
-    --server http://CLOUD_IP:8080 \
-    --timeout 300
+  --checkpoint ./checkpoints/gan_bottleneck/split/edge_weights.pth \
+  --image ./test.jpg \
+  --server http://CLOUD_IP:8080 \
+  --timeout 300
 ```
 
----
+## Layer Alignment Experiments
 
-## 🧪 Layer Alignment Experiments
-
-Test the impact of aligning CNN+Upsampler to different Qwen ViT layers.
-
-### Layer Semantics
-
-| split_layer | Alignment Target | Inference Flow | Feature Dim |
-|------------|--------|------------|--------|
-| `-1` | Raw pixel patches (JPEG level) | upsampled → patch_embed → blocks[0:] → merger | 3×pH×pW |
-| `0` | patch_embed output | upsampled → blocks[0:] → merger | 1280 |
-| `4` | block 4 output (default) | upsampled → blocks[4:] → merger | 1280 |
-| `8` | block 8 output | upsampled → blocks[8:] → merger | 1280 |
-| `16` | block 16 output | upsampled → blocks[16:] → merger | 1280 |
-
-### Feature Distribution Stats (COCO, ~200 samples)
-
-| Layer | mean | std | Notes |
-|-------|------|-----|-------|
-| `-1` (pixel, 1176 dim) | -0.041 | 1.015 | 3×2×14×14, no normalization |
-| `0` (patch_embed, 1280 dim) | -0.000 | 0.362 | Written into code |
-| `4` (block 4, 1280 dim) | -0.022 | 0.847 | Default |
-| `8` (block 8, 1280 dim) | -0.021 | 1.066 | Written into code |
-| `16` (block 16, 1280 dim) | -0.030 | 2.255 | Written into code |
-
-Get the missing magic numbers:
-```bash
-# Measure from existing layer 4 dir
-python scripts/measure_feature_stats.py \
-    --features_dir ./data/coco_features_layer4 --split train
-
-# Measure all 4 layers at once (loads Qwen, ~10 min)
-python scripts/measure_feature_stats.py \
-    --data_dir ./data/coco --split train --max_files 100 --realtime --all_layers
-```
-
-### Precompute Each Layer
+If you want to reproduce the layer study, the repository already supports alignment targets at `-1`, `0`, `4`, `8`, and `16`.
 
 ```bash
-# Layer 0: patch_embed output
 python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco --output_dir ./data/coco_features_layer0 --layer 0 --split train
-python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco --output_dir ./data/coco_features_layer0 --layer 0 --split val
-
-# Layer 8
-python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco --output_dir ./data/coco_features_layer8 --layer 8 --split train
-python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco --output_dir ./data/coco_features_layer8 --layer 8 --split val
-
-# Layer -1 (pixel patches, no full Qwen forward pass needed)
-python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco --output_dir ./data/coco_features_layer-1 --layer -1 --split train
-python scripts/precompute_qwen_features.py \
-    --data_dir ./data/coco --output_dir ./data/coco_features_layer-1 --layer -1 --split val
+  --data_dir ./data/coco \
+  --output_dir ./data/coco_features_layer8 \
+  --layer 8 \
+  --split train
 ```
 
----
+You can also measure feature statistics directly:
 
-## 📐 Architecture (v2.2)
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ EDGE                                      [edge_client.py]              │
-│  Image → MobileNet → Projector → Bottleneck.encode()                    │
-│                           ↓                                              │
-│              [49 × 64] int8 quantized → base64 encoded                  │
-└───────────────────────────────────────┬─────────────────────────────────┘
-                                        │ HTTP POST (~3 KB payload)
-┌───────────────────────────────────────▼─────────────────────────────────┐
-│ CLOUD                                     [cloud_server.py]             │
-│  Flask Server @ :8080                                                    │
-│  Dequantize → Bottleneck.decode() → Upsampler → Qwen[4:] → LLM         │
-│                           ↓                                              │
-│              JSON Response: {"response": "Image description..."}        │
-└─────────────────────────────────────────────────────────────────────────┘
+```bash
+python scripts/measure_feature_stats.py \
+  --data_dir ./data/coco \
+  --split train \
+  --max_files 100 \
+  --realtime \
+  --all_layers
 ```
 
-### Edge vs Cloud Comparison
+## Current Limitations
 
-| | Edge | Cloud |
-|---|---|---|
-| **Components** | MobileNetV2 + StridedProjector + Bottleneck.encoder | Bottleneck.decoder + TransformerUpsampler |
-| **Weight File** | 11 MB | 486 MB |
-| **Active Params** | 2.87M | 126.63M |
-| **Extra Compute** | - | Qwen ViT [4:32] + Merger + LLM |
+- OCR and chart-heavy understanding are still the largest gap versus the full Qwen baseline.
+- The current README reports one useful but imperfect layer-ablation study that was run without the bottleneck path enabled.
+- The project is a research prototype, so benchmarking, packaging, and reproducibility still need more polishing than a production SDK.
 
----
+## Roadmap
 
-## 📝 Key Arguments
+- Stronger text-centric training data and OCR-focused adaptation
+- Cleaner end-task evaluation under bandwidth constraints
+- Adaptive token transmission instead of a fixed token budget
+- More real-device latency and energy measurements
 
-### Training Arguments
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--bottleneck_dim` | 0 | Bottleneck dimension (recommended: 64/128) |
-| `--bottleneck_method` | linear | linear / mlp / autoencoder |
-| `--lambda_recon` | 0.1 | Reconstruction loss weight |
-| `--upsampler_type` | transformer | transformer / mlp / deconv |
-| `--phase` | - | warmup (MSE) / gan (adversarial) |
-
-### Deployment Arguments
-
-| Argument | Description |
-|----------|-------------|
-| `--offline` | Offline mode, no HuggingFace connection |
-| `--qwen_path` | Qwen model path |
-| `--timeout` | Request timeout in seconds |
-
----
-
-## 📊 Transmission Size Comparison
-
-| bottleneck_dim | Size (int8) | Compression |
-|----------------|-------------|-------------|
-| Disabled (1280) | 61 KB | 1× |
-| 128 | 6.1 KB | 10× |
-| **64** | **3.1 KB** | **20×** |
-| 32 | 1.5 KB | 40× |
-
----
-
-## 📄 License
+## License
 
 MIT License
