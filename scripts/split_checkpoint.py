@@ -71,6 +71,15 @@ def main():
     print(f"   Bottleneck dim: {original_args.get('bottleneck_dim', 0)}")
     print(f"   Bottleneck method: {original_args.get('bottleneck_method', 'linear')}")
     
+    # 检测 importance-aware 模式
+    importance_aware = original_args.get('importance_aware', False)
+    if importance_aware:
+        print(f"\n   [Importance-Aware Mode Detected]")
+        print(f"   Scorer method: {original_args.get('scorer_method', 'mlp')}")
+        print(f"   Token budget: {original_args.get('token_budget', 24)}")
+        print(f"   Min tokens: {original_args.get('min_tokens', 8)}")
+        print(f"   Completion layers: {original_args.get('completion_layers', 2)}")
+    
     # 拆分瓶颈层权重
     has_bottleneck = 'bottleneck_state_dict' in ckpt
     if has_bottleneck:
@@ -100,6 +109,17 @@ def main():
     if has_bottleneck:
         edge_checkpoint['bottleneck_encoder_state_dict'] = encoder_weights
     
+    # 添加 importance-aware 端侧模块
+    if importance_aware:
+        if 'importance_scorer_state_dict' in ckpt:
+            edge_checkpoint['importance_scorer_state_dict'] = ckpt['importance_scorer_state_dict']
+        if 'budgeted_transmission_state_dict' in ckpt:
+            edge_checkpoint['budgeted_transmission_state_dict'] = ckpt['budgeted_transmission_state_dict']
+        edge_checkpoint['args']['importance_aware'] = original_args.get('importance_aware', False)
+        edge_checkpoint['args']['scorer_method'] = original_args.get('scorer_method', 'mlp')
+        edge_checkpoint['args']['token_budget'] = original_args.get('token_budget', 24)
+        edge_checkpoint['args']['min_tokens'] = original_args.get('min_tokens', 8)
+    
     # 创建云端权重
     cloud_checkpoint = {
         'upsampler_state_dict': ckpt['upsampler_state_dict'],
@@ -117,6 +137,13 @@ def main():
     
     if has_bottleneck:
         cloud_checkpoint['bottleneck_decoder_state_dict'] = decoder_weights
+    
+    # 添加 importance-aware 云端模块
+    if importance_aware:
+        if 'sparse_upsampler_state_dict' in ckpt:
+            cloud_checkpoint['sparse_upsampler_state_dict'] = ckpt['sparse_upsampler_state_dict']
+        cloud_checkpoint['args']['importance_aware'] = original_args.get('importance_aware', False)
+        cloud_checkpoint['args']['completion_layers'] = original_args.get('completion_layers', 2)
     
     # 可选：保留 discriminator (用于继续训练)
     if 'discriminator_state_dict' in ckpt:
@@ -145,14 +172,31 @@ def main():
     edge_params += sum(v.numel() for v in edge_checkpoint['projector_state_dict'].values())
     if has_bottleneck:
         edge_params += sum(v.numel() for v in edge_checkpoint['bottleneck_encoder_state_dict'].values())
+    if importance_aware:
+        if 'importance_scorer_state_dict' in edge_checkpoint:
+            edge_params += sum(v.numel() for v in edge_checkpoint['importance_scorer_state_dict'].values())
+        if 'budgeted_transmission_state_dict' in edge_checkpoint:
+            edge_params += sum(v.numel() for v in edge_checkpoint['budgeted_transmission_state_dict'].values())
     
     cloud_params = sum(v.numel() for v in cloud_checkpoint['upsampler_state_dict'].values())
     if has_bottleneck:
         cloud_params += sum(v.numel() for v in cloud_checkpoint['bottleneck_decoder_state_dict'].values())
+    if importance_aware:
+        if 'sparse_upsampler_state_dict' in cloud_checkpoint:
+            cloud_params += sum(v.numel() for v in cloud_checkpoint['sparse_upsampler_state_dict'].values())
     
     print(f"\n📈 Parameters:")
     print(f"   Edge:  {edge_params:,} ({edge_params/1e6:.2f}M)")
     print(f"   Cloud: {cloud_params:,} ({cloud_params/1e6:.2f}M)")
+    
+    if importance_aware:
+        print(f"\n🎯 Importance-Aware modules:")
+        scorer_keys = len(edge_checkpoint.get('importance_scorer_state_dict', {}))
+        budget_keys = len(edge_checkpoint.get('budgeted_transmission_state_dict', {}))
+        sparse_keys = len(cloud_checkpoint.get('sparse_upsampler_state_dict', {}))
+        print(f"   Edge  - importance_scorer keys: {scorer_keys}")
+        print(f"   Edge  - budgeted_transmission keys: {budget_keys}")
+        print(f"   Cloud - sparse_upsampler keys: {sparse_keys}")
     
     print("\n" + "=" * 60)
 

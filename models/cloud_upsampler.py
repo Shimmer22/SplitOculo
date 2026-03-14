@@ -248,6 +248,121 @@ class TransformerUpsampler(nn.Module):
         return x
 
 
+class SparseTokenUpsampler(nn.Module):
+    """
+    稀疏 Token 上采样器
+    
+    接收 K 个被选中的 token（K ≤ max_tokens）及其位置索引,
+    重建完整的 max_tokens 序列, 然后上采样到 target_tokens。
+    
+    流程:
+    1. 将 K 个选中 token 放回 max_tokens 个 slot 的对应位置
+    2. 未选中位置用可学习的占位符嵌入填充
+    3. 加入位置编码
+    4. 用 Transformer 补全缺失位置 (让 missing tokens attend to known tokens)
+    5. 复用现有 upsampler 从 max_tokens → target_tokens
+    
+    Args:
+        hidden_size: token维度 (default 1280)
+        max_tokens: 总slot数 (default 49, 即7x7)
+        target_tokens: 目标token数 (default 256, 即16x16)
+        num_completion_layers: 补全Transformer层数 (default 2)
+        num_upsample_layers: 上采样Transformer层数 (default 4)
+        initial_upsample: 初始上采样方式 (default 'pixelshuffle')
+    """
+    def __init__(self, hidden_size=1280, max_tokens=49, target_tokens=256,
+                 num_completion_layers=2, num_upsample_layers=4,
+                 initial_upsample='pixelshuffle'):
+        super().__init__()
+        
+        self.hidden_size = hidden_size
+        self.max_tokens = max_tokens
+        self.target_tokens = target_tokens
+        
+        # Learnable missing token embedding (single shared embedding for all missing positions)
+        self.missing_token_embed = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
+        
+        # Slot positional embedding (49 positions, so model knows which slot is which)
+        self.slot_pos_embed = nn.Parameter(torch.randn(1, max_tokens, hidden_size) * 0.02)
+        
+        # Token presence indicator embedding (known=1, missing=0)
+        self.presence_embed = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
+        self.absence_embed = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
+        
+        # Completion Transformer: fills in missing token info from known tokens
+        nhead = 16
+        while hidden_size % nhead != 0:
+            nhead //= 2
+        completion_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size, nhead=nhead,
+            dim_feedforward=hidden_size * 2,
+            dropout=0.1, activation='gelu',
+            batch_first=True, norm_first=True
+        )
+        self.completion_transformer = nn.TransformerEncoder(
+            completion_layer, num_layers=num_completion_layers
+        )
+        self.completion_norm = nn.LayerNorm(hidden_size)
+        
+        # Upsampler: reuse TransformerUpsampler for max_tokens -> target_tokens
+        self.upsampler = TransformerUpsampler(
+            hidden_size=hidden_size,
+            input_tokens=max_tokens,
+            target_tokens=target_tokens,
+            num_layers=num_upsample_layers,
+            initial_upsample=initial_upsample
+        )
+    
+    def forward(self, sparse_tokens, indices, total_slots=None):
+        """
+        Args:
+            sparse_tokens: [B, K, hidden_size] - selected tokens
+            indices: [B, K] - position indices (0 to max_tokens-1)
+            total_slots: int or None (uses self.max_tokens if None)
+        Returns:
+            [B, target_tokens, hidden_size]
+        """
+        B, K, D = sparse_tokens.shape
+        N = total_slots or self.max_tokens
+        
+        # 1. Build full sequence with missing token placeholders
+        full_seq = self.missing_token_embed.expand(B, N, -1).clone()
+        
+        # 2. Place known tokens at their positions
+        idx_expanded = indices.unsqueeze(-1).expand(-1, -1, D)
+        full_seq.scatter_(1, idx_expanded, sparse_tokens)
+        
+        # 3. Add slot positional embedding
+        full_seq = full_seq + self.slot_pos_embed[:, :N, :]
+        
+        # 4. Add presence/absence indicator
+        presence_mask = torch.zeros(B, N, 1, device=sparse_tokens.device)
+        presence_mask.scatter_(1, indices.unsqueeze(-1), 1.0)
+        indicator = presence_mask * self.presence_embed + (1 - presence_mask) * self.absence_embed
+        full_seq = full_seq + indicator
+        
+        # 5. Completion Transformer
+        completed = self.completion_transformer(full_seq)
+        completed = self.completion_norm(completed)
+        
+        # 6. Upsample to target_tokens
+        output = self.upsampler(completed)
+        
+        return output
+    
+    def forward_dense(self, tokens):
+        """
+        Dense mode fallback: all tokens present (no sparse selection).
+        Equivalent to just running the upsampler.
+        
+        Args:
+            tokens: [B, max_tokens, hidden_size]
+        Returns:
+            [B, target_tokens, hidden_size]
+        """
+        return self.upsampler(tokens)
+
+
 class LearnableProjector(nn.Module):
     """
     完整的端侧 Projector + 云端 Upsampler
@@ -337,5 +452,36 @@ if __name__ == '__main__':
     upsampler = CloudUpsampler(hidden_size=1280, input_tokens=49, target_tokens=256)
     out = upsampler(edge_tokens)
     print(f"Upsampler output: {out.shape}")
+    
+    # 测试 SparseTokenUpsampler
+    print("\n--- SparseTokenUpsampler 测试 ---")
+    sparse_upsampler = SparseTokenUpsampler(
+        hidden_size=1280,
+        max_tokens=49,
+        target_tokens=256,
+        num_completion_layers=2,
+        num_upsample_layers=4,
+        initial_upsample='pixelshuffle'
+    )
+    
+    # 测试 sparse forward: K=24 个 token，随机索引
+    K = 24
+    sparse_tokens = torch.randn(2, K, 1280)
+    indices = torch.stack([torch.randperm(49)[:K] for _ in range(2)])  # [2, 24]
+    
+    sparse_out = sparse_upsampler(sparse_tokens, indices)
+    print(f"Sparse input: tokens={sparse_tokens.shape}, indices={indices.shape}")
+    print(f"Sparse output: {sparse_out.shape}")  # (2, 256, 1280)
+    
+    # 测试 dense forward fallback
+    dense_tokens = torch.randn(2, 49, 1280)
+    dense_out = sparse_upsampler.forward_dense(dense_tokens)
+    print(f"Dense input: {dense_tokens.shape}")
+    print(f"Dense output: {dense_out.shape}")  # (2, 256, 1280)
+    
+    # 参数量统计
+    total_params = sum(p.numel() for p in sparse_upsampler.parameters())
+    trainable_params = sum(p.numel() for p in sparse_upsampler.parameters() if p.requires_grad)
+    print(f"SparseTokenUpsampler params: {total_params:,} (trainable: {trainable_params:,})")
     
     print("\n✅ 所有测试通过!")

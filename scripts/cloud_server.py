@@ -30,7 +30,7 @@ import torch.nn.functional as F
 import numpy as np
 from flask import Flask, request, jsonify
 
-from models.cloud_upsampler import CloudUpsampler, TransformerUpsampler
+from models.cloud_upsampler import CloudUpsampler, TransformerUpsampler, SparseTokenUpsampler
 from models.bottleneck import DimensionBottleneck
 
 
@@ -106,6 +106,24 @@ class CloudInferenceEngine:
         self.upsampler.load_state_dict(ckpt['upsampler_state_dict'])
         self.upsampler.eval()
         
+        # Sparse upsampler (importance-aware mode)
+        self.importance_aware = args.get('importance_aware', False)
+        if self.importance_aware:
+            self.sparse_upsampler = SparseTokenUpsampler(
+                hidden_size=hidden_size,
+                max_tokens=self.transmission_tokens,
+                target_tokens=self.target_tokens,
+                num_completion_layers=args.get('completion_layers', 2),
+                num_upsample_layers=transformer_layers,
+                initial_upsample=args.get('initial_upsample', 'pixelshuffle'),
+            ).to(device)
+            self.sparse_upsampler.load_state_dict(ckpt['sparse_upsampler_state_dict'])
+            self.sparse_upsampler.eval()
+            print(f"   SparseTokenUpsampler: completion={args.get('completion_layers', 2)} layers, "
+                  f"upsample={transformer_layers} layers (importance-aware mode)")
+        else:
+            self.sparse_upsampler = None
+        
         print(f"✅ Cloud components loaded")
         
         # Qwen (延迟加载)
@@ -142,7 +160,7 @@ class CloudInferenceEngine:
         
         print(f"✅ Qwen loaded")
     
-    def decode_features(self, features_b64: str, scale: float, zero_point: float):
+    def decode_features(self, features_b64: str, scale: float, zero_point: float, num_tokens: int = None):
         """
         反序列化并反量化特征
         
@@ -150,6 +168,7 @@ class CloudInferenceEngine:
             features_b64: base64 编码的 int8 特征
             scale: 量化缩放因子
             zero_point: 量化零点
+            num_tokens: 可选，token数量（稀疏模式下为K < transmission_tokens）
         
         Returns:
             解压后的特征 tensor
@@ -162,7 +181,7 @@ class CloudInferenceEngine:
         
         # 确定形状
         expected_dim = self.bottleneck_dim if self.bottleneck else self.hidden_size
-        features_int8 = features_int8.reshape(1, self.transmission_tokens, expected_dim)
+        features_int8 = features_int8.reshape(1, num_tokens or self.transmission_tokens, expected_dim)
         
         # 转为 tensor 并反量化
         features = torch.from_numpy(features_int8.astype(np.float32)).to(self.device)
@@ -171,13 +190,14 @@ class CloudInferenceEngine:
         return features
     
     @torch.no_grad()
-    def infer(self, compressed_features, prompt="这张图里有什么?"):
+    def infer(self, compressed_features, prompt="这张图里有什么?", indices=None):
         """
         完成云端推理
 
         Args:
-            compressed_features: [1, 49, bottleneck_dim] 压缩特征
+            compressed_features: [1, K, bottleneck_dim] 压缩特征 (K=49 or K<49 for sparse)
             prompt: 用户提示
+            indices: 可选，稀疏token的位置索引列表 (importance-aware模式)
 
         Returns:
             LLM 响应文本
@@ -188,8 +208,19 @@ class CloudInferenceEngine:
         else:
             edge_tokens = compressed_features
 
-        # 2. Upsampler
-        upsampled = self.upsampler(edge_tokens)
+        # 2. Upsampler (sparse or normal path)
+        if self.importance_aware and indices is not None:
+            # Sparse path: K tokens + indices → full reconstruction
+            if not isinstance(indices, torch.Tensor):
+                indices_tensor = torch.tensor(indices, dtype=torch.long, device=self.device).unsqueeze(0)
+            else:
+                indices_tensor = indices.to(self.device)
+                if indices_tensor.dim() == 1:
+                    indices_tensor = indices_tensor.unsqueeze(0)
+            upsampled = self.sparse_upsampler(edge_tokens, indices_tensor)
+        else:
+            # Normal path: full 49 tokens
+            upsampled = self.upsampler(edge_tokens)
 
         # 3. 特征缩放匹配 Qwen 分布 (按 split_layer 区分)
         if self.split_layer == 4:
@@ -320,7 +351,8 @@ def health():
     return jsonify({
         'status': 'ok',
         'model_loaded': engine is not None,
-        'qwen_loaded': engine.qwen_model is not None if engine else False
+        'qwen_loaded': engine.qwen_model is not None if engine else False,
+        'importance_aware': engine.importance_aware if engine else False
     })
 
 
@@ -335,12 +367,14 @@ def infer():
         scale = data['scale']
         zero_point = data['zero_point']
         prompt = data.get('prompt', '这张图里有什么?')
+        indices = data.get('indices', None)
+        num_selected = data.get('num_selected', None)
         
         # 反序列化特征
-        features = engine.decode_features(features_b64, scale, zero_point)
+        features = engine.decode_features(features_b64, scale, zero_point, num_tokens=num_selected)
         
         # 推理
-        response = engine.infer(features, prompt)
+        response = engine.infer(features, prompt, indices=indices)
         
         latency_ms = (time.time() - start_time) * 1000
         

@@ -32,9 +32,10 @@ from PIL import Image
 from torchvision import transforms
 import math
 
-from models.pooling_projector import PoolingTokenProjector
 from models.strided_projector import StridedTokenProjector
 from models.bottleneck import DimensionBottleneck
+from models.importance_scorer import TokenImportanceScorer
+from models.budgeted_transmission import SoftBudgetedTransmission
 
 
 class EdgeProjector(nn.Module):
@@ -111,7 +112,7 @@ class EdgeEncoder:
             ).to(device)
             print("   Strided token projector")
         else:
-            self.projector = PoolingTokenProjector(
+            self.projector = EdgeProjector(
                 in_channels=student_channels,
                 hidden_size=hidden_size,
                 hidden_channels=args.get('projector_hidden', 512),
@@ -152,6 +153,43 @@ class EdgeEncoder:
             self.bottleneck = None
             print(f"   No bottleneck (full dimension)")
         
+        # Importance-aware sparse transmission (optional)
+        self.importance_aware = args.get('importance_aware', False)
+        self.importance_scorer = None
+        self.budgeted_transmission = None
+        
+        if self.importance_aware:
+            scorer_method = args.get('scorer_method', 'mlp')
+            self.importance_scorer = TokenImportanceScorer(
+                hidden_size=hidden_size,
+                method=scorer_method
+            ).to(device)
+            
+            token_budget = args.get('token_budget', 24)
+            min_tokens = args.get('min_tokens', 8)
+            self.budgeted_transmission = SoftBudgetedTransmission(
+                max_tokens=self.transmission_tokens,
+                target_budget=token_budget,
+                min_tokens=min_tokens
+            ).to(device)
+            
+            # Load state dicts
+            if 'importance_scorer_state_dict' in ckpt:
+                self.importance_scorer.load_state_dict(ckpt['importance_scorer_state_dict'])
+                print(f"   Importance scorer ({scorer_method}): loaded")
+            else:
+                print(f"   Importance scorer ({scorer_method}): no weights found, using random init")
+            
+            if 'budgeted_transmission_state_dict' in ckpt:
+                self.budgeted_transmission.load_state_dict(ckpt['budgeted_transmission_state_dict'])
+                print(f"   Budgeted transmission: budget={token_budget}, min={min_tokens}, loaded")
+            else:
+                print(f"   Budgeted transmission: budget={token_budget}, min={min_tokens}, no weights found")
+            
+            self.importance_scorer.eval()
+            self.budgeted_transmission.eval()
+            print(f"   Importance-aware sparse encoding: ENABLED")
+        
         # 图像预处理
         self.transform = transforms.Compose([
             transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -173,6 +211,7 @@ class EdgeEncoder:
         Returns:
             features: 压缩特征 tensor
             is_compressed: 是否经过瓶颈层压缩
+            indices: 选中的 token 索引 (importance-aware 时), 否则 None
         """
         # 加载图像
         img = Image.open(image_path).convert('RGB')
@@ -182,12 +221,24 @@ class EdgeEncoder:
         feat = self.student(image_tensor)[-1]
         tokens = self.projector(feat)
         
-        # Bottleneck 压缩
+        # Importance-aware sparse token selection (before bottleneck)
+        if self.importance_aware:
+            importance_logits = self.importance_scorer(tokens)
+            selected_tokens, indices, _, _ = self.budgeted_transmission(tokens, importance_logits)
+            
+            # Bottleneck encode the selected tokens
+            if self.bottleneck is not None:
+                compressed = self.bottleneck.encode(selected_tokens)
+                return compressed, True, indices
+            
+            return selected_tokens, False, indices
+        
+        # Standard path (no importance scoring)
         if self.bottleneck is not None:
             compressed = self.bottleneck.encode(tokens)
-            return compressed, True
+            return compressed, True, None
         
-        return tokens, False
+        return tokens, False, None
     
     def quantize_int8(self, features):
         """
@@ -218,13 +269,13 @@ class EdgeEncoder:
         完整编码流水线：图像 → base64 编码的压缩特征
         
         Returns:
-            payload: dict 包含 features, scale, zero_point
+            payload: dict 包含 features, scale, zero_point (及 indices, num_selected if importance-aware)
             stats: dict 包含统计信息
         """
         start_time = time.time()
         
         # 编码
-        features, is_compressed = self.encode(image_path)
+        features, is_compressed, indices = self.encode(image_path)
         encode_time = time.time() - start_time
         
         # 量化
@@ -246,6 +297,13 @@ class EdgeEncoder:
             'is_compressed': is_compressed
         }
         
+        # Add sparse token indices if importance-aware
+        if indices is not None:
+            payload['indices'] = indices.squeeze(0).cpu().tolist()
+            payload['num_selected'] = len(payload['indices'])
+            stats['num_selected'] = payload['num_selected']
+            stats['total_tokens'] = self.transmission_tokens
+        
         return payload, stats
 
 
@@ -263,6 +321,8 @@ def main():
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--timeout', type=int, default=300,
                         help='Request timeout in seconds (default: 300)')
+    parser.add_argument('--importance_aware', action='store_true',
+                        help='Display importance-aware info (actual behavior is checkpoint-driven)')
     
     args = parser.parse_args()
     
@@ -283,6 +343,11 @@ def main():
     
     print(f"   Feature shape: {stats['feature_shape']}")
     print(f"   Compressed: {stats['is_compressed']}")
+    if 'num_selected' in stats:
+        print(f"   Importance-aware: {stats['num_selected']}/{stats['total_tokens']} tokens selected "
+              f"({stats['num_selected']/stats['total_tokens']*100:.0f}%)")
+        bandwidth_saving = (1 - stats['num_selected'] / stats['total_tokens']) * 100
+        print(f"   Bandwidth saving: {bandwidth_saving:.0f}%")
     print(f"   Encode time: {stats['encode_time_ms']:.2f} ms")
     print(f"   Payload size: {stats['payload_bytes']} bytes ({stats['payload_bytes']/1024:.2f} KB)")
     
@@ -315,6 +380,8 @@ def main():
             print(f"\n📊 Summary:")
             print(f"   Edge encode: {stats['encode_time_ms']:.2f} ms")
             print(f"   Transmission: {stats['payload_bytes']/1024:.2f} KB")
+            if 'num_selected' in stats:
+                print(f"   Sparse tokens: {stats['num_selected']}/{stats['total_tokens']}")
             print(f"   Total latency: {total_time:.2f} ms")
         else:
             print(f"❌ Error: {response.status_code}")

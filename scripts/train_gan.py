@@ -54,10 +54,14 @@ import math
 from core.utils import set_seed, get_logger, count_parameters
 from core.qwen_extractor import QwenFeatureExtractor
 from models.cloud_upsampler import CloudUpsampler, TransformerUpsampler
-from models.pooling_projector import PoolingTokenProjector
+# PoolingTokenProjector is the inline EdgeProjector class (pooling_projector.py was removed)
+# The 'pooling' projector_type now uses EdgeProjector defined below
 from models.strided_projector import StridedTokenProjector
 from models.discriminator import FeatureDiscriminator
 from models.bottleneck import DimensionBottleneck
+from models.importance_scorer import TokenImportanceScorer, TextAwareImportanceScorer
+from models.budgeted_transmission import SoftBudgetedTransmission
+from models.cloud_upsampler import SparseTokenUpsampler
 
 
 class EdgeProjector(nn.Module):
@@ -237,6 +241,11 @@ class GANTrainer:
                    count_parameters(self.upsampler))
         d_params = count_parameters(self.discriminator)
         
+        if self.importance_scorer is not None:
+            g_params += count_parameters(self.importance_scorer)
+        if self.sparse_upsampler is not None:
+            g_params += count_parameters(self.sparse_upsampler)
+        
         self.logger.info(f"Generator params: {g_params / 1e6:.2f}M")
         self.logger.info(f"  Student: {count_parameters(self.student) / 1e6:.2f}M")
         self.logger.info(f"  Projector: {count_parameters(self.projector) / 1e6:.2f}M")
@@ -244,6 +253,10 @@ class GANTrainer:
             self.logger.info(f"  Bottleneck: {bottleneck_params / 1e6:.2f}M (dim={args.bottleneck_dim}, method={args.bottleneck_method})")
             self.logger.info(f"  Transmission size: {self.bottleneck.get_transmission_size_kb(args.transmission_tokens):.2f} KB")
         self.logger.info(f"  Upsampler: {count_parameters(self.upsampler) / 1e6:.2f}M")
+        if self.importance_scorer is not None:
+            self.logger.info(f"  Importance Scorer: {count_parameters(self.importance_scorer) / 1e6:.2f}M")
+        if self.sparse_upsampler is not None:
+            self.logger.info(f"  Sparse Upsampler: {count_parameters(self.sparse_upsampler) / 1e6:.2f}M")
         self.logger.info(f"Discriminator params: {d_params / 1e6:.2f}M")
     
     def _load_models(self):
@@ -277,13 +290,13 @@ class GANTrainer:
             ).to(self.device)
             self.logger.info("Using strided token projector")
         else:
-            self.projector = PoolingTokenProjector(
+            self.projector = EdgeProjector(
                 in_channels=student_channels,
                 hidden_size=args.target_hidden_size,
                 hidden_channels=args.projector_hidden,
                 transmission_tokens=args.transmission_tokens
             ).to(self.device)
-            self.logger.info("Using pooling token projector")
+            self.logger.info("Using pooling (edge) projector")
         
         # 云端 Upsampler (使用 TransformerUpsampler)
         if args.upsampler_type == 'transformer':
@@ -309,12 +322,57 @@ class GANTrainer:
             self.bottleneck = DimensionBottleneck(
                 hidden_size=args.target_hidden_size,
                 bottleneck_dim=args.bottleneck_dim,
-                method=args.bottleneck_method
+                method=args.bottleneck_method,
+                quantize_aware=getattr(args, 'quantize_aware', False),
+                num_bits=getattr(args, 'num_bits', 8),
             ).to(self.device)
             self.logger.info(f"Using Bottleneck: {args.target_hidden_size} → {args.bottleneck_dim} → {args.target_hidden_size}")
         else:
             self.bottleneck = None
             self.logger.info("No bottleneck (full dimension transmission)")
+        
+        # Importance scorer (for information-aware transmission)
+        if args.importance_aware:
+            if args.text_aware:
+                self.importance_scorer = TextAwareImportanceScorer(
+                    cnn_channels=student_channels,
+                    hidden_size=args.target_hidden_size,
+                    spatial_size=student_feat.shape[2],  # 14 for MobileNetV2
+                    token_grid_size=int(args.transmission_tokens ** 0.5),
+                ).to(self.device)
+                self.logger.info(f"Using TextAwareImportanceScorer (CNN {student_channels}ch + semantic)")
+            else:
+                self.importance_scorer = TokenImportanceScorer(
+                    hidden_size=args.target_hidden_size,
+                    method=args.scorer_method,
+                ).to(self.device)
+                self.logger.info(f"Using TokenImportanceScorer (method={args.scorer_method})")
+            
+            # Budgeted transmission
+            self.budgeted_tx = SoftBudgetedTransmission(
+                max_tokens=args.transmission_tokens,
+                target_budget=args.token_budget,
+                initial_temperature=args.budget_temperature,
+                min_temperature=0.1,
+                anneal_rate=args.anneal_rate,
+                min_tokens=args.min_tokens,
+            ).to(self.device)
+            self.logger.info(f"Using SoftBudgetedTransmission (budget={args.token_budget}, temp={args.budget_temperature})")
+            
+            # Use SparseTokenUpsampler instead of regular upsampler
+            self.sparse_upsampler = SparseTokenUpsampler(
+                hidden_size=args.target_hidden_size,
+                max_tokens=args.transmission_tokens,
+                target_tokens=args.target_tokens,
+                num_completion_layers=args.completion_layers,
+                num_upsample_layers=args.transformer_layers,
+                initial_upsample=args.initial_upsample,
+            ).to(self.device)
+            self.logger.info(f"Using SparseTokenUpsampler (completion_layers={args.completion_layers})")
+        else:
+            self.importance_scorer = None
+            self.budgeted_tx = None
+            self.sparse_upsampler = None
         
         # Discriminator
         self.discriminator = FeatureDiscriminator(
@@ -338,6 +396,12 @@ class GANTrainer:
         # 添加瓶颈层参数
         if self.bottleneck is not None:
             g_params += list(self.bottleneck.parameters())
+        
+        # Add importance-aware module parameters
+        if self.importance_scorer is not None:
+            g_params += list(self.importance_scorer.parameters())
+        if self.sparse_upsampler is not None:
+            g_params += list(self.sparse_upsampler.parameters())
         
         # Generator 优化器
         self.opt_G = optim.AdamW(g_params, lr=args.lr_g, weight_decay=args.weight_decay,
@@ -364,6 +428,18 @@ class GANTrainer:
             self.bottleneck.load_state_dict(ckpt['bottleneck_state_dict'])
             self.logger.info("Loaded bottleneck weights")
         
+        if 'importance_scorer_state_dict' in ckpt and self.importance_scorer is not None:
+            self.importance_scorer.load_state_dict(ckpt['importance_scorer_state_dict'])
+            self.logger.info("Loaded importance scorer weights")
+        
+        if 'budgeted_tx_state_dict' in ckpt and self.budgeted_tx is not None:
+            self.budgeted_tx.load_state_dict(ckpt['budgeted_tx_state_dict'])
+            self.logger.info("Loaded budgeted transmission weights")
+        
+        if 'sparse_upsampler_state_dict' in ckpt and self.sparse_upsampler is not None:
+            self.sparse_upsampler.load_state_dict(ckpt['sparse_upsampler_state_dict'])
+            self.logger.info("Loaded sparse upsampler weights")
+        
         if 'discriminator_state_dict' in ckpt:
             self.discriminator.load_state_dict(ckpt['discriminator_state_dict'])
         
@@ -385,9 +461,18 @@ class GANTrainer:
         self.student.train()
         self.projector.train()
         self.upsampler.train()
+        if self.importance_scorer is not None:
+            self.importance_scorer.train()
+        if self.budgeted_tx is not None:
+            self.budgeted_tx.train()
+        if self.sparse_upsampler is not None:
+            self.sparse_upsampler.train()
         
         total_loss = 0
         total_cos_sim = 0
+        total_budget_loss = 0
+        total_entropy_loss = 0
+        total_effective_k = 0
         
         pbar = tqdm(dataloader, desc=f"Warmup Epoch {epoch}")
         for images, teacher_tokens in pbar:
@@ -401,25 +486,60 @@ class GANTrainer:
                 student_feat = self.student(images)[-1]
                 edge_tokens = self.projector(student_feat)
                 
-                # 瓶颈层压缩/解压
-                if self.bottleneck is not None:
-                    decompressed, compressed = self.bottleneck(edge_tokens)
-                    output_tokens = self.upsampler(decompressed)
+                if self.importance_scorer is not None:
+                    # Information-aware path
+                    # Score importance
+                    if self.args.text_aware and isinstance(self.importance_scorer, TextAwareImportanceScorer):
+                        importance_logits, imp_details = self.importance_scorer(student_feat, edge_tokens)
+                    else:
+                        importance_logits = self.importance_scorer(edge_tokens)
+                        imp_details = {}
+                    
+                    # Budgeted transmission (soft masking in training)
+                    masked_tokens, mask, budget_loss, entropy_loss = self.budgeted_tx(edge_tokens, importance_logits)
+                    
+                    # Bottleneck compression
+                    if self.bottleneck is not None:
+                        decompressed, compressed = self.bottleneck(masked_tokens)
+                    else:
+                        decompressed = masked_tokens
+                        compressed = None
+                    
+                    # Sparse upsampler (in training mode, receives soft-masked full sequence)
+                    # During training, use forward_dense since we have all 49 tokens (just soft-masked)
+                    output_tokens = self.sparse_upsampler.forward_dense(decompressed)
                 else:
-                    output_tokens = self.upsampler(edge_tokens)
-                    compressed = None
+                    # Original path (no importance scoring)
+                    if self.bottleneck is not None:
+                        decompressed, compressed = self.bottleneck(edge_tokens)
+                        output_tokens = self.upsampler(decompressed)
+                    else:
+                        output_tokens = self.upsampler(edge_tokens)
+                        compressed = None
+                        decompressed = None
+                    budget_loss = torch.tensor(0.0, device=self.device)
+                    entropy_loss = torch.tensor(0.0, device=self.device)
+                    mask = None
                 
-                # 对齐 token 数量
+                # Align token counts
                 if output_tokens.shape[1] != teacher_tokens.shape[1]:
                     teacher_tokens = self._align_tokens(teacher_tokens, output_tokens.shape[1])
                 
                 # MSE Loss
                 loss = self.mse_loss(output_tokens, teacher_tokens)
                 
-                # 重建损失 (瓶颈层)
+                # Bottleneck reconstruction loss
                 if self.bottleneck is not None and self.args.lambda_recon > 0:
-                    loss_recon = self.mse_loss(decompressed, edge_tokens.detach())
+                    if self.importance_scorer is not None:
+                        loss_recon = self.mse_loss(decompressed, masked_tokens.detach())
+                    else:
+                        loss_recon = self.mse_loss(decompressed, edge_tokens.detach())
                     loss = loss + self.args.lambda_recon * loss_recon
+                
+                # Budget & entropy losses (importance-aware mode only)
+                if self.importance_scorer is not None:
+                    loss = loss + self.args.lambda_budget * budget_loss
+                    loss = loss + self.args.lambda_entropy * entropy_loss
             
             # Backward with AMP
             if self.use_amp:
@@ -440,11 +560,24 @@ class GANTrainer:
             
             total_loss += loss.item()
             total_cos_sim += cos_sim.item()
+            total_budget_loss += budget_loss.item()
+            total_entropy_loss += entropy_loss.item()
+            if mask is not None:
+                total_effective_k += mask.sum(dim=1).mean().item()
             
-            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'cos_sim': f'{cos_sim.item():.4f}'})
+            postfix = {'loss': f'{loss.item():.4f}', 'cos_sim': f'{cos_sim.item():.4f}'}
+            if mask is not None:
+                postfix['eff_k'] = f'{mask.sum(dim=1).mean().item():.1f}'
+            pbar.set_postfix(postfix)
         
         n = len(dataloader)
-        return {'loss': total_loss / n, 'cos_sim': total_cos_sim / n}
+        metrics = {'loss': total_loss / n, 'cos_sim': total_cos_sim / n}
+        if self.importance_scorer is not None:
+            metrics['budget_loss'] = total_budget_loss / n
+            metrics['entropy_loss'] = total_entropy_loss / n
+            metrics['effective_k'] = total_effective_k / n
+            metrics['temperature'] = self.budgeted_tx.current_temperature
+        return metrics
     
     def train_epoch_gan(self, dataloader, epoch):
         """GAN 训练: Generator vs Discriminator"""
@@ -452,11 +585,20 @@ class GANTrainer:
         self.projector.train()
         self.upsampler.train()
         self.discriminator.train()
+        if self.importance_scorer is not None:
+            self.importance_scorer.train()
+        if self.budgeted_tx is not None:
+            self.budgeted_tx.train()
+        if self.sparse_upsampler is not None:
+            self.sparse_upsampler.train()
         
         total_loss_g = 0
         total_loss_d = 0
         total_cos_sim = 0
         total_mse = 0
+        total_budget_loss = 0
+        total_entropy_loss = 0
+        total_effective_k = 0
         
         pbar = tqdm(dataloader, desc=f"GAN Epoch {epoch}")
         for images, teacher_tokens in pbar:
@@ -482,10 +624,24 @@ class GANTrainer:
                 with torch.no_grad():
                     student_feat = self.student(images)[-1]
                     edge_tokens = self.projector(student_feat)
-                    if self.bottleneck is not None:
-                        decompressed, _ = self.bottleneck(edge_tokens)
-                        edge_tokens = decompressed
-                    fake_tokens_d = self.upsampler(edge_tokens)
+                    
+                    if self.importance_scorer is not None:
+                        # Information-aware path for D
+                        if self.args.text_aware and isinstance(self.importance_scorer, TextAwareImportanceScorer):
+                            importance_logits, _ = self.importance_scorer(student_feat, edge_tokens)
+                        else:
+                            importance_logits = self.importance_scorer(edge_tokens)
+                        masked_tokens, _, _, _ = self.budgeted_tx(edge_tokens, importance_logits)
+                        if self.bottleneck is not None:
+                            decompressed, _ = self.bottleneck(masked_tokens)
+                        else:
+                            decompressed = masked_tokens
+                        fake_tokens_d = self.sparse_upsampler.forward_dense(decompressed)
+                    else:
+                        if self.bottleneck is not None:
+                            decompressed, _ = self.bottleneck(edge_tokens)
+                            edge_tokens = decompressed
+                        fake_tokens_d = self.upsampler(edge_tokens)
                 
                 pred_fake = self.discriminator(fake_tokens_d.detach())
                 label_fake = torch.zeros_like(pred_fake)
@@ -511,13 +667,34 @@ class GANTrainer:
                 student_feat = self.student(images)[-1]
                 edge_tokens_raw = self.projector(student_feat)
                 
-                # 瓶颈层
-                if self.bottleneck is not None:
-                    decompressed, compressed = self.bottleneck(edge_tokens_raw)
-                    fake_tokens = self.upsampler(decompressed)
+                if self.importance_scorer is not None:
+                    # Information-aware path
+                    if self.args.text_aware and isinstance(self.importance_scorer, TextAwareImportanceScorer):
+                        importance_logits, imp_details = self.importance_scorer(student_feat, edge_tokens_raw)
+                    else:
+                        importance_logits = self.importance_scorer(edge_tokens_raw)
+                        imp_details = {}
+                    
+                    masked_tokens, mask, budget_loss, entropy_loss = self.budgeted_tx(edge_tokens_raw, importance_logits)
+                    
+                    if self.bottleneck is not None:
+                        decompressed, compressed = self.bottleneck(masked_tokens)
+                    else:
+                        decompressed = masked_tokens
+                        compressed = None
+                    
+                    fake_tokens = self.sparse_upsampler.forward_dense(decompressed)
                 else:
-                    fake_tokens = self.upsampler(edge_tokens_raw)
-                    decompressed = None
+                    # Original path
+                    if self.bottleneck is not None:
+                        decompressed, compressed = self.bottleneck(edge_tokens_raw)
+                        fake_tokens = self.upsampler(decompressed)
+                    else:
+                        fake_tokens = self.upsampler(edge_tokens_raw)
+                        decompressed = None
+                    budget_loss = torch.tensor(0.0, device=self.device)
+                    entropy_loss = torch.tensor(0.0, device=self.device)
+                    mask = None
                 
                 # 内容损失 (MSE)
                 loss_mse = self.mse_loss(fake_tokens, teacher_tokens)
@@ -529,10 +706,18 @@ class GANTrainer:
                 # 重建损失
                 loss_recon = 0
                 if self.bottleneck is not None and self.args.lambda_recon > 0:
-                    loss_recon = self.mse_loss(decompressed, edge_tokens_raw.detach())
+                    if self.importance_scorer is not None:
+                        loss_recon = self.mse_loss(decompressed, masked_tokens.detach())
+                    else:
+                        loss_recon = self.mse_loss(decompressed, edge_tokens_raw.detach())
                 
                 # 组合损失
                 loss_g = loss_mse * self.args.lambda_mse + loss_adv * self.args.lambda_adv + loss_recon * self.args.lambda_recon
+                
+                # Budget & entropy losses (importance-aware mode only)
+                if self.importance_scorer is not None:
+                    loss_g = loss_g + self.args.lambda_budget * budget_loss
+                    loss_g = loss_g + self.args.lambda_entropy * entropy_loss
             
             if self.use_amp:
                 self.scaler_G.scale(loss_g).backward()
@@ -554,20 +739,33 @@ class GANTrainer:
             total_loss_d += loss_d.item()
             total_cos_sim += cos_sim.item()
             total_mse += loss_mse.item()
+            total_budget_loss += budget_loss.item()
+            total_entropy_loss += entropy_loss.item()
+            if mask is not None:
+                total_effective_k += mask.sum(dim=1).mean().item()
             
-            pbar.set_postfix({
+            postfix = {
                 'G': f'{loss_g.item():.3f}',
                 'D': f'{loss_d.item():.3f}',
                 'cos': f'{cos_sim.item():.3f}'
-            })
+            }
+            if mask is not None:
+                postfix['eff_k'] = f'{mask.sum(dim=1).mean().item():.1f}'
+            pbar.set_postfix(postfix)
         
         n = len(dataloader)
-        return {
+        metrics = {
             'loss_g': total_loss_g / n,
             'loss_d': total_loss_d / n,
             'cos_sim': total_cos_sim / n,
             'mse': total_mse / n
         }
+        if self.importance_scorer is not None:
+            metrics['budget_loss'] = total_budget_loss / n
+            metrics['entropy_loss'] = total_entropy_loss / n
+            metrics['effective_k'] = total_effective_k / n
+            metrics['temperature'] = self.budgeted_tx.current_temperature
+        return metrics
     
     @torch.no_grad()
     def validate(self, dataloader):
@@ -575,10 +773,17 @@ class GANTrainer:
         self.student.eval()
         self.projector.eval()
         self.upsampler.eval()
+        if self.importance_scorer is not None:
+            self.importance_scorer.eval()
+        if self.budgeted_tx is not None:
+            self.budgeted_tx.eval()
+        if self.sparse_upsampler is not None:
+            self.sparse_upsampler.eval()
         
         total_mse = 0
         total_cos_sim = 0
         total_std = 0
+        total_effective_k = 0
         
         for images, teacher_tokens in tqdm(dataloader, desc="Validating"):
             images = images.to(self.device)
@@ -587,12 +792,32 @@ class GANTrainer:
             student_feat = self.student(images)[-1]
             edge_tokens = self.projector(student_feat)
             
-            # 瓶颈层
-            if self.bottleneck is not None:
-                decompressed, _ = self.bottleneck(edge_tokens)
-                output_tokens = self.upsampler(decompressed)
+            if self.importance_scorer is not None:
+                # Information-aware path (eval mode: hard top-K selection)
+                if self.args.text_aware and isinstance(self.importance_scorer, TextAwareImportanceScorer):
+                    importance_logits, _ = self.importance_scorer(student_feat, edge_tokens)
+                else:
+                    importance_logits = self.importance_scorer(edge_tokens)
+                
+                # Hard top-K selection in eval mode
+                selected_tokens, indices, _, _ = self.budgeted_tx(edge_tokens, importance_logits)
+                
+                # Bottleneck
+                if self.bottleneck is not None:
+                    decompressed, _ = self.bottleneck(selected_tokens)
+                else:
+                    decompressed = selected_tokens
+                
+                # Sparse upsampler with indices
+                output_tokens = self.sparse_upsampler(decompressed, indices)
+                total_effective_k += indices.shape[1]
             else:
-                output_tokens = self.upsampler(edge_tokens)
+                # Original path
+                if self.bottleneck is not None:
+                    decompressed, _ = self.bottleneck(edge_tokens)
+                    output_tokens = self.upsampler(decompressed)
+                else:
+                    output_tokens = self.upsampler(edge_tokens)
             
             if output_tokens.shape[1] != teacher_tokens.shape[1]:
                 teacher_tokens = self._align_tokens(teacher_tokens, output_tokens.shape[1])
@@ -611,11 +836,14 @@ class GANTrainer:
             total_std += output_tokens.std().item()
         
         n = len(dataloader)
-        return {
+        metrics = {
             'val_mse': total_mse / n,
             'val_cos_sim': total_cos_sim / n,
             'val_std': total_std / n
         }
+        if self.importance_scorer is not None:
+            metrics['val_effective_k'] = total_effective_k / n
+        return metrics
     
     def save_checkpoint(self, epoch, metrics, is_best=False, prefix=''):
         """保存检查点"""
@@ -634,6 +862,14 @@ class GANTrainer:
         # 保存瓶颈层权重
         if self.bottleneck is not None:
             checkpoint['bottleneck_state_dict'] = self.bottleneck.state_dict()
+        
+        # 保存 importance-aware 模块权重
+        if self.importance_scorer is not None:
+            checkpoint['importance_scorer_state_dict'] = self.importance_scorer.state_dict()
+        if self.budgeted_tx is not None:
+            checkpoint['budgeted_tx_state_dict'] = self.budgeted_tx.state_dict()
+        if self.sparse_upsampler is not None:
+            checkpoint['sparse_upsampler_state_dict'] = self.sparse_upsampler.state_dict()
         
         torch.save(checkpoint, self.output_dir / f'{prefix}latest.pth')
         
@@ -654,6 +890,11 @@ class GANTrainer:
             val_metrics = self.validate(val_loader)
             
             self.scheduler_G.step()
+            
+            # Temperature annealing for budgeted transmission
+            if self.budgeted_tx is not None:
+                self.budgeted_tx.anneal_temperature()
+                self.logger.info(f"  Temperature: {self.budgeted_tx.current_temperature:.4f}")
             
             metrics = {**train_metrics, **val_metrics}
             
@@ -689,6 +930,11 @@ class GANTrainer:
             
             self.scheduler_G.step()
             self.scheduler_D.step()
+            
+            # Temperature annealing for budgeted transmission
+            if self.budgeted_tx is not None:
+                self.budgeted_tx.anneal_temperature()
+                self.logger.info(f"  Temperature: {self.budgeted_tx.current_temperature:.4f}")
             
             metrics = {**train_metrics, **val_metrics}
             
@@ -775,6 +1021,35 @@ def main():
     parser.add_argument('--bottleneck_method', type=str, default='linear',
                         choices=['linear', 'mlp', 'autoencoder'],
                         help='瓶颈层方法')
+    
+    # Information-aware transmission
+    parser.add_argument('--importance_aware', action='store_true',
+                        help='Enable information-aware token transmission')
+    parser.add_argument('--text_aware', action='store_true',
+                        help='Enable text-region-aware importance scoring')
+    parser.add_argument('--scorer_method', type=str, default='mlp',
+                        choices=['mlp', 'attention'],
+                        help='Importance scorer method')
+    parser.add_argument('--token_budget', type=int, default=24,
+                        help='Target number of tokens to transmit (budget)')
+    parser.add_argument('--min_tokens', type=int, default=8,
+                        help='Minimum tokens to transmit during inference')
+    parser.add_argument('--budget_temperature', type=float, default=1.0,
+                        help='Initial temperature for soft budget masking')
+    parser.add_argument('--anneal_rate', type=float, default=0.01,
+                        help='Temperature annealing rate per epoch')
+    parser.add_argument('--lambda_budget', type=float, default=0.1,
+                        help='Budget constraint loss weight')
+    parser.add_argument('--lambda_entropy', type=float, default=0.01,
+                        help='Entropy regularization loss weight')
+    parser.add_argument('--completion_layers', type=int, default=2,
+                        help='Number of Transformer layers for sparse token completion')
+    
+    # Quantization-aware training
+    parser.add_argument('--quantize_aware', action='store_true',
+                        help='Enable STE-based quantization-aware training')
+    parser.add_argument('--num_bits', type=int, default=8,
+                        help='Number of bits for fake quantization (QAT)')
     
     # 动态模式参数
     parser.add_argument('--dynamic', action='store_true',

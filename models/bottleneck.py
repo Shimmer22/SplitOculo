@@ -34,11 +34,14 @@ class DimensionBottleneck(nn.Module):
         bottleneck_dim: 瓶颈维度 (默认 64)
         method: 压缩方法 ('linear', 'mlp', 'autoencoder')
     """
-    def __init__(self, hidden_size=1280, bottleneck_dim=64, method='linear'):
+    def __init__(self, hidden_size=1280, bottleneck_dim=64, method='linear',
+                 quantize_aware=False, num_bits=8):
         super().__init__()
         self.hidden_size = hidden_size
         self.bottleneck_dim = bottleneck_dim
         self.method = method
+        self.quantize_aware = quantize_aware
+        self.num_bits = num_bits
         
         if method == 'linear':
             # 最简单：线性投影
@@ -87,16 +90,49 @@ class DimensionBottleneck(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
     
-    def encode(self, x):
+    def fake_quantize(self, x):
         """
-        端侧编码：压缩特征维度
+        STE-based fake quantization.
+        
+        Forward pass: quantize then dequantize (introduces quantization noise)
+        Backward pass: straight-through (gradients pass as if no quantization)
+        
+        Only active when self.quantize_aware=True AND self.training=True.
         
         Args:
-            x: [B, N, hidden_size]
+            x: [B, N, bottleneck_dim] float tensor
         Returns:
-            [B, N, bottleneck_dim]
+            [B, N, bottleneck_dim] fake-quantized float tensor
         """
-        return self.encoder(x)
+        if not self.quantize_aware or not self.training:
+            return x
+        
+        n_levels = 2 ** self.num_bits - 1  # 255 for int8
+        
+        # Per-tensor dynamic range (detach to avoid gradients on range computation)
+        x_min = x.detach().amin()  # scalar
+        x_max = x.detach().amax()  # scalar
+        
+        # Avoid zero range
+        if x_min == x_max:
+            return x
+        
+        scale = (x_max - x_min) / n_levels
+        zero_point = (-x_min / scale).round()
+        
+        # Quantize then dequantize
+        x_q = torch.clamp(torch.round(x / scale + zero_point), 0, n_levels)
+        x_dq = (x_q - zero_point) * scale
+        
+        # Straight-Through Estimator: use quantized values in forward, but
+        # let gradients flow through as if quantization didn't happen
+        return x + (x_dq - x).detach()
+    
+    def encode(self, x):
+        """端侧编码：压缩特征维度（训练时包含fake quantization）"""
+        compressed = self.encoder(x)
+        compressed = self.fake_quantize(compressed)  # STE fake quantization
+        return compressed
     
     def decode(self, x):
         """
@@ -127,6 +163,13 @@ class DimensionBottleneck(nn.Module):
         """获取压缩比"""
         return self.hidden_size / self.bottleneck_dim
     
+    def get_quantize_config(self):
+        """Return quantization configuration dict"""
+        return {
+            'quantize_aware': self.quantize_aware,
+            'num_bits': self.num_bits,
+        }
+    
     def get_transmission_size_kb(self, num_tokens=49, dtype_bytes=1):
         """
         计算传输大小 (KB)
@@ -144,8 +187,10 @@ class BottleneckWithQuantization(DimensionBottleneck):
     
     支持在 encode 后进行 int8 量化，decode 前进行反量化
     """
-    def __init__(self, hidden_size=1280, bottleneck_dim=64, method='linear'):
-        super().__init__(hidden_size, bottleneck_dim, method)
+    def __init__(self, hidden_size=1280, bottleneck_dim=64, method='linear',
+                 quantize_aware=False, num_bits=8):
+        super().__init__(hidden_size, bottleneck_dim, method,
+                         quantize_aware=quantize_aware, num_bits=num_bits)
         
         # 量化参数（训练时学习）
         self.register_buffer('scale', torch.ones(1))
@@ -263,5 +308,82 @@ if __name__ == '__main__':
     compressed_dq = bottleneck_q.dequantize_int8(quantized, scale, zero_point)
     quant_error = ((compressed_fp - compressed_dq) ** 2).mean().item()
     print(f"Quantization MSE: {quant_error:.6f}")
+    
+    print("\n" + "=" * 60)
+    print("QAT Fake Quantization 测试")
+    print("=" * 60)
+    
+    # --- Test 1: QAT mode introduces quantization noise ---
+    print("\n--- Test 1: QAT mode (quantize_aware=True, training) ---")
+    bottleneck_qat = DimensionBottleneck(
+        hidden_size=1280,
+        bottleneck_dim=64,
+        method='linear',
+        quantize_aware=True,
+        num_bits=8
+    )
+    bottleneck_qat.train()
+    
+    x_test = torch.randn(B, N, C, requires_grad=True)
+    compressed_qat = bottleneck_qat.encode(x_test)
+    
+    # Without fake quantization (direct encoder output)
+    compressed_raw = bottleneck_qat.encoder(x_test)
+    
+    # Quantization noise should make them differ
+    diff = (compressed_qat - compressed_raw).abs().max().item()
+    print(f"Max diff between QAT encode and raw encoder: {diff:.6f}")
+    assert diff > 0, "QAT should introduce quantization noise!"
+    print("✓ QAT introduces quantization noise as expected")
+    
+    # --- Test 2: STE - gradients still flow ---
+    print("\n--- Test 2: STE gradient flow ---")
+    loss = compressed_qat.sum()
+    loss.backward()
+    
+    assert x_test.grad is not None, "Gradients should flow through STE!"
+    grad_norm = x_test.grad.norm().item()
+    print(f"Gradient norm: {grad_norm:.4f}")
+    assert grad_norm > 0, "Gradient norm should be > 0!"
+    print("✓ Gradients flow through STE correctly")
+    
+    # --- Test 3: QAT disabled means no quantization noise ---
+    print("\n--- Test 3: quantize_aware=False (no noise) ---")
+    bottleneck_no_qat = DimensionBottleneck(
+        hidden_size=1280,
+        bottleneck_dim=64,
+        method='linear',
+        quantize_aware=False,
+    )
+    bottleneck_no_qat.train()
+    
+    x_test2 = torch.randn(B, N, C)
+    compressed_no_qat = bottleneck_no_qat.encode(x_test2)
+    compressed_raw2 = bottleneck_no_qat.encoder(x_test2)
+    
+    diff2 = (compressed_no_qat - compressed_raw2).abs().max().item()
+    print(f"Max diff (should be 0): {diff2:.8f}")
+    assert diff2 == 0.0, "Without QAT, encode should equal raw encoder output!"
+    print("✓ No quantization noise when quantize_aware=False")
+    
+    # --- Test 4: QAT inactive during eval ---
+    print("\n--- Test 4: QAT inactive during eval mode ---")
+    bottleneck_qat.eval()
+    x_test3 = torch.randn(B, N, C)
+    compressed_eval = bottleneck_qat.encode(x_test3)
+    compressed_raw3 = bottleneck_qat.encoder(x_test3)
+    
+    diff3 = (compressed_eval - compressed_raw3).abs().max().item()
+    print(f"Max diff in eval mode (should be 0): {diff3:.8f}")
+    assert diff3 == 0.0, "QAT should be inactive during eval!"
+    print("✓ No quantization noise during eval mode")
+    
+    # --- Test 5: get_quantize_config ---
+    print("\n--- Test 5: get_quantize_config ---")
+    config = bottleneck_qat.get_quantize_config()
+    print(f"Config: {config}")
+    assert config['quantize_aware'] == True
+    assert config['num_bits'] == 8
+    print("✓ Config returned correctly")
     
     print("\n✅ 所有测试通过!")
