@@ -54,7 +54,8 @@ import math
 from core.utils import set_seed, get_logger, count_parameters
 from core.qwen_extractor import QwenFeatureExtractor
 from models.cloud_upsampler import CloudUpsampler, TransformerUpsampler
-from models.projector_v3 import StridedProjector
+from models.pooling_projector import PoolingTokenProjector
+from models.strided_projector import StridedTokenProjector
 from models.discriminator import FeatureDiscriminator
 from models.bottleneck import DimensionBottleneck
 
@@ -268,21 +269,21 @@ class GANTrainer:
         
         # 端侧 Projector
         if args.projector_type == 'strided':
-            self.projector = StridedProjector(
+            self.projector = StridedTokenProjector(
                 in_channels=student_channels,
                 hidden_size=args.target_hidden_size,
                 hidden_channels=args.projector_hidden,
                 transmission_tokens=args.transmission_tokens
             ).to(self.device)
-            self.logger.info(f"Using StridedProjector (v3)")
+            self.logger.info("Using strided token projector")
         else:
-            self.projector = EdgeProjector(
+            self.projector = PoolingTokenProjector(
                 in_channels=student_channels,
                 hidden_size=args.target_hidden_size,
                 hidden_channels=args.projector_hidden,
                 transmission_tokens=args.transmission_tokens
             ).to(self.device)
-            self.logger.info(f"Using EdgeProjector (pooling, v2)")
+            self.logger.info("Using pooling token projector")
         
         # 云端 Upsampler (使用 TransformerUpsampler)
         if args.upsampler_type == 'transformer':

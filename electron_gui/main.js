@@ -3,7 +3,6 @@
  * Manages application lifecycle, window creation, and Python subprocess execution
  */
 
-
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -14,8 +13,8 @@ let edgeClientProcess = null;
 
 // Configuration - Load defaults
 let config = {
-  cloudCheckpoint: 'E:\\experiments\\SplitOculo\\checkpoints\\autodl\\bot_cc3m\\split\\cloud_weights.pth',
-  edgeCheckpoint: 'E:\\experiments\\SplitOculo\\checkpoints\\autodl\\bot_cc3m\\split\\edge_weights.pth',
+  cloudCheckpoint: '',
+  edgeCheckpoint: '',
   serverHost: '0.0.0.0',
   serverPort: 8080,
   qwenPath: 'Qwen/Qwen2.5-VL-3B-Instruct',

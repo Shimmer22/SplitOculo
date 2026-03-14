@@ -1,23 +1,23 @@
 # SplitOculo Electron GUI
 
-Desktop monitoring and testing interface for SplitOculo Edge-Cloud VLM Inference System.
+Desktop monitoring and testing interface for SplitOculo edge-cloud inference.
 
 ## Features
 
-- 📊 **Real-time Dashboard**: Monitor edge/cloud service status, performance metrics, and live charts
-- 🧪 **Testing Interface**: Upload images, configure parameters, and view detailed inference results
-- ⚙️ **Configuration Management**: Centralized config for cloud server and edge client settings
-- 📝 **Live Logs**: Real-time log streaming from Python processes with export capability
-- 🚀 **Process Management**: Start/stop cloud server directly from GUI
-- 📈 **Performance Visualization**: Latency trends and compression ratio charts using Chart.js
+- **Real-time Dashboard**: Monitor edge/cloud service status, performance metrics, and live charts
+- **Testing Interface**: Upload images, configure parameters, and inspect inference results
+- **Configuration Management**: Centralized settings for cloud server and edge client
+- **Live Logs**: Stream runtime logs from Python processes and export them when needed
+- **Process Management**: Start and stop the cloud server from the GUI
+- **Performance Visualization**: View latency trends and compression ratios with Chart.js
 
 ## Installation
 
 ### Prerequisites
 
-- Node.js (v16 or higher)
+- Node.js 16 or higher
 - Python 3.10+ with SplitOculo dependencies installed
-- Trained model checkpoints (edge and cloud weights)
+- Trained model checkpoints for edge and cloud
 
 ### Setup
 
@@ -34,64 +34,57 @@ npm install
 npm start
 ```
 
-This will launch the Electron app with DevTools enabled.
+This launches the Electron app with DevTools enabled.
 
 ### Production Build
 
-Build for your platform:
-
 ```bash
-# Windows
 npm run build:win
-
-# Linux
 npm run build:linux
-
-# macOS
 npm run build:mac
 ```
 
 ## Configuration
 
-1. Launch the app
-2. Navigate to the **Config** tab
-3. Set the following paths:
-   - **Cloud Checkpoint**: Path to cloud weights (e.g., `./checkpoints/gan_bottleneck/split/cloud_weights.pth`)
-   - **Edge Checkpoint**: Path to edge weights (e.g., `./checkpoints/gan_bottleneck/split/edge_weights.pth`)
-   - **Qwen Model Path**: HuggingFace model ID or local path
-4. Configure server settings (host, port, device)
-5. Click **Save Configuration**
+1. Launch the app.
+2. Open the `Config` tab.
+3. Set the required paths and runtime options:
+   - Cloud checkpoint
+   - Edge checkpoint
+   - Qwen model path
+   - Host, port, device, and timeout
+4. Save the configuration.
 
 ## Quick Start
 
-### 1. Start Cloud Server
+### 1. Start the Cloud Server
 
-1. Go to **Dashboard** tab
-2. Click **Start Server** button
-3. Wait for "Cloud: Online" status
+1. Open the `Dashboard` tab.
+2. Click `Start Server`.
+3. Wait until the cloud status changes to `Online`.
 
 ### 2. Run Quick Inference
 
-- On Dashboard, drag and drop an image to the Quick Inference area
-- View results instantly with latency and payload metrics
+- Drag an image into the quick inference area on the dashboard
+- Review the returned text, latency, and payload size
 
-### 3. Detailed Testing
+### 3. Run Detailed Testing
 
-1. Go to **Testing** tab
-2. Upload an image via drag-and-drop
-3. Configure inference settings (checkpoint, server URL, prompt)
-4. Click **Run Inference**
-5. View detailed results and metrics
+1. Open the `Testing` tab.
+2. Upload an image.
+3. Select an edge checkpoint and server URL.
+4. Run inference.
+5. Review detailed metrics and the returned response.
 
-## Architecture
+## Structure
 
-```
+```text
 electron_gui/
-├── main.js              # Main process (window management, Python subprocess)
+├── main.js              # Main process and Python subprocess management
 ├── preload.js           # IPC bridge
 ├── index.html           # Main UI
 ├── styles/
-│   └── main.css         # Modern dark theme styling
+│   └── main.css         # Desktop UI styling
 └── renderer/
     ├── navigation.js    # Tab switching
     ├── dashboard.js     # Real-time monitoring
@@ -104,21 +97,21 @@ electron_gui/
 
 ### Python Script Errors
 
-- Ensure Python environment is activated and SplitOculo dependencies are installed
-- Check that checkpoint paths are correct
-- Verify CUDA is available if using GPU mode
+- Ensure the Python environment is ready and dependencies are installed
+- Check that checkpoint paths are valid
+- Verify CUDA is available if GPU mode is selected
 
-### Cloud Server Won't Start
+### Cloud Server Does Not Start
 
-- Check if port 8080 is already in use
-- Verify cloud checkpoint path is valid
-- Review logs in the Logs tab for error messages
+- Confirm that port `8080` is available
+- Check the configured cloud checkpoint path
+- Review the logs tab for runtime errors
 
 ### Image Inference Fails
 
-- Ensure cloud server is running (green "Online" status)
-- Check that edge checkpoint is configured correctly
-- Verify server URL matches the running cloud server
+- Ensure the cloud server is running
+- Check that the edge checkpoint path is configured correctly
+- Verify that the server URL matches the running cloud server
 
 ## License
 

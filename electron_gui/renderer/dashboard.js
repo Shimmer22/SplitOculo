@@ -136,7 +136,7 @@ async function runQuickInference(imagePath) {
     const resultText = resultDiv.querySelector('.result-text');
 
     resultDiv.classList.remove('hidden');
-    resultText.textContent = '⏳ Processing...';
+    resultText.textContent = 'Processing...';
 
     try {
         // Load config to get checkpoint paths
@@ -144,7 +144,7 @@ async function runQuickInference(imagePath) {
         const config = configResult.config;
 
         if (!config.edgeCheckpoint) {
-            resultText.textContent = '❌ Please configure edge checkpoint in Config tab';
+            resultText.textContent = 'Please configure an edge checkpoint in the Config tab.';
             return;
         }
 
@@ -154,7 +154,7 @@ async function runQuickInference(imagePath) {
             serverUrl: `http://localhost:${config.serverPort}`,
             device: config.device,
             timeout: config.timeout,
-            prompt: '这张图里有什么?'
+            prompt: 'What is in this image?'
         };
 
         const result = await window.electronAPI.runEdgeInference(options);
@@ -171,10 +171,10 @@ async function runQuickInference(imagePath) {
             // Update performance metrics
             updatePerformanceMetrics(data);
         } else {
-            resultText.textContent = `❌ ${result.error || 'Inference failed'}`;
+            resultText.textContent = `Error: ${result.error || 'Inference failed'}`;
         }
     } catch (error) {
-        resultText.textContent = `❌ Error: ${error.message}`;
+        resultText.textContent = `Error: ${error.message}`;
     }
 }
 
@@ -320,7 +320,6 @@ function updatePerformanceMetrics(data) {
     // Update metric cards
     const avgLatency = performanceData.latencies.reduce((a, b) => a + b, 0) / performanceData.latencies.length;
     const avgCompression = performanceData.compressionRatios.reduce((a, b) => a + b, 0) / performanceData.compressionRatios.length;
-    const avgPayloadKB = performanceData.totalPayloadBytes / performanceData.totalInferences / 1024;
     const throughput = (1000 / avgLatency).toFixed(2);
 
     document.getElementById('avg-latency').textContent = `${avgLatency.toFixed(1)}ms`;
@@ -331,7 +330,6 @@ function updatePerformanceMetrics(data) {
 
 // Helper function used by multiple modules
 function addLog(type, message) {
-    // This will be implemented in logs.js, but we need to call it
     if (window.addLogEntry) {
         window.addLogEntry(type, message);
     }

@@ -1,7 +1,7 @@
 """
 测量预计算 Qwen 特征的统计分布 (mean / std)
 
-用于获取 infer_hybrid.py 中特征归一化所需的 magic number。
+用于获取推理时特征归一化所需的 magic number。
 
 Usage:
     # 测量已有特征目录 (layer 4)
@@ -162,7 +162,7 @@ def main():
             results[layer] = {'mean': mean, 'std': std}
         
         print("\n" + "="*60)
-        print("Summary (use these as magic numbers in infer_hybrid.py / cloud_server.py):")
+        print("Summary (use these values for feature normalization):")
         print("="*60)
         for layer, stats in results.items():
             label = {

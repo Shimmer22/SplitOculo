@@ -32,7 +32,8 @@ from PIL import Image
 from torchvision import transforms
 import math
 
-from models.projector_v3 import StridedProjector
+from models.pooling_projector import PoolingTokenProjector
+from models.strided_projector import StridedTokenProjector
 from models.bottleneck import DimensionBottleneck
 
 
@@ -102,21 +103,21 @@ class EdgeEncoder:
         # Projector
         projector_type = args.get('projector_type', 'pooling')
         if projector_type == 'strided':
-            self.projector = StridedProjector(
+            self.projector = StridedTokenProjector(
                 in_channels=student_channels,
                 hidden_size=hidden_size,
                 hidden_channels=args.get('projector_hidden', 512),
                 transmission_tokens=self.transmission_tokens
             ).to(device)
-            print(f"   StridedProjector (v3)")
+            print("   Strided token projector")
         else:
-            self.projector = EdgeProjector(
+            self.projector = PoolingTokenProjector(
                 in_channels=student_channels,
                 hidden_size=hidden_size,
                 hidden_channels=args.get('projector_hidden', 512),
                 transmission_tokens=self.transmission_tokens
             ).to(device)
-            print(f"   EdgeProjector (pooling)")
+            print("   Pooling token projector")
         
         self.projector.load_state_dict(ckpt['projector_state_dict'])
         self.projector.eval()
