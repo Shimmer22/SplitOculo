@@ -139,9 +139,9 @@ async function runInference() {
     const metricsDiv = document.getElementById('test-metrics');
 
     runBtn.disabled = true;
-    runBtn.textContent = '⏳ Running...';
+    runBtn.textContent = 'Running...';
 
-    resultContainer.innerHTML = '<p class="placeholder-text">⏳ Processing inference...</p>';
+    resultContainer.innerHTML = '<p class="placeholder-text">Processing inference...</p>';
     metricsDiv.classList.add('hidden');
 
     try {
@@ -164,11 +164,11 @@ async function runInference() {
             displayResults(result.result);
             addLog('success', 'Inference completed successfully');
         } else {
-            resultContainer.innerHTML = `<p class="placeholder-text" style="color: #ef4444;">❌ ${result.error || 'Inference failed'}</p>`;
+            resultContainer.innerHTML = `<p class="placeholder-text" style="color: #ef4444;">Error: ${result.error || 'Inference failed'}</p>`;
             addLog('error', result.error || 'Inference failed');
         }
     } catch (error) {
-        resultContainer.innerHTML = `<p class="placeholder-text" style="color: #ef4444;">❌ Error: ${error.message}</p>`;
+        resultContainer.innerHTML = `<p class="placeholder-text" style="color: #ef4444;">Error: ${error.message}</p>`;
         addLog('error', `Exception: ${error.message}`);
     } finally {
         runBtn.disabled = false;

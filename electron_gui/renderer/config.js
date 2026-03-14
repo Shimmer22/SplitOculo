@@ -65,16 +65,16 @@ async function saveConfiguration() {
         const result = await window.electronAPI.saveConfig(config);
 
         if (result.success) {
-            showConfigMessage('Configuration saved successfully! ✅', 'success');
+            showConfigMessage('Configuration saved successfully.', 'success');
             addLog('success', 'Configuration saved');
 
             // Update dashboard status displays
             updateDashboardConfig(config);
         } else {
-            showConfigMessage('Failed to save configuration ❌', 'error');
+            showConfigMessage('Failed to save configuration.', 'error');
         }
     } catch (error) {
-        showConfigMessage(`Error: ${error.message} ❌`, 'error');
+        showConfigMessage(`Error: ${error.message}`, 'error');
     }
 }
 
@@ -99,7 +99,7 @@ async function loadConfiguration() {
             addLog('info', 'Configuration loaded');
         }
     } catch (error) {
-        showConfigMessage(`Error loading configuration: ${error.message} ❌`, 'error');
+        showConfigMessage(`Error loading configuration: ${error.message}`, 'error');
     }
 }
 
