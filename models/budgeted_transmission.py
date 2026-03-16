@@ -107,11 +107,9 @@ class SoftBudgetedTransmission(nn.Module):
 
     def _forward_eval(self, tokens, importance_logits):
         """推理时: hard top-K selection"""
-        scores = torch.sigmoid(importance_logits)
-
-        # Dynamic K: count tokens with score > 0.5, clamp to [min_tokens, max_tokens]
-        dynamic_k = (scores > 0.5).sum(dim=1).float().mean().long().item()
-        k = max(self.min_tokens, min(dynamic_k, self.max_tokens))
+        # Use fixed target budget during inference for stable/controlled comparisons.
+        k = max(self.min_tokens, min(self.target_budget, self.max_tokens))
+        k = min(k, tokens.size(1))
 
         # Select top-K
         _, topk_indices = importance_logits.topk(k, dim=1, sorted=True)

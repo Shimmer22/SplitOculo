@@ -64,6 +64,18 @@ from models.budgeted_transmission import SoftBudgetedTransmission
 from models.cloud_upsampler import SparseTokenUpsampler
 
 
+def parse_bool_flag(value):
+    """Parse bool-like CLI values for flags that can be explicitly enabled/disabled."""
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in {'1', 'true', 't', 'yes', 'y', 'on'}:
+        return True
+    if value in {'0', 'false', 'f', 'no', 'n', 'off'}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 class EdgeProjector(nn.Module):
     """端侧 Projector: CNN 特征 → 传输 tokens"""
     def __init__(self, in_channels, hidden_size=1280,
@@ -234,31 +246,53 @@ class GANTrainer:
             self.scaler_D = None
         
         # 记录参数量
-        bottleneck_params = count_parameters(self.bottleneck) if self.bottleneck else 0
-        g_params = (count_parameters(self.student) + 
-                   count_parameters(self.projector) + 
-                   bottleneck_params +
-                   count_parameters(self.upsampler))
-        d_params = count_parameters(self.discriminator)
-        
-        if self.importance_scorer is not None:
-            g_params += count_parameters(self.importance_scorer)
-        if self.sparse_upsampler is not None:
-            g_params += count_parameters(self.sparse_upsampler)
-        
-        self.logger.info(f"Generator params: {g_params / 1e6:.2f}M")
-        self.logger.info(f"  Student: {count_parameters(self.student) / 1e6:.2f}M")
-        self.logger.info(f"  Projector: {count_parameters(self.projector) / 1e6:.2f}M")
-        if self.bottleneck:
-            self.logger.info(f"  Bottleneck: {bottleneck_params / 1e6:.2f}M (dim={args.bottleneck_dim}, method={args.bottleneck_method})")
-            self.logger.info(f"  Transmission size: {self.bottleneck.get_transmission_size_kb(args.transmission_tokens):.2f} KB")
-        self.logger.info(f"  Upsampler: {count_parameters(self.upsampler) / 1e6:.2f}M")
-        if self.importance_scorer is not None:
-            self.logger.info(f"  Importance Scorer: {count_parameters(self.importance_scorer) / 1e6:.2f}M")
-        if self.sparse_upsampler is not None:
-            self.logger.info(f"  Sparse Upsampler: {count_parameters(self.sparse_upsampler) / 1e6:.2f}M")
-        self.logger.info(f"Discriminator params: {d_params / 1e6:.2f}M")
+        self._log_run_config()
+        self._log_model_params()
     
+    def _log_run_config(self):
+        """Log full CLI args so newly added arguments are always visible in train.log."""
+        self.logger.info("Run config:")
+        for key in sorted(vars(self.args)):
+            self.logger.info(f"  {key}: {getattr(self.args, key)}")
+
+        self.logger.info(
+            f"Runtime: device={self.device.type}, amp_requested={self.args.amp}, amp_enabled={self.use_amp}"
+        )
+
+    def _log_model_params(self):
+        """Log parameter counts from actual optimizer groups and module-level breakdown."""
+        g_params = sum(
+            p.numel()
+            for group in self.opt_G.param_groups
+            for p in group['params']
+            if p.requires_grad
+        )
+        d_params = sum(
+            p.numel()
+            for group in self.opt_D.param_groups
+            for p in group['params']
+            if p.requires_grad
+        )
+
+        self.logger.info(f"Generator params: {g_params / 1e6:.2f}M")
+        self.logger.info(f"Discriminator params: {d_params / 1e6:.2f}M")
+
+        module_keys = [
+            'student', 'projector', 'bottleneck', 'upsampler',
+            'importance_scorer', 'budgeted_tx', 'sparse_upsampler', 'discriminator'
+        ]
+        self.logger.info("Model components:")
+        for key in module_keys:
+            module = getattr(self, key, None)
+            if module is None:
+                self.logger.info(f"  {key}: disabled")
+                continue
+            self.logger.info(f"  {key}: {count_parameters(module) / 1e6:.2f}M")
+
+        if self.bottleneck is not None:
+            size_kb = self.bottleneck.get_transmission_size_kb(self.args.transmission_tokens)
+            self.logger.info(f"Transmission size: {size_kb:.2f} KB")
+
     def _load_models(self):
         """加载模型"""
         args = self.args
@@ -1065,7 +1099,7 @@ def main():
     parser.add_argument('--output_dir', type=str, default='./checkpoints/gan')
     parser.add_argument('--save_freq', type=int, default=5)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--amp', action='store_true',
+    parser.add_argument('--amp', type=parse_bool_flag, nargs='?', const=True, default=True,
                         help='启用 AMP 混合精度训练 (加速 1.5-2x)')
     
     args = parser.parse_args()
@@ -1132,6 +1166,11 @@ def main():
     
     # 创建训练器
     trainer = GANTrainer(args)
+    trainer.logger.info(
+        f"Data: mode={'dynamic' if args.dynamic else 'static'}, "
+        f"train_samples={len(train_dataset)}, val_samples={len(val_dataset)}, "
+        f"batch_size={args.batch_size}, num_workers={num_workers}"
+    )
     
     # 根据阶段训练
     if args.phase == 'warmup':

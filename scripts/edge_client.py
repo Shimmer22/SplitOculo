@@ -180,9 +180,12 @@ class EdgeEncoder:
             else:
                 print(f"   Importance scorer ({scorer_method}): no weights found, using random init")
             
-            if 'budgeted_transmission_state_dict' in ckpt:
+            if 'budgeted_tx_state_dict' in ckpt:
+                self.budgeted_transmission.load_state_dict(ckpt['budgeted_tx_state_dict'])
+                print(f"   Budgeted transmission: budget={token_budget}, min={min_tokens}, loaded (budgeted_tx_state_dict)")
+            elif 'budgeted_transmission_state_dict' in ckpt:
                 self.budgeted_transmission.load_state_dict(ckpt['budgeted_transmission_state_dict'])
-                print(f"   Budgeted transmission: budget={token_budget}, min={min_tokens}, loaded")
+                print(f"   Budgeted transmission: budget={token_budget}, min={min_tokens}, loaded (budgeted_transmission_state_dict)")
             else:
                 print(f"   Budgeted transmission: budget={token_budget}, min={min_tokens}, no weights found")
             

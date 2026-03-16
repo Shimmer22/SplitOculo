@@ -113,7 +113,13 @@ def main():
     if importance_aware:
         if 'importance_scorer_state_dict' in ckpt:
             edge_checkpoint['importance_scorer_state_dict'] = ckpt['importance_scorer_state_dict']
-        if 'budgeted_transmission_state_dict' in ckpt:
+        # Backward/forward compatibility:
+        # trainer saves "budgeted_tx_state_dict", older code may use "budgeted_transmission_state_dict".
+        if 'budgeted_tx_state_dict' in ckpt:
+            edge_checkpoint['budgeted_tx_state_dict'] = ckpt['budgeted_tx_state_dict']
+            edge_checkpoint['budgeted_transmission_state_dict'] = ckpt['budgeted_tx_state_dict']
+        elif 'budgeted_transmission_state_dict' in ckpt:
+            edge_checkpoint['budgeted_tx_state_dict'] = ckpt['budgeted_transmission_state_dict']
             edge_checkpoint['budgeted_transmission_state_dict'] = ckpt['budgeted_transmission_state_dict']
         edge_checkpoint['args']['importance_aware'] = original_args.get('importance_aware', False)
         edge_checkpoint['args']['scorer_method'] = original_args.get('scorer_method', 'mlp')
