@@ -62,6 +62,8 @@ class SoftBudgetedTransmission(nn.Module):
 
         # Temperature as buffer (saved in state_dict but not a parameter)
         self.register_buffer('temperature', torch.tensor(initial_temperature))
+        # Train-time hard top-k ratio in [0,1]: 0=soft mask, 1=hard top-k (ST gradient)
+        self.hard_ratio = 0.0
 
     def forward(self, tokens, importance_logits):
         """
@@ -90,11 +92,23 @@ class SoftBudgetedTransmission(nn.Module):
         # Soft mask via sigmoid with temperature
         mask = torch.sigmoid(importance_logits / self.temperature)  # [B, N] in (0,1)
 
-        # Apply soft mask
-        masked_tokens = tokens * mask.unsqueeze(-1)  # [B, N, D]
+        if self.hard_ratio > 0:
+            # Straight-through hard top-k mask for better train/infer consistency.
+            k = max(self.min_tokens, min(self.target_budget, self.max_tokens))
+            k = min(k, mask.size(1))
+            _, topk_idx = importance_logits.topk(k, dim=1, sorted=False)
+            hard_mask = torch.zeros_like(mask)
+            hard_mask.scatter_(1, topk_idx, 1.0)
+            st_hard_mask = hard_mask + (mask - mask.detach())
+            effective_mask = (1 - self.hard_ratio) * mask + self.hard_ratio * st_hard_mask
+        else:
+            effective_mask = mask
+
+        # Apply soft/hard-blended mask
+        masked_tokens = tokens * effective_mask.unsqueeze(-1)  # [B, N, D]
 
         # Budget loss: encourage average selected count to be near target
-        effective_k = mask.sum(dim=1).mean()  # approximate "number of selected tokens"
+        effective_k = effective_mask.sum(dim=1).mean()  # approximate "number of selected tokens"
         budget_loss = (effective_k - self.target_budget) ** 2
 
         # Entropy loss: encourage mask to be near 0/1 (decisive)
@@ -103,7 +117,7 @@ class SoftBudgetedTransmission(nn.Module):
             mask * (mask + eps).log() + (1 - mask) * (1 - mask + eps).log()
         ).mean()
 
-        return masked_tokens, mask, budget_loss, entropy_loss
+        return masked_tokens, effective_mask, budget_loss, entropy_loss
 
     def _forward_eval(self, tokens, importance_logits):
         """推理时: hard top-K selection"""
@@ -128,6 +142,10 @@ class SoftBudgetedTransmission(nn.Module):
             self.min_temperature,
             self.temperature * (1 - self.anneal_rate),
         )
+
+    def set_train_hard_ratio(self, ratio):
+        """Set train-time hard top-k ratio in [0, 1]."""
+        self.hard_ratio = float(max(0.0, min(1.0, ratio)))
 
     @property
     def current_temperature(self):

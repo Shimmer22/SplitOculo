@@ -210,16 +210,25 @@ class CloudInferenceEngine:
 
         # 2. Upsampler (sparse or normal path)
         if self.importance_aware and indices is not None:
-            # Sparse path: K tokens + indices → full reconstruction
+            # Sparse path: K tokens + indices -> full reconstruction.
+            # If K already equals full transmission slots, use dense path directly.
             if not isinstance(indices, torch.Tensor):
                 indices_tensor = torch.tensor(indices, dtype=torch.long, device=self.device).unsqueeze(0)
             else:
                 indices_tensor = indices.to(self.device)
                 if indices_tensor.dim() == 1:
                     indices_tensor = indices_tensor.unsqueeze(0)
-            upsampled = self.sparse_upsampler(edge_tokens, indices_tensor)
+
+            selected_k = indices_tensor.size(1)
+            if selected_k >= self.transmission_tokens:
+                if self.sparse_upsampler is not None:
+                    upsampled = self.sparse_upsampler.forward_dense(edge_tokens)
+                else:
+                    upsampled = self.upsampler(edge_tokens)
+            else:
+                upsampled = self.sparse_upsampler(edge_tokens, indices_tensor)
         else:
-            # Normal path: full 49 tokens
+            # Normal path
             upsampled = self.upsampler(edge_tokens)
 
         # 3. 特征缩放匹配 Qwen 分布 (按 split_layer 区分)

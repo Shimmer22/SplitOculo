@@ -158,6 +158,10 @@
             <label>Timeout (seconds)</label>
             <input type="number" id="test-timeout" value="300">
           </div>
+          <div class="form-group">
+            <label>Top-K Tokens (optional)</label>
+            <input type="number" id="test-topk-tokens" min="1" placeholder="Use checkpoint budget if empty">
+          </div>
           <button class="btn btn-primary btn-large" id="run-inference-btn" disabled>
             Run Inference
           </button>

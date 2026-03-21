@@ -72,7 +72,7 @@ class EdgeProjector(nn.Module):
 class EdgeEncoder:
     """端侧编码器"""
     
-    def __init__(self, checkpoint_path, device='cuda'):
+    def __init__(self, checkpoint_path, device='cuda', topk_tokens=None):
         self.device = device
         
         print(f"📱 Loading edge components from {checkpoint_path}")
@@ -172,6 +172,13 @@ class EdgeEncoder:
                 target_budget=token_budget,
                 min_tokens=min_tokens
             ).to(device)
+
+            if topk_tokens is not None:
+                override_k = max(1, min(int(topk_tokens), self.transmission_tokens))
+                self.budgeted_transmission.target_budget = override_k
+                self.budgeted_transmission.min_tokens = override_k
+                token_budget = override_k
+                min_tokens = override_k
             
             # Load state dicts
             if 'importance_scorer_state_dict' in ckpt:
@@ -326,6 +333,8 @@ def main():
                         help='Request timeout in seconds (default: 300)')
     parser.add_argument('--importance_aware', action='store_true',
                         help='Display importance-aware info (actual behavior is checkpoint-driven)')
+    parser.add_argument('--topk_tokens', type=int, default=None,
+                        help='Optional runtime top-k override for importance-aware transmission')
     
     args = parser.parse_args()
     
@@ -336,7 +345,8 @@ def main():
     # 加载端侧编码器
     encoder = EdgeEncoder(
         checkpoint_path=args.checkpoint,
-        device=args.device
+        device=args.device,
+        topk_tokens=args.topk_tokens
     )
     
     # 编码图像

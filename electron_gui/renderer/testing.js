@@ -115,6 +115,7 @@ async function loadTestingConfig() {
         document.getElementById('test-edge-checkpoint').value = config.edgeCheckpoint || '';
         document.getElementById('test-server-url').value = `http://localhost:${config.serverPort}`;
         document.getElementById('test-timeout').value = config.timeout;
+        document.getElementById('test-topk-tokens').value = config.topkTokens || '';
     }
 }
 
@@ -128,9 +129,15 @@ async function runInference() {
     const serverUrl = document.getElementById('test-server-url').value;
     const prompt = document.getElementById('test-prompt').value;
     const timeout = parseInt(document.getElementById('test-timeout').value);
+    const topkValue = document.getElementById('test-topk-tokens').value.trim();
+    const topkTokens = topkValue === '' ? null : parseInt(topkValue);
 
     if (!checkpoint) {
         addLog('error', 'Please select edge checkpoint');
+        return;
+    }
+    if (topkTokens !== null && (!Number.isInteger(topkTokens) || topkTokens <= 0)) {
+        addLog('error', 'Top-K Tokens must be a positive integer');
         return;
     }
 
@@ -154,7 +161,8 @@ async function runInference() {
             serverUrl,
             device,
             timeout,
-            prompt
+            prompt,
+            topkTokens
         };
 
         addLog('info', 'Starting edge inference...');

@@ -20,7 +20,8 @@ let config = {
   qwenPath: 'Qwen/Qwen2.5-VL-3B-Instruct',
   offlineMode: false,
   device: 'cuda',
-  timeout: 300
+  timeout: 300,
+  topkTokens: ''
 };
 
 function createWindow() {
@@ -176,6 +177,9 @@ ipcMain.handle('run-edge-inference', async (event, options) => {
 
     if (options.prompt) {
       args.push('--prompt', options.prompt);
+    }
+    if (options.topkTokens !== undefined && options.topkTokens !== null && options.topkTokens !== '') {
+      args.push('--topk_tokens', options.topkTokens.toString());
     }
 
     edgeClientProcess = spawn('python', args, {
