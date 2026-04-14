@@ -12,7 +12,7 @@
 |---|---|---|---|---|---|---|---|---|---|
 | EXP-001 | bootstrap-baseline | A | completed | Agent 01 | 2026-04-14 | 2026-04-14 | 建立整体框架文档，确认工程最小闭环与后续实验入口 | 当前工程可支撑后续实验，但必须先补齐答案保持型评测与预算统计骨架 | 启动 EXP-002，建立 answer agreement baseline |
 | EXP-002 | answer-agreement-baseline | B | in_progress | Agent 02 | 2026-04-14 | 2026-04-14 | 建立答案保持型评测基线与预算评测口径 | 已完成 20 样本实测（run-20260414_141417：0 失败，平均约 4.1KB/样本），当前为 caption-proxy 参考口径 | 切换 teacher-reference 口径并扩展到 50+ 样本与多预算对照 |
-| EXP-002R | reference-protocol | B+ | planned | TBD | TBD | 2026-04-14 | 将参考答案/参考分布定义过程独立成可复用实验协议 | 尚未开始；目的是在 EXP-003 前固定 teacher reference 口径 | 输出 teacher answer/logits 口径与字段规范，供后续实验统一复用 |
+| EXP-002R | reference-protocol | B+ | in_progress | Agent 03 | 2026-04-14 | 2026-04-14 | 将参考答案/参考分布定义过程独立成可复用实验协议 | 已完成 AI2D reference v1 schema、teacher/student 输出解析与 loss 口径实现，并完成 5 样本 probe（teacher 5/5 命中，student 0/5） | 扩展至 20+ 样本 teacher-enriched 正式评测并回填 EXP-002 主表 |
 | EXP-003 | selector-mvp | C | planned | TBD | TBD | 2026-04-14 | 实现最小可行 selector，验证是否存在正向信号 | 需等待 EXP-002 给出统一评测口径后再推进 | 在 transmission tokens 位置插入最小 selector |
 | EXP-004 | necessity-check | D | planned | TBD | TBD | 2026-04-14 | 验证方法是否比 relevance-aware 更接近 necessity-aware | 依赖 EXP-003 先得到可比较的 selector 原型 | 做删除实验、补集退化与失败案例对照 |
 | EXP-005 | discriminative-check | E | planned | TBD | TBD | 2026-04-14 | 验证方法是否更能保持决策边界与竞争答案区分性 | 依赖 EXP-004 建立必要性证据后再继续 | 评估是否值得扩大规模与进入更正式实验 |
@@ -53,3 +53,5 @@
 - 回填 `EXP-002` 首次真实推理结果（run-003）：8 样本全部成功，agreement 在 caption-proxy 严格精确匹配下为 0.0
 - 回填 `EXP-002` 扩展结果（run-20260414_141417）：20 样本全部成功，平均 payload 4184 bytes，agreement 仍为 0.0
 - 新增 `EXP-002R` 规划，用于在进入 EXP-003 前单独固化 reference protocol
+
+- EXP-002R 更新为 in_progress，新增 AI2D reference v1、probe 结果与后续扩展计划

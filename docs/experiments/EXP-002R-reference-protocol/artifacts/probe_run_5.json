@@ -1,0 +1,112 @@
+[
+  {
+    "sample_id": "ai2d-000000",
+    "label": "B",
+    "options": {
+      "A": "c",
+      "B": "D",
+      "C": "b",
+      "D": "a"
+    },
+    "teacher_raw": "B",
+    "teacher_parsed": {
+      "choice": "B",
+      "answer": "D",
+      "raw": "B"
+    },
+    "student_raw": " Establish",
+    "student_parsed": {
+      "choice": "C",
+      "answer": "b",
+      "raw": " Establish"
+    }
+  },
+  {
+    "sample_id": "ai2d-000001",
+    "label": "D",
+    "options": {
+      "A": "b",
+      "B": "a",
+      "C": "d",
+      "D": "k"
+    },
+    "teacher_raw": "D",
+    "teacher_parsed": {
+      "choice": "D",
+      "answer": "k",
+      "raw": "D"
+    },
+    "student_raw": "群众",
+    "student_parsed": {
+      "choice": "",
+      "answer": "群众",
+      "raw": "群众"
+    }
+  },
+  {
+    "sample_id": "ai2d-000002",
+    "label": "B",
+    "options": {
+      "A": "Seal population will become extinct",
+      "B": "Fish population would decrease.",
+      "C": "Whale population would decrease.",
+      "D": "Penguin population would increase."
+    },
+    "teacher_raw": "B",
+    "teacher_parsed": {
+      "choice": "B",
+      "answer": "Fish population would decrease.",
+      "raw": "B"
+    },
+    "student_raw": " [,]",
+    "student_parsed": {
+      "choice": "",
+      "answer": "[,]",
+      "raw": " [,]"
+    }
+  },
+  {
+    "sample_id": "ai2d-000003",
+    "label": "C",
+    "options": {
+      "A": "krill",
+      "B": "whale",
+      "C": "Phytoplankton",
+      "D": "leopard"
+    },
+    "teacher_raw": "C",
+    "teacher_parsed": {
+      "choice": "C",
+      "answer": "Phytoplankton",
+      "raw": "C"
+    },
+    "student_raw": "৺",
+    "student_parsed": {
+      "choice": "",
+      "answer": "৺",
+      "raw": "৺"
+    }
+  },
+  {
+    "sample_id": "ai2d-000004",
+    "label": "A",
+    "options": {
+      "A": "Increase",
+      "B": "None of these",
+      "C": "Neither increase nor decrease",
+      "D": "Decrease"
+    },
+    "teacher_raw": "A",
+    "teacher_parsed": {
+      "choice": "A",
+      "answer": "Increase",
+      "raw": "A"
+    },
+    "student_raw": " Sun",
+    "student_parsed": {
+      "choice": "",
+      "answer": "Sun",
+      "raw": " Sun"
+    }
+  }
+]
