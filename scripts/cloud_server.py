@@ -22,6 +22,7 @@ from pathlib import Path
 import base64
 import time
 import json
+import re
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -324,6 +325,15 @@ engine = None
 app = Flask(__name__)
 
 
+def normalize_qwen_path(raw_path: str) -> str:
+    """Normalize accidental whitespace/newline breaks in local model path."""
+    text = str(raw_path or "").strip()
+    # Handle shell line-break artifacts like "/\n  snapshots/..."
+    text = re.sub(r"/\s+", "/", text)
+    text = re.sub(r"\s+/", "/", text)
+    return text
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """健康检查"""
@@ -394,7 +404,7 @@ def main():
     )
     
     # 存储配置供后续使用
-    engine.qwen_path = args.qwen_path
+    engine.qwen_path = normalize_qwen_path(args.qwen_path)
     engine.offline_mode = args.offline
     
     if args.preload_qwen:
