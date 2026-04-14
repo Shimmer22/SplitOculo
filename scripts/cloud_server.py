@@ -123,13 +123,15 @@ class CloudInferenceEngine:
         
         from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
         
+        qwen_dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
         self.qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
+            torch_dtype=qwen_dtype,
+            device_map=None,
             trust_remote_code=True,
             local_files_only=local_only,
         )
+        self.qwen_model.to(self.device)
         self.processor = AutoProcessor.from_pretrained(
             model_name,
             trust_remote_code=True,
@@ -141,6 +143,14 @@ class CloudInferenceEngine:
         self.qwen_model.eval()
         
         print(f"✅ Qwen loaded")
+
+    def _get_visual_module(self):
+        """Compatible visual module accessor for different transformers versions."""
+        if hasattr(self.qwen_model, "visual"):
+            return self.qwen_model.visual
+        if hasattr(self.qwen_model, "model") and hasattr(self.qwen_model.model, "visual"):
+            return self.qwen_model.model.visual
+        raise AttributeError("Qwen model does not expose a visual module")
     
     def decode_features(self, features_b64: str, scale: float, zero_point: float):
         """
@@ -220,7 +230,7 @@ class CloudInferenceEngine:
             offline = getattr(self, 'offline_mode', False)
             self.load_qwen(model_name=model_path, local_only=offline)
         
-        visual = self.qwen_model.visual
+        visual = self._get_visual_module()
         B = upsampled.shape[0]
         target_h = target_w = int(self.target_tokens ** 0.5)
         

@@ -1,0 +1,382 @@
+[
+  {
+    "budget": "v22",
+    "sample_id": "coco-179765",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000179765.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A black Honda motorcycle parked in front of a garage.",
+    "prediction": "INEED A BIKER TO RIDE WITH ME.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 23.07295799255371,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-190236",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000190236.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "An office cubicle with four different types of computers.",
+    "prediction": "redo the image",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 171.64993286132812,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-331352",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000331352.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A small closed toilet in a cramped space.",
+    "prediction": "构成了一个马桶的图片。",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 9.262800216674805,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-517069",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000517069.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "Two women waiting at a bench next to a street.",
+    "prediction": " театр district in new york city.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 23.42820167541504,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-182417",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000182417.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A beautiful dessert waiting to be shared by two people",
+    "prediction": ",<p>There is a plate of food on the table.</p>",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 17.031192779541016,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-46378",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000046378.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A cat eating a bird it has caught.",
+    "prediction": " submitted by user",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 9.963035583496094,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-93437",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000093437.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A shot of an elderly man inside a kitchen.",
+    "prediction": ".City of the future.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 11.678934097290039,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-172330",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000172330.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A cat in between two cars in a parking lot.",
+    "prediction": " assimilation",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 28.00297737121582,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-472678",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000472678.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "An office cubicle with multiple computers in it",
+    "prediction": "ينا تايني چي؟",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 8.352041244506836,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-314251",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000314251.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A parade of motorcycles is going through a group of tall trees.",
+    "prediction": "任何一个有摩托车的街道。",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 15.691995620727539,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-223747",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000223747.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "a man sleeping with his cat next to him",
+    "prediction": "벴A person is lying on their back with their head resting on a pillow.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 7.725715637207031,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-109976",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000109976.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "An all white kitchen with an electric stovetop.",
+    "prediction": "petsitting.com is a website that helps people find pet sitters.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 10.517120361328125,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-12667",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000012667.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "The telephone has a banana where the receiver should be.",
+    "prediction": " NaN",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 12.62211799621582,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-482917",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000482917.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A dog sitting between its masters feet on a footstool watching tv",
+    "prediction": "處理及 a dog is watching TV.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 10.907888412475586,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-534605",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000534605.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "Man in motorcycle leathers standing in front of a group of bikes",
+    "prediction": " Kaufman's Lego motorcycle is on display at the 2019 SEMA Show.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 16.216754913330078,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-289393",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000289393.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "Set of toy animals sitting in front of a red wooden wagon.",
+    "prediction": " verde and brown cow standing in front of a red chair.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 11.896848678588867,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-561256",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000561256.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A woman wearing a hat & pink top takes a selfie in front of a bathroom mirror.",
+    "prediction": "olare a woman taking a selfie in a mirror.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 13.503074645996094,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-338325",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000338325.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A striped plane flying up into the sky as the sun shines behind it.",
+    "prediction": "若干飞机在天空中飞行",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 8.491039276123047,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-65485",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000065485.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A dog driving an SUV in an open grass covered field.",
+    "prediction": "黥: The image shows a red and silver car parked on the side of the road.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 11.918783187866211,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-226662",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000226662.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A customized motorcycle with more in the background.",
+    "prediction": "多元化。",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 14.307737350463867,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  }
+]

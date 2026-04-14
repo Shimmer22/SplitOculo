@@ -1,0 +1,42 @@
+[
+  {
+    "budget": "v22",
+    "sample_id": "coco-179765",
+    "error": "image not found: /Users/hui/code/SplitOculo/docs/experiments/EXP-002-answer-agreement-baseline/artifacts/data/coco/val2017/000000179765.jpg"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-190236",
+    "error": "image not found: /Users/hui/code/SplitOculo/docs/experiments/EXP-002-answer-agreement-baseline/artifacts/data/coco/val2017/000000190236.jpg"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-331352",
+    "error": "image not found: /Users/hui/code/SplitOculo/docs/experiments/EXP-002-answer-agreement-baseline/artifacts/data/coco/val2017/000000331352.jpg"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-517069",
+    "error": "image not found: /Users/hui/code/SplitOculo/docs/experiments/EXP-002-answer-agreement-baseline/artifacts/data/coco/val2017/000000517069.jpg"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-182417",
+    "error": "image not found: /Users/hui/code/SplitOculo/docs/experiments/EXP-002-answer-agreement-baseline/artifacts/data/coco/val2017/000000182417.jpg"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-46378",
+    "error": "image not found: /Users/hui/code/SplitOculo/docs/experiments/EXP-002-answer-agreement-baseline/artifacts/data/coco/val2017/000000046378.jpg"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-93437",
+    "error": "image not found: /Users/hui/code/SplitOculo/docs/experiments/EXP-002-answer-agreement-baseline/artifacts/data/coco/val2017/000000093437.jpg"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-172330",
+    "error": "image not found: /Users/hui/code/SplitOculo/docs/experiments/EXP-002-answer-agreement-baseline/artifacts/data/coco/val2017/000000172330.jpg"
+  }
+]

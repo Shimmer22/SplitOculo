@@ -1,0 +1,21 @@
+{
+  "dataset": "/Users/hui/code/SplitOculo/docs/experiments/EXP-002-answer-agreement-baseline/artifacts/coco_val20_caption_proxy.jsonl",
+  "server": "http://127.0.0.1:8080",
+  "num_requested_samples": 8,
+  "num_rows": 8,
+  "num_failures": 0,
+  "summary_by_budget": {
+    "v22": {
+      "num_samples": 8,
+      "agreement_rate": 0.0,
+      "avg_payload_bytes": 4184.0,
+      "avg_payload_bits": 33472.0,
+      "subsets": {
+        "scene_caption_proxy": {
+          "num_samples": 8,
+          "agreement_rate": 0.0
+        }
+      }
+    }
+  }
+}

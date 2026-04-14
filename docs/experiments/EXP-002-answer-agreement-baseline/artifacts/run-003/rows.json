@@ -1,0 +1,154 @@
+[
+  {
+    "budget": "v22",
+    "sample_id": "coco-179765",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000179765.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A black Honda motorcycle parked in front of a garage.",
+    "prediction": "INEED A BIKER TO RIDE WITH ME.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 131.81376457214355,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-190236",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000190236.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "An office cubicle with four different types of computers.",
+    "prediction": "redo the image",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 117.83385276794434,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-331352",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000331352.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A small closed toilet in a cramped space.",
+    "prediction": "构成了一个马桶的图片。",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 13.531208038330078,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-517069",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000517069.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "Two women waiting at a bench next to a street.",
+    "prediction": " театр district in new york city.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 10.55908203125,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-182417",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000182417.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A beautiful dessert waiting to be shared by two people",
+    "prediction": ",<p>There is a plate of food on the table.</p>",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 12.125968933105469,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-46378",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000046378.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A cat eating a bird it has caught.",
+    "prediction": " submitted by user",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 9.202957153320312,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-93437",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000093437.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A shot of an elderly man inside a kitchen.",
+    "prediction": ".City of the future.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 11.963129043579102,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-172330",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000172330.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A cat in between two cars in a parking lot.",
+    "prediction": " assimilation",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 14.621973037719727,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  }
+]

@@ -1,0 +1,2 @@
+{"sample_id": "demo-001", "image": "images/demo-001.jpg", "prompt": "Read the main number.", "reference": "42", "subsets": ["ocr", "digits"]}
+{"sample_id": "demo-002", "image": "images/demo-002.jpg", "prompt": "What color is the car?", "reference": "blue", "subsets": ["colors"]}

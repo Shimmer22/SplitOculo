@@ -1,0 +1,42 @@
+[
+  {
+    "budget": "v22",
+    "sample_id": "coco-179765",
+    "error": "500 Server Error: INTERNAL SERVER ERROR for url: http://127.0.0.1:8080/infer"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-190236",
+    "error": "500 Server Error: INTERNAL SERVER ERROR for url: http://127.0.0.1:8080/infer"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-331352",
+    "error": "500 Server Error: INTERNAL SERVER ERROR for url: http://127.0.0.1:8080/infer"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-517069",
+    "error": "500 Server Error: INTERNAL SERVER ERROR for url: http://127.0.0.1:8080/infer"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-182417",
+    "error": "500 Server Error: INTERNAL SERVER ERROR for url: http://127.0.0.1:8080/infer"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-46378",
+    "error": "500 Server Error: INTERNAL SERVER ERROR for url: http://127.0.0.1:8080/infer"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-93437",
+    "error": "500 Server Error: INTERNAL SERVER ERROR for url: http://127.0.0.1:8080/infer"
+  },
+  {
+    "budget": "v22",
+    "sample_id": "coco-172330",
+    "error": "500 Server Error: INTERNAL SERVER ERROR for url: http://127.0.0.1:8080/infer"
+  }
+]

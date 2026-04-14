@@ -1,0 +1,21 @@
+[
+  {
+    "budget": "v22",
+    "sample_id": "coco-179765",
+    "image": "/Users/hui/code/SplitOculo/data/coco/val2017/000000179765.jpg",
+    "prompt": "Describe this image in one short sentence.",
+    "reference": "A black Honda motorcycle parked in front of a garage.",
+    "prediction": "A motorcycle is parked in the snow.",
+    "agreement": false,
+    "payload_bytes": 4184,
+    "encode_time_ms": 27.4200439453125,
+    "feature_shape": [
+      1,
+      49,
+      64
+    ],
+    "subsets": [
+      "scene_caption_proxy"
+    ]
+  }
+]
