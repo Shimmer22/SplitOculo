@@ -15,6 +15,11 @@ import sys
 from pathlib import Path
 from collections import OrderedDict
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
@@ -94,6 +99,9 @@ def main():
             'target_hidden_size': original_args.get('target_hidden_size', 1280),
             'bottleneck_dim': original_args.get('bottleneck_dim', 0),
             'bottleneck_method': original_args.get('bottleneck_method', 'linear'),
+            'image_size': original_args.get('image_size', 224),
+            'data_dir': original_args.get('data_dir'),
+            'features_dir': original_args.get('features_dir'),
         }
     }
     
@@ -112,6 +120,9 @@ def main():
             'target_hidden_size': original_args.get('target_hidden_size', 1280),
             'bottleneck_dim': original_args.get('bottleneck_dim', 0),
             'bottleneck_method': original_args.get('bottleneck_method', 'linear'),
+            'image_size': original_args.get('image_size', 224),
+            'data_dir': original_args.get('data_dir'),
+            'features_dir': original_args.get('features_dir'),
         }
     }
     

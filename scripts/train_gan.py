@@ -667,8 +667,7 @@ class GANTrainer:
             if is_best:
                 best_cos_sim = metrics['val_cos_sim']
             
-            if epoch % self.args.save_freq == 0 or is_best:
-                self.save_checkpoint(epoch, metrics, is_best, prefix='warmup_')
+            self.save_checkpoint(epoch, metrics, is_best, prefix='warmup_')
         
         self.logger.info("=" * 60)
         self.logger.info(f"Warmup 完成! Best cos_sim: {best_cos_sim:.4f}")
@@ -703,8 +702,7 @@ class GANTrainer:
             if is_best:
                 best_cos_sim = metrics['val_cos_sim']
             
-            if epoch % self.args.save_freq == 0 or is_best:
-                self.save_checkpoint(epoch, metrics, is_best, prefix='gan_')
+            self.save_checkpoint(epoch, metrics, is_best, prefix='gan_')
         
         self.logger.info("=" * 60)
         self.logger.info(f"GAN 训练完成! Best cos_sim: {best_cos_sim:.4f}")

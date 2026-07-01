@@ -79,6 +79,7 @@ class EdgeEncoder:
         args = ckpt.get('args', {})
         
         self.transmission_tokens = args.get('transmission_tokens', 49)
+        self.image_size = args.get('image_size', 224)
         hidden_size = args.get('target_hidden_size', 1280)
         self.hidden_size = hidden_size
         
@@ -95,7 +96,7 @@ class EdgeEncoder:
         
         # 获取通道数
         with torch.no_grad():
-            dummy = torch.randn(1, 3, 224, 224).to(device)
+            dummy = torch.randn(1, 3, self.image_size, self.image_size).to(device)
             student_channels = self.student(dummy)[-1].shape[1]
         
         print(f"   CNN: {student_model} → {student_channels} channels")
@@ -154,8 +155,8 @@ class EdgeEncoder:
         
         # 图像预处理
         self.transform = transforms.Compose([
-            transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(224),
+            transforms.Resize(self.image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(self.image_size),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
