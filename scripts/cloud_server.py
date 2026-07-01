@@ -134,6 +134,7 @@ class CloudInferenceEngine:
             model_name,
             trust_remote_code=True,
             local_files_only=local_only,
+            use_fast=True,
         )
         
         for param in self.qwen_model.parameters():
