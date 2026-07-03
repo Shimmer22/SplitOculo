@@ -28,8 +28,9 @@ class QwenFeatureExtractor:
                     可在任意层提取
     """
     
-    def __init__(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct", device='cuda', 
-                 extract_layer=4):
+    def __init__(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct", device='cuda',
+                 extract_layer=4, local_files_only=False, min_pixels=None,
+                 max_pixels=None):
         """
         Args:
             model_name: Qwen 模型名称或本地路径
@@ -44,6 +45,9 @@ class QwenFeatureExtractor:
         self.model_name = model_name
         self.device = device
         self.extract_layer = extract_layer
+        self.local_files_only = local_files_only
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
         self.model = None
         self.processor = None
         self.total_layers = 32  # Qwen 3B 有 32 层
@@ -64,10 +68,19 @@ class QwenFeatureExtractor:
             torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
+            local_files_only=self.local_files_only,
         )
+        processor_kwargs = {
+            "trust_remote_code": True,
+            "local_files_only": self.local_files_only,
+        }
+        if self.min_pixels is not None:
+            processor_kwargs["min_pixels"] = self.min_pixels
+        if self.max_pixels is not None:
+            processor_kwargs["max_pixels"] = self.max_pixels
         self.processor = AutoProcessor.from_pretrained(
             self.model_name,
-            trust_remote_code=True
+            **processor_kwargs,
         )
         
         # 冻结所有参数
@@ -156,6 +169,57 @@ class QwenFeatureExtractor:
         """
         # 由于不同图片 token 数量可能不同，逐个处理
         return [self.extract_features(img) for img in pil_images]
+
+    @torch.no_grad()
+    def extract_video_features(self, pil_frames):
+        """
+        Extract visual tokens from a video represented as PIL frames.
+
+        Args:
+            pil_frames: list[PIL.Image.Image], sampled in temporal order.
+
+        Returns:
+            features: (num_tokens, hidden_size) float32 CPU tensor.
+            video_grid_thw: (3,) CPU tensor containing T, H, W grid.
+        """
+        if not self._loaded:
+            self.load()
+        if not pil_frames:
+            raise ValueError("pil_frames must contain at least one frame")
+
+        messages = [{
+            "role": "user",
+            "content": [{"type": "video", "video": "sampled_frames"}],
+        }]
+        text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = self.processor(
+            text=[text],
+            videos=[pil_frames],
+            return_tensors="pt",
+            padding=True,
+        )
+
+        if "pixel_values_videos" not in inputs or "video_grid_thw" not in inputs:
+            raise RuntimeError(
+                "Processor did not return video tensors. Check transformers/Qwen2.5-VL video support."
+            )
+
+        pixel_values = inputs["pixel_values_videos"].to(self.device)
+        grid_thw = inputs["video_grid_thw"].to(self.device)
+
+        if self.extract_layer == -1:
+            hidden_states = self._extract_pixel_patches(pixel_values)
+        else:
+            hidden_states = self._extract_intermediate_layer(
+                pixel_values.to(self.model.visual.patch_embed.proj.weight.dtype),
+                grid_thw=grid_thw,
+            )
+
+        return hidden_states.cpu(), grid_thw[0].detach().cpu()
     
     def _extract_pixel_patches(self, pixel_values):
         """
