@@ -88,9 +88,9 @@ def main():
             os.remove(data_file)
             print(f"🧹 Removed temporary external data file: {data_file}")
         except Exception as e:
-            print(f"⚠️ Could not remove data file: {e}")
+            print(f"Warning: could not remove data file: {e}")
 
-    print(f"✅ Export success! Saved to {args.output}")
+    print(f"Export success. Saved to {args.output}")
 
 if __name__ == '__main__':
     main()

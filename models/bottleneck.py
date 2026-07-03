@@ -210,7 +210,7 @@ if __name__ == '__main__':
     x = torch.randn(B, N, C)
     
     print("=" * 60)
-    print("DimensionBottleneck 测试")
+    print("DimensionBottleneck test")
     print("=" * 60)
     
     for method in ['linear', 'mlp', 'autoencoder']:
@@ -241,7 +241,7 @@ if __name__ == '__main__':
         print(f"Reconstruction MSE: {mse:.4f}")
     
     print("\n" + "=" * 60)
-    print("BottleneckWithQuantization 测试")
+    print("BottleneckWithQuantization test")
     print("=" * 60)
     
     bottleneck_q = BottleneckWithQuantization(
@@ -264,4 +264,4 @@ if __name__ == '__main__':
     quant_error = ((compressed_fp - compressed_dq) ** 2).mean().item()
     print(f"Quantization MSE: {quant_error:.6f}")
     
-    print("\n✅ 所有测试通过!")
+    print("\nAll tests passed.")

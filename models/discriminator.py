@@ -104,16 +104,16 @@ if __name__ == '__main__':
     # 测试 FeatureDiscriminator
     disc = FeatureDiscriminator(hidden_size=C, num_tokens=N)
     score = disc(x)
-    print(f"FeatureDiscriminator: {x.shape} → {score.shape}")  # [2, 1]
+    print(f"FeatureDiscriminator: {x.shape} -> {score.shape}")  # [2, 1]
     
     # 测试 PatchDiscriminator
     patch_disc = PatchDiscriminator(hidden_size=C)
     patch_score = patch_disc(x)
-    print(f"PatchDiscriminator: {x.shape} → {patch_score.shape}")  # [2, 256, 1]
+    print(f"PatchDiscriminator: {x.shape} -> {patch_score.shape}")  # [2, 256, 1]
     
     # 参数量
     from core.utils import count_parameters
     print(f"\nFeatureDiscriminator params: {count_parameters(disc) / 1e6:.2f}M")
     print(f"PatchDiscriminator params: {count_parameters(patch_disc) / 1e6:.2f}M")
     
-    print("\n✅ 所有测试通过!")
+    print("\nAll tests passed.")

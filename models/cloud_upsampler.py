@@ -330,7 +330,7 @@ if __name__ == '__main__':
     
     target_tokens, edge_tokens = projector(x)
     print(f"Input: {x.shape}")
-    print(f"Edge tokens (传输): {edge_tokens.shape}")  # (2, 49, 1280)
+    print(f"Edge tokens: {edge_tokens.shape}")  # (2, 49, 1280)
     print(f"Target tokens: {target_tokens.shape}")  # (2, 256, 1280)
     
     # 测试单独的 CloudUpsampler
@@ -338,4 +338,4 @@ if __name__ == '__main__':
     out = upsampler(edge_tokens)
     print(f"Upsampler output: {out.shape}")
     
-    print("\n✅ 所有测试通过!")
+    print("\nAll tests passed.")

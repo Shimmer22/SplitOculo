@@ -149,7 +149,7 @@ def main():
     cloud_size = cloud_path.stat().st_size / 1024 / 1024
     original_size = Path(args.input).stat().st_size / 1024 / 1024
     
-    print(f"\n✅ Split complete!")
+    print("\nSplit complete.")
     print(f"\n📊 File sizes:")
     print(f"   Original: {original_size:.2f} MB")
     print(f"   Edge:     {edge_size:.2f} MB ({edge_path})")
