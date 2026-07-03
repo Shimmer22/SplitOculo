@@ -58,10 +58,18 @@ from models.pooling_projector import PoolingTokenProjector
 from models.strided_projector import StridedTokenProjector
 from models.discriminator import FeatureDiscriminator
 from models.bottleneck import DimensionBottleneck
+from models.multilevel import (
+    choose_payload_level,
+    format_payload_level,
+    pad_dim,
+    parse_payload_levels,
+    resize_tokens,
+    truncate_dim,
+)
 
 
 class EdgeProjector(nn.Module):
-    """端侧 Projector: CNN 特征 → 传输 tokens"""
+    """Edge projector: CNN features to transmission tokens."""
     def __init__(self, in_channels, hidden_size=1280,
                  hidden_channels=512, transmission_tokens=49):
         super().__init__()
@@ -215,6 +223,11 @@ class GANTrainer:
         
         self._load_models()
         self._setup_optimizers()
+        self.payload_levels = parse_payload_levels(args.payload_levels) if args.multilevel_payload else [
+            (args.transmission_tokens, args.bottleneck_dim if args.bottleneck_dim > 0 else args.target_hidden_size)
+        ]
+        self.max_payload_tokens = max(level[0] for level in self.payload_levels)
+        self.max_payload_dim = max(level[1] for level in self.payload_levels)
         
         # 损失函数
         self.mse_loss = nn.MSELoss()
@@ -243,6 +256,9 @@ class GANTrainer:
         if self.bottleneck:
             self.logger.info(f"  Bottleneck: {bottleneck_params / 1e6:.2f}M (dim={args.bottleneck_dim}, method={args.bottleneck_method})")
             self.logger.info(f"  Transmission size: {self.bottleneck.get_transmission_size_kb(args.transmission_tokens):.2f} KB")
+            if args.multilevel_payload:
+                levels = ", ".join(format_payload_level(level) for level in self.payload_levels)
+                self.logger.info(f"  Multi-level payloads: {levels}")
         self.logger.info(f"  Upsampler: {count_parameters(self.upsampler) / 1e6:.2f}M")
         self.logger.info(f"Discriminator params: {d_params / 1e6:.2f}M")
     
@@ -311,7 +327,7 @@ class GANTrainer:
                 bottleneck_dim=args.bottleneck_dim,
                 method=args.bottleneck_method
             ).to(self.device)
-            self.logger.info(f"Using Bottleneck: {args.target_hidden_size} → {args.bottleneck_dim} → {args.target_hidden_size}")
+            self.logger.info(f"Using Bottleneck: {args.target_hidden_size} -> {args.bottleneck_dim} -> {args.target_hidden_size}")
         else:
             self.bottleneck = None
             self.logger.info("No bottleneck (full dimension transmission)")
@@ -322,7 +338,7 @@ class GANTrainer:
             num_tokens=args.target_tokens
         ).to(self.device)
         
-        self.logger.info(f"Upsampler: {args.transmission_tokens} → {args.target_tokens} tokens")
+        self.logger.info(f"Upsampler: {args.transmission_tokens} -> {args.target_tokens} tokens")
     
     def _setup_optimizers(self):
         """设置优化器"""
@@ -379,6 +395,46 @@ class GANTrainer:
         tokens = F.adaptive_avg_pool2d(tokens, (target_h, target_w))
         tokens = tokens.permute(0, 2, 3, 1).view(b, -1, c)
         return tokens
+
+    def _select_payload_level(self, mode="random"):
+        if not self.args.multilevel_payload:
+            return None
+        return choose_payload_level(self.payload_levels, mode=mode)
+
+    def _forward_generator(self, images, payload_level=None):
+        student_feat = self.student(images)[-1]
+        edge_tokens_raw = self.projector(student_feat)
+        recon_target = edge_tokens_raw
+
+        if payload_level is not None:
+            payload_tokens, payload_dim = payload_level
+            edge_tokens_for_payload = resize_tokens(edge_tokens_raw, payload_tokens)
+            recon_target = edge_tokens_for_payload
+        else:
+            payload_tokens = edge_tokens_raw.shape[1]
+            payload_dim = self.args.bottleneck_dim if self.bottleneck is not None else edge_tokens_raw.shape[-1]
+            edge_tokens_for_payload = edge_tokens_raw
+
+        if self.bottleneck is not None:
+            compressed_full = self.bottleneck.encode(edge_tokens_for_payload)
+            compressed_payload = truncate_dim(compressed_full, payload_dim)
+            compressed_padded = pad_dim(compressed_payload, self.args.bottleneck_dim)
+            decompressed = self.bottleneck.decode(compressed_padded)
+        else:
+            compressed_payload = truncate_dim(edge_tokens_for_payload, payload_dim)
+            decompressed = pad_dim(compressed_payload, edge_tokens_raw.shape[-1])
+
+        upsampler_input = resize_tokens(decompressed, self.args.transmission_tokens, mode="bilinear")
+        output_tokens = self.upsampler(upsampler_input)
+
+        return {
+            "output_tokens": output_tokens,
+            "edge_tokens_raw": edge_tokens_raw,
+            "recon_target": recon_target,
+            "decompressed": decompressed,
+            "compressed": compressed_payload,
+            "payload_level": (payload_tokens, payload_dim),
+        }
     
     def train_epoch_warmup(self, dataloader, epoch):
         """Warmup 训练: 只用 MSE Loss"""
@@ -617,6 +673,209 @@ class GANTrainer:
             'val_std': total_std / n
         }
     
+    def train_epoch_warmup(self, dataloader, epoch):
+        """Warmup training with optional random multi-level payloads."""
+        self.student.train()
+        self.projector.train()
+        self.upsampler.train()
+
+        total_loss = 0
+        total_cos_sim = 0
+
+        pbar = tqdm(dataloader, desc=f"Warmup Epoch {epoch}")
+        for images, teacher_tokens in pbar:
+            images = images.to(self.device)
+            teacher_tokens = teacher_tokens.to(self.device).float()
+
+            self.opt_G.zero_grad()
+
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                payload_level = self._select_payload_level()
+                forward_out = self._forward_generator(images, payload_level)
+                output_tokens = forward_out["output_tokens"]
+                decompressed = forward_out["decompressed"]
+                recon_target = forward_out["recon_target"]
+
+                if output_tokens.shape[1] != teacher_tokens.shape[1]:
+                    teacher_tokens = self._align_tokens(teacher_tokens, output_tokens.shape[1])
+
+                loss = self.mse_loss(output_tokens, teacher_tokens)
+                if self.bottleneck is not None and self.args.lambda_recon > 0:
+                    loss_recon = self.mse_loss(decompressed, recon_target.detach())
+                    loss = loss + self.args.lambda_recon * loss_recon
+
+            if self.use_amp:
+                self.scaler_G.scale(loss).backward()
+                self.scaler_G.step(self.opt_G)
+                self.scaler_G.update()
+            else:
+                loss.backward()
+                self.opt_G.step()
+
+            with torch.no_grad():
+                cos_sim = F.cosine_similarity(
+                    output_tokens.reshape(-1, self.args.target_hidden_size),
+                    teacher_tokens.reshape(-1, self.args.target_hidden_size),
+                    dim=-1
+                ).mean()
+
+            total_loss += loss.item()
+            total_cos_sim += cos_sim.item()
+
+            postfix = {'loss': f'{loss.item():.4f}', 'cos_sim': f'{cos_sim.item():.4f}'}
+            if self.args.multilevel_payload:
+                postfix['level'] = format_payload_level(forward_out["payload_level"])
+            pbar.set_postfix(postfix)
+
+        n = len(dataloader)
+        return {'loss': total_loss / n, 'cos_sim': total_cos_sim / n}
+
+    def train_epoch_gan(self, dataloader, epoch):
+        """GAN training with optional random multi-level payloads."""
+        self.student.train()
+        self.projector.train()
+        self.upsampler.train()
+        self.discriminator.train()
+
+        total_loss_g = 0
+        total_loss_d = 0
+        total_cos_sim = 0
+        total_mse = 0
+
+        pbar = tqdm(dataloader, desc=f"GAN Epoch {epoch}")
+        for images, teacher_tokens in pbar:
+            images = images.to(self.device)
+            teacher_tokens = teacher_tokens.to(self.device).float()
+
+            if teacher_tokens.shape[1] != self.args.target_tokens:
+                teacher_tokens = self._align_tokens(teacher_tokens, self.args.target_tokens)
+
+            self.opt_D.zero_grad()
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                pred_real = self.discriminator(teacher_tokens)
+                loss_d_real = self.bce_loss(pred_real, torch.ones_like(pred_real))
+
+                with torch.no_grad():
+                    payload_level = self._select_payload_level()
+                    fake_tokens_d = self._forward_generator(images, payload_level)["output_tokens"]
+
+                pred_fake = self.discriminator(fake_tokens_d.detach())
+                loss_d_fake = self.bce_loss(pred_fake, torch.zeros_like(pred_fake))
+                loss_d = (loss_d_real + loss_d_fake) / 2
+
+            if self.use_amp:
+                self.scaler_D.scale(loss_d).backward()
+                self.scaler_D.step(self.opt_D)
+                self.scaler_D.update()
+            else:
+                loss_d.backward()
+                self.opt_D.step()
+
+            self.opt_G.zero_grad()
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                payload_level = self._select_payload_level()
+                forward_out = self._forward_generator(images, payload_level)
+                fake_tokens = forward_out["output_tokens"]
+                decompressed = forward_out["decompressed"]
+                recon_target = forward_out["recon_target"]
+
+                loss_mse = self.mse_loss(fake_tokens, teacher_tokens)
+                pred_fake = self.discriminator(fake_tokens)
+                loss_adv = self.bce_loss(pred_fake, torch.ones_like(pred_fake))
+
+                loss_recon = 0
+                if self.bottleneck is not None and self.args.lambda_recon > 0:
+                    loss_recon = self.mse_loss(decompressed, recon_target.detach())
+
+                loss_g = loss_mse * self.args.lambda_mse + loss_adv * self.args.lambda_adv + loss_recon * self.args.lambda_recon
+
+            if self.use_amp:
+                self.scaler_G.scale(loss_g).backward()
+                self.scaler_G.step(self.opt_G)
+                self.scaler_G.update()
+            else:
+                loss_g.backward()
+                self.opt_G.step()
+
+            with torch.no_grad():
+                cos_sim = F.cosine_similarity(
+                    fake_tokens.reshape(-1, self.args.target_hidden_size),
+                    teacher_tokens.reshape(-1, self.args.target_hidden_size),
+                    dim=-1
+                ).mean()
+
+            total_loss_g += loss_g.item()
+            total_loss_d += loss_d.item()
+            total_cos_sim += cos_sim.item()
+            total_mse += loss_mse.item()
+
+            postfix = {
+                'G': f'{loss_g.item():.3f}',
+                'D': f'{loss_d.item():.3f}',
+                'cos': f'{cos_sim.item():.3f}',
+            }
+            if self.args.multilevel_payload:
+                postfix['level'] = format_payload_level(forward_out["payload_level"])
+            pbar.set_postfix(postfix)
+
+        n = len(dataloader)
+        return {
+            'loss_g': total_loss_g / n,
+            'loss_d': total_loss_d / n,
+            'cos_sim': total_cos_sim / n,
+            'mse': total_mse / n
+        }
+
+    @torch.no_grad()
+    def validate(self, dataloader):
+        """Validate all payload levels when multi-level training is enabled."""
+        self.student.eval()
+        self.projector.eval()
+        self.upsampler.eval()
+
+        levels = self.payload_levels if self.args.multilevel_payload else [None]
+        totals = {
+            level: {'mse': 0.0, 'cos': 0.0, 'std': 0.0}
+            for level in levels
+        }
+
+        for images, teacher_tokens in tqdm(dataloader, desc="Validating"):
+            images = images.to(self.device)
+            teacher_tokens = teacher_tokens.to(self.device).float()
+
+            for level in levels:
+                output_tokens = self._forward_generator(images, level)["output_tokens"]
+                aligned_teacher = teacher_tokens
+                if output_tokens.shape[1] != aligned_teacher.shape[1]:
+                    aligned_teacher = self._align_tokens(aligned_teacher, output_tokens.shape[1])
+
+                mse = self.mse_loss(output_tokens, aligned_teacher)
+                cos_sim = F.cosine_similarity(
+                    output_tokens.reshape(-1, self.args.target_hidden_size),
+                    aligned_teacher.reshape(-1, self.args.target_hidden_size),
+                    dim=-1
+                ).mean()
+
+                totals[level]['mse'] += mse.item()
+                totals[level]['cos'] += cos_sim.item()
+                totals[level]['std'] += output_tokens.std().item()
+
+        n = len(dataloader)
+        max_level = choose_payload_level(self.payload_levels, mode="max") if self.args.multilevel_payload else None
+        primary = totals[max_level]
+        metrics = {
+            'val_mse': primary['mse'] / n,
+            'val_cos_sim': primary['cos'] / n,
+            'val_std': primary['std'] / n,
+        }
+        if self.args.multilevel_payload:
+            for level, values in totals.items():
+                name = format_payload_level(level)
+                metrics[f'val_mse_{name}'] = values['mse'] / n
+                metrics[f'val_cos_sim_{name}'] = values['cos'] / n
+                metrics[f'val_std_{name}'] = values['std'] / n
+        return metrics
+
     def save_checkpoint(self, epoch, metrics, is_best=False, prefix=''):
         """保存检查点"""
         checkpoint = {
@@ -679,7 +938,7 @@ class GANTrainer:
         
         self.logger.info("=" * 60)
         self.logger.info("Phase 2: GAN Training")
-        self.logger.info(f"λ_MSE={self.args.lambda_mse}, λ_ADV={self.args.lambda_adv}")
+        self.logger.info(f"lambda_mse={self.args.lambda_mse}, lambda_adv={self.args.lambda_adv}")
         self.logger.info("=" * 60)
         
         for epoch in range(1, self.args.epochs + 1):
@@ -714,9 +973,9 @@ def main():
     
     # 数据参数
     parser.add_argument('--features_dir', type=str, default=None,
-                        help='预计算特征目录 (静态模式必需)')
+                        help='precomputed feature directory required for static mode')
     parser.add_argument('--data_dir', type=str, required=True,
-                        help='原始图像目录')
+                        help='image dataset directory')
     parser.add_argument('--image_size', type=int, default=224)
     
     # Student 模型参数
@@ -745,42 +1004,47 @@ def main():
     # 训练阶段
     parser.add_argument('--phase', type=str, required=True,
                         choices=['warmup', 'gan'],
-                        help='训练阶段: warmup (MSE only) 或 gan (adversarial)')
+                        help='training phase: warmup or gan')
     parser.add_argument('--warmup_checkpoint', type=str, default=None,
-                        help='GAN 阶段加载的 warmup checkpoint')
+                        help='warmup checkpoint loaded for GAN training')
     
     # 训练参数
     parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr_g', type=float, default=1e-4,
-                        help='Generator 学习率')
+                        help='generator learning rate')
     parser.add_argument('--lr_d', type=float, default=4e-5,
-                        help='Discriminator 学习率 (通常低于 G)')
+                        help='discriminator learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--num_workers', type=int, default=8)
     
     # GAN 损失权重
     parser.add_argument('--lambda_mse', type=float, default=10.0,
-                        help='MSE 损失权重 (内容)')
+                        help='MSE loss weight')
     parser.add_argument('--lambda_adv', type=float, default=0.1,
-                        help='对抗损失权重 (样式)')
+                        help='adversarial loss weight')
     parser.add_argument('--lambda_recon', type=float, default=0.1,
-                        help='瓶颈层重建损失权重')
+                        help='bottleneck reconstruction loss weight')
     
     # 瓶颈层参数
     parser.add_argument('--bottleneck_dim', type=int, default=64,
-                        help='瓶颈层维度 (0 = 禁用瓶颈层)')
+                        help='bottleneck dimension; 0 disables bottleneck')
     parser.add_argument('--bottleneck_method', type=str, default='linear',
                         choices=['linear', 'mlp', 'autoencoder'],
-                        help='瓶颈层方法')
+                        help='bottleneck method')
     
     # 动态模式参数
+    parser.add_argument('--multilevel_payload', action='store_true',
+                        help='enable random multi-level payload training')
+    parser.add_argument('--payload_levels', type=str, default='49x64,49x128,196x64,196x128',
+                        help='comma-separated payload levels, e.g. 49x64,49x128,196x64,196x128')
+
     parser.add_argument('--dynamic', action='store_true',
-                        help='启用动态模式: 训练时实时计算 Qwen 特征 (无需预计算)')
+                        help='enable dynamic mode and compute Qwen features during training')
     parser.add_argument('--qwen_model', type=str, default='Qwen/Qwen2.5-VL-3B-Instruct',
-                        help='Qwen 模型名称或路径 (动态模式)')
+                        help='Qwen model name or local path for dynamic mode')
     parser.add_argument('--qwen_layer', type=int, default=4,
-                        help='Qwen ViT 提取层 (1-32, 默认 4)')
+                        help='Qwen ViT extraction layer')
     
     # 其他
     parser.add_argument('--device', type=str,
@@ -789,9 +1053,21 @@ def main():
     parser.add_argument('--save_freq', type=int, default=5)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--amp', action='store_true',
-                        help='启用 AMP 混合精度训练 (加速 1.5-2x)')
+                        help='enable AMP mixed precision training')
     
     args = parser.parse_args()
+    if args.multilevel_payload:
+        levels = parse_payload_levels(args.payload_levels)
+        max_tokens = max(level[0] for level in levels)
+        max_dim = max(level[1] for level in levels)
+        if args.transmission_tokens < max_tokens:
+            raise ValueError(
+                f"--transmission_tokens must be at least {max_tokens} for payload levels {args.payload_levels}"
+            )
+        if args.bottleneck_dim < max_dim:
+            raise ValueError(
+                f"--bottleneck_dim must be at least {max_dim} for payload levels {args.payload_levels}"
+            )
     set_seed(args.seed)
     
     # 加载数据

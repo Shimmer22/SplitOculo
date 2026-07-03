@@ -35,10 +35,11 @@ import math
 from models.pooling_projector import PoolingTokenProjector
 from models.strided_projector import StridedTokenProjector
 from models.bottleneck import DimensionBottleneck
+from models.multilevel import parse_payload_levels, resize_tokens, truncate_dim
 
 
 class EdgeProjector(nn.Module):
-    """端侧 Projector: CNN 特征 → 传输 tokens"""
+    """Edge projector: CNN features to transmission tokens."""
     def __init__(self, in_channels, hidden_size=1280,
                  hidden_channels=512, transmission_tokens=49):
         super().__init__()
@@ -74,7 +75,7 @@ class EdgeEncoder:
     def __init__(self, checkpoint_path, device='cuda'):
         self.device = device
         
-        print(f"📱 Loading edge components from {checkpoint_path}")
+        print(f"Loading edge components from {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         args = ckpt.get('args', {})
         
@@ -99,7 +100,7 @@ class EdgeEncoder:
             dummy = torch.randn(1, 3, self.image_size, self.image_size).to(device)
             student_channels = self.student(dummy)[-1].shape[1]
         
-        print(f"   CNN: {student_model} → {student_channels} channels")
+        print(f"   CNN: {student_model} -> {student_channels} channels")
         
         # Projector
         projector_type = args.get('projector_type', 'pooling')
@@ -140,13 +141,13 @@ class EdgeEncoder:
                 # 拆分权重: 只有 encoder 部分，需要去掉 'encoder.' 前缀
                 encoder_sd = {k.replace('encoder.', ''): v for k, v in ckpt['bottleneck_encoder_state_dict'].items()}
                 self.bottleneck.encoder.load_state_dict(encoder_sd)
-                print(f"   Bottleneck encoder (split): {hidden_size} → {bottleneck_dim}")
+                print(f"   Bottleneck encoder (split): {hidden_size} -> {bottleneck_dim}")
             elif 'bottleneck_state_dict' in ckpt:
                 # AIO 权重: 完整 bottleneck
                 self.bottleneck.load_state_dict(ckpt['bottleneck_state_dict'])
-                print(f"   Bottleneck encoder (AIO): {hidden_size} → {bottleneck_dim}")
+                print(f"   Bottleneck encoder (AIO): {hidden_size} -> {bottleneck_dim}")
             else:
-                print(f"   ⚠️ No bottleneck weights found, using random init")
+                print(f"   Warning: no bottleneck weights found, using random init")
             
             self.bottleneck.eval()
         else:
@@ -161,7 +162,7 @@ class EdgeEncoder:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
         
-        print(f"✅ Edge encoder loaded")
+        print("Edge encoder loaded")
     
     @torch.no_grad()
     def encode(self, image_path):
@@ -177,6 +178,12 @@ class EdgeEncoder:
         """
         # 加载图像
         img = Image.open(image_path).convert('RGB')
+        return self.encode_pil(img)
+
+    @torch.no_grad()
+    def encode_pil(self, img):
+        """Encode a PIL image as compressed SplitOculo edge features."""
+        img = img.convert('RGB')
         image_tensor = self.transform(img).unsqueeze(0).to(self.device)
         
         # CNN + Projector
@@ -188,6 +195,25 @@ class EdgeEncoder:
             compressed = self.bottleneck.encode(tokens)
             return compressed, True
         
+        return tokens, False
+
+    @torch.no_grad()
+    def encode_pil_level(self, img, payload_level):
+        """Encode a PIL image using a specific payload level such as 49x64."""
+        payload_tokens, payload_dim = payload_level
+        img = img.convert('RGB')
+        image_tensor = self.transform(img).unsqueeze(0).to(self.device)
+
+        feat = self.student(image_tensor)[-1]
+        tokens = self.projector(feat)
+        tokens = resize_tokens(tokens, payload_tokens)
+
+        if self.bottleneck is not None:
+            compressed = self.bottleneck.encode(tokens)
+            compressed = truncate_dim(compressed, payload_dim)
+            return compressed, True
+
+        tokens = truncate_dim(tokens, payload_dim)
         return tokens, False
     
     def quantize_int8(self, features):
@@ -249,6 +275,34 @@ class EdgeEncoder:
         
         return payload, stats
 
+    def encode_to_payload_level(self, image_path, level):
+        payload_level = parse_payload_levels(level)[0] if isinstance(level, str) else level
+        start_time = time.time()
+        img = Image.open(image_path).convert('RGB')
+        features, is_compressed = self.encode_pil_level(img, payload_level)
+        encode_time = time.time() - start_time
+
+        quantized, scale, zero_point = self.quantize_int8(features)
+        features_b64 = base64.b64encode(quantized.tobytes()).decode('ascii')
+
+        payload = {
+            'features': features_b64,
+            'scale': scale,
+            'zero_point': zero_point,
+            'payload_tokens': payload_level[0],
+            'payload_dim': payload_level[1],
+        }
+
+        stats = {
+            'encode_time_ms': encode_time * 1000,
+            'feature_shape': list(features.shape),
+            'payload_bytes': len(payload['features']),
+            'is_compressed': is_compressed,
+            'payload_level': f"{payload_level[0]}x{payload_level[1]}",
+        }
+
+        return payload, stats
+
 
 def main():
     parser = argparse.ArgumentParser(description='SplitOculo Edge Client')
@@ -258,7 +312,7 @@ def main():
                         help='Path to input image')
     parser.add_argument('--server', type=str, default='http://localhost:8080',
                         help='Cloud server URL')
-    parser.add_argument('--prompt', type=str, default='这张图里有什么?',
+    parser.add_argument('--prompt', type=str, default='Describe this image.',
                         help='Prompt for the model')
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -278,7 +332,7 @@ def main():
     )
     
     # 编码图像
-    print(f"\n📷 Encoding image: {args.image}")
+    print(f"\nEncoding image: {args.image}")
     payload, stats = encoder.encode_to_payload(args.image)
     payload['prompt'] = args.prompt
     
@@ -306,26 +360,26 @@ def main():
             print(f"   Network round-trip: {network_time*1000:.2f} ms")
             print(f"   Cloud inference: {result.get('latency_ms', 0):.2f} ms")
             
-            print(f"\n💬 Response:")
+            print("\nResponse:")
             print("-" * 40)
             print(result['response'])
             print("-" * 40)
             
             # 总结
             total_time = network_time * 1000
-            print(f"\n📊 Summary:")
+            print("\nSummary:")
             print(f"   Edge encode: {stats['encode_time_ms']:.2f} ms")
             print(f"   Transmission: {stats['payload_bytes']/1024:.2f} KB")
             print(f"   Total latency: {total_time:.2f} ms")
         else:
-            print(f"❌ Error: {response.status_code}")
+            print(f"Error: {response.status_code}")
             print(response.text)
     
     except requests.exceptions.ConnectionError:
-        print(f"❌ Cannot connect to server at {args.server}")
+        print(f"Cannot connect to server at {args.server}")
         print("   Make sure the cloud server is running.")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Error: {e}")
     
     print("\n" + "=" * 60)
 

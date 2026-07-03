@@ -32,6 +32,7 @@ from flask import Flask, request, jsonify
 
 from models.cloud_upsampler import CloudUpsampler, TransformerUpsampler
 from models.bottleneck import DimensionBottleneck
+from models.multilevel import pad_dim, resize_tokens
 
 
 class CloudInferenceEngine:
@@ -41,7 +42,7 @@ class CloudInferenceEngine:
         self.device = device
         self.split_layer = split_layer
         
-        print(f"☁️ Loading cloud components from {checkpoint_path}")
+        print(f"Loading cloud components from {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         args = ckpt.get('args', {})
         
@@ -67,13 +68,13 @@ class CloudInferenceEngine:
                 # 拆分权重: 只有 decoder 部分，需要去掉 'decoder.' 前缀
                 decoder_sd = {k.replace('decoder.', ''): v for k, v in ckpt['bottleneck_decoder_state_dict'].items()}
                 self.bottleneck.decoder.load_state_dict(decoder_sd)
-                print(f"   Bottleneck decoder (split): {bottleneck_dim} → {hidden_size}")
+                print(f"   Bottleneck decoder (split): {bottleneck_dim} -> {hidden_size}")
             elif 'bottleneck_state_dict' in ckpt:
                 # AIO 权重: 完整 bottleneck
                 self.bottleneck.load_state_dict(ckpt['bottleneck_state_dict'])
-                print(f"   Bottleneck decoder (AIO): {bottleneck_dim} → {hidden_size}")
+                print(f"   Bottleneck decoder (AIO): {bottleneck_dim} -> {hidden_size}")
             else:
-                print(f"   ⚠️ No bottleneck weights found, using random init")
+                print(f"   Warning: no bottleneck weights found, using random init")
             
             self.bottleneck.eval()
         else:
@@ -106,7 +107,7 @@ class CloudInferenceEngine:
         self.upsampler.load_state_dict(ckpt['upsampler_state_dict'])
         self.upsampler.eval()
         
-        print(f"✅ Cloud components loaded")
+        print("Cloud components loaded")
         
         # Qwen (延迟加载)
         self.qwen_model = None
@@ -117,9 +118,9 @@ class CloudInferenceEngine:
         if self.qwen_model is not None:
             return
         
-        print(f"📥 Loading Qwen from {model_name}...")
+        print(f"Loading Qwen from {model_name}...")
         if local_only:
-            print("   (离线模式，不连接 HuggingFace)")
+            print("   offline mode; not connecting to HuggingFace")
         
         from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
         
@@ -141,9 +142,9 @@ class CloudInferenceEngine:
             param.requires_grad = False
         self.qwen_model.eval()
         
-        print(f"✅ Qwen loaded")
+        print("Qwen loaded")
     
-    def decode_features(self, features_b64: str, scale: float, zero_point: float):
+    def decode_features(self, features_b64: str, scale: float, zero_point: float, payload_tokens=None, payload_dim=None):
         """
         反序列化并反量化特征
         
@@ -162,17 +163,26 @@ class CloudInferenceEngine:
         features_int8 = np.frombuffer(features_bytes, dtype=np.uint8)
         
         # 确定形状
-        expected_dim = self.bottleneck_dim if self.bottleneck else self.hidden_size
-        features_int8 = features_int8.reshape(1, self.transmission_tokens, expected_dim)
+        expected_tokens = int(payload_tokens or self.transmission_tokens)
+        expected_dim = int(payload_dim or (self.bottleneck_dim if self.bottleneck else self.hidden_size))
+        features_int8 = features_int8.reshape(1, expected_tokens, expected_dim)
         
         # 转为 tensor 并反量化
         features = torch.from_numpy(features_int8.astype(np.float32)).to(self.device)
         features = (features - zero_point) * scale
         
         return features
+
+    def decode_payload_to_edge_tokens(self, compressed_features):
+        if self.bottleneck is not None:
+            compressed_features = pad_dim(compressed_features, self.bottleneck_dim)
+            edge_tokens = self.bottleneck.decode(compressed_features)
+        else:
+            edge_tokens = pad_dim(compressed_features, self.hidden_size)
+        return resize_tokens(edge_tokens, self.transmission_tokens, mode="bilinear")
     
     @torch.no_grad()
-    def infer(self, compressed_features, prompt="这张图里有什么?"):
+    def infer(self, compressed_features, prompt="Describe this image."):
         """
         完成云端推理
 
@@ -309,6 +319,217 @@ class CloudInferenceEngine:
         
         return response
 
+    @torch.no_grad()
+    def reconstruct_tokens(self, compressed_features):
+        """Decode edge features and upsample them to split-layer visual tokens."""
+        if self.bottleneck is not None:
+            edge_tokens = self.bottleneck.decode(compressed_features)
+        else:
+            edge_tokens = compressed_features
+
+        upsampled = self.upsampler(edge_tokens)
+
+        if self.split_layer == 4:
+            target_std, target_mean = 0.847, -0.022
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+        elif self.split_layer == 8:
+            target_std, target_mean = 1.066, -0.021
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+        elif self.split_layer == 0:
+            target_std, target_mean = 0.362, -0.0001
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+
+        return upsampled
+
+    @torch.no_grad()
+    def reconstruct_payload_tokens(self, compressed_features):
+        """Decode a possibly truncated multi-level payload to split-layer tokens."""
+        edge_tokens = self.decode_payload_to_edge_tokens(compressed_features)
+        upsampled = self.upsampler(edge_tokens)
+
+        if self.split_layer == 4:
+            target_std, target_mean = 0.847, -0.022
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+        elif self.split_layer == 8:
+            target_std, target_mean = 1.066, -0.021
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+        elif self.split_layer == 0:
+            target_std, target_mean = 0.362, -0.0001
+            current_std = upsampled.std()
+            if current_std > 0:
+                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+
+        return upsampled
+
+    @torch.no_grad()
+    def infer_payload(self, compressed_features, prompt="Describe this image.", max_new_tokens=256):
+        """Run image inference from a standard or multi-level payload tensor."""
+        upsampled = self.reconstruct_payload_tokens(compressed_features)
+        target_h = target_w = int(self.target_tokens ** 0.5)
+        grid_thw = torch.tensor([[1, target_h, target_w]], dtype=torch.long, device=self.device)
+        visual_tokens = self.run_visual_tail(upsampled, grid_thw=grid_thw, modality="image")
+        return self.generate_from_visual_tokens(
+            visual_tokens,
+            prompt=prompt,
+            modality="image",
+            max_new_tokens=max_new_tokens,
+        )
+
+    @torch.no_grad()
+    def run_visual_tail(self, upsampled, grid_thw=None, modality="image"):
+        """Continue Qwen visual blocks from the configured split layer."""
+        if self.qwen_model is None:
+            model_path = getattr(self, 'qwen_path', "Qwen/Qwen2.5-VL-3B-Instruct")
+            offline = getattr(self, 'offline_mode', False)
+            self.load_qwen(model_name=model_path, local_only=offline)
+
+        visual = self.qwen_model.visual
+        batch_size = upsampled.shape[0]
+        if grid_thw is None:
+            target_h = target_w = int(self.target_tokens ** 0.5)
+            grid_thw = torch.tensor([[1, target_h, target_w]] * batch_size, dtype=torch.long, device=self.device)
+        else:
+            grid_thw = torch.as_tensor(grid_thw, dtype=torch.long, device=self.device)
+            if grid_thw.dim() == 1:
+                grid_thw = grid_thw.unsqueeze(0)
+
+        expected_tokens = int((grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).sum().item())
+        if upsampled.shape[1] != expected_tokens:
+            raise ValueError(f"{modality} grid_thw expects {expected_tokens} tokens, got {upsampled.shape[1]}")
+
+        hidden_states = upsampled.view(-1, upsampled.shape[-1])
+        hidden_states = hidden_states.to(visual.blocks[0].attn.qkv.weight.dtype)
+
+        rotary_pos_emb = visual.rot_pos_emb(grid_thw)
+        window_index, cu_window_seqlens = visual.get_window_index(grid_thw)
+        cu_window_seqlens = torch.tensor(cu_window_seqlens, device=self.device, dtype=torch.int32)
+        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+
+        seq_len = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
+        hidden_states = hidden_states[window_index, :, :]
+        hidden_states = hidden_states.reshape(seq_len, -1)
+
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
+        rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2],
+            grid_thw[:, 0],
+        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
+        for layer_num, blk in enumerate(visual.blocks):
+            if layer_num < self.split_layer:
+                continue
+            if layer_num in visual.fullatt_block_indexes:
+                hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+            else:
+                hidden_states = blk(hidden_states, cu_seqlens=cu_window_seqlens, position_embeddings=position_embeddings)
+
+        reverse_indices = torch.argsort(window_index)
+        hidden_states = hidden_states.reshape(seq_len // visual.spatial_merge_unit, visual.spatial_merge_unit, -1)
+        hidden_states = hidden_states[reverse_indices, :, :]
+        hidden_states = hidden_states.reshape(seq_len, -1)
+
+        visual_tokens = visual.merger(hidden_states)
+        return visual_tokens.unsqueeze(0) if visual_tokens.dim() == 2 else visual_tokens
+
+    @torch.no_grad()
+    def generate_from_visual_tokens(self, visual_tokens, prompt, modality="image", max_new_tokens=256):
+        """Inject reconstructed image/video visual tokens into Qwen's language model."""
+        if self.qwen_model is None:
+            model_path = getattr(self, 'qwen_path', "Qwen/Qwen2.5-VL-3B-Instruct")
+            offline = getattr(self, 'offline_mode', False)
+            self.load_qwen(model_name=model_path, local_only=offline)
+
+        if modality == "video":
+            pad_token = "<|video_pad|>"
+            visual_token_id = self.qwen_model.config.video_token_id
+        else:
+            pad_token = "<|image_pad|>"
+            visual_token_id = self.qwen_model.config.image_token_id
+
+        num_visual_tokens = visual_tokens.shape[1]
+        placeholder = "<|vision_start|>" + pad_token * num_visual_tokens + "<|vision_end|>"
+        messages = [{'role': 'user', 'content': placeholder + prompt}]
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+        text_inputs = self.processor.tokenizer(text, return_tensors='pt', padding=True)
+        input_ids = text_inputs['input_ids'].to(self.device)
+        attention_mask = text_inputs['attention_mask'].to(self.device)
+
+        embed_layer = self.qwen_model.get_input_embeddings()
+        inputs_embeds = embed_layer(input_ids)
+
+        visual_mask = (input_ids == visual_token_id)
+        num_placeholders = visual_mask.sum().item()
+        visual_tokens_flat = visual_tokens.view(-1, visual_tokens.shape[-1])
+        if visual_tokens_flat.shape[0] != num_placeholders:
+            if visual_tokens_flat.shape[0] < num_placeholders:
+                pad = visual_tokens_flat[-1:].repeat(num_placeholders - visual_tokens_flat.shape[0], 1)
+                visual_tokens_flat = torch.cat([visual_tokens_flat, pad], dim=0)
+            else:
+                visual_tokens_flat = visual_tokens_flat[:num_placeholders]
+
+        visual_tokens_flat = visual_tokens_flat.to(inputs_embeds.dtype)
+        batch_indices, token_indices = torch.where(visual_mask)
+        for i, (b, t) in enumerate(zip(batch_indices, token_indices)):
+            inputs_embeds[b, t] = visual_tokens_flat[i]
+
+        outputs = self.qwen_model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=self.processor.tokenizer.pad_token_id,
+            eos_token_id=self.processor.tokenizer.eos_token_id,
+        )
+        response = self.processor.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if 'assistant' in response.lower():
+            response = response.split('assistant')[-1].strip()
+        return response
+
+    @torch.no_grad()
+    def infer_video_from_frame_features(self, compressed_frame_features, prompt="Describe this video.", max_new_tokens=256):
+        """
+        First-pass SplitOculo video inference: reconstruct each frame with the
+        existing image split model, then preserve frame order as T x H x W tokens.
+        """
+        if compressed_frame_features.dim() == 4:
+            compressed_frame_features = compressed_frame_features.squeeze(1)
+        if compressed_frame_features.dim() != 3:
+            raise ValueError("compressed_frame_features must be [T, tokens, channels]")
+
+        frame_tokens = []
+        for frame_features in compressed_frame_features:
+            upsampled = self.reconstruct_tokens(frame_features.unsqueeze(0))
+            frame_tokens.append(upsampled.squeeze(0))
+
+        video_tokens = torch.cat(frame_tokens, dim=0).unsqueeze(0)
+        target_h = target_w = int(self.target_tokens ** 0.5)
+        grid_thw = torch.tensor([[len(frame_tokens), target_h, target_w]], dtype=torch.long, device=self.device)
+        visual_tokens = self.run_visual_tail(video_tokens, grid_thw=grid_thw, modality="video")
+        return self.generate_from_visual_tokens(
+            visual_tokens,
+            prompt=prompt,
+            modality="video",
+            max_new_tokens=max_new_tokens,
+        )
+
 
 # 全局引擎实例
 engine = None
@@ -335,13 +556,19 @@ def infer():
         features_b64 = data['features']
         scale = data['scale']
         zero_point = data['zero_point']
-        prompt = data.get('prompt', '这张图里有什么?')
+        prompt = data.get('prompt', 'Describe this image.')
         
         # 反序列化特征
-        features = engine.decode_features(features_b64, scale, zero_point)
+        features = engine.decode_features(
+            features_b64,
+            scale,
+            zero_point,
+            payload_tokens=data.get('payload_tokens'),
+            payload_dim=data.get('payload_dim'),
+        )
         
         # 推理
-        response = engine.infer(features, prompt)
+        response = engine.infer_payload(features, prompt)
         
         latency_ms = (time.time() - start_time) * 1000
         
@@ -391,7 +618,7 @@ def main():
     if args.preload_qwen:
         engine.load_qwen(model_name=args.qwen_path, local_only=args.offline)
     
-    print(f"\n🚀 Starting server on {args.host}:{args.port}")
+    print(f"\nStarting server on {args.host}:{args.port}")
     print(f"   POST /infer - Run inference")
     print(f"   GET /health - Health check")
     
