@@ -52,6 +52,15 @@ logs/
 *.log
 wandb/
 runs/
+sampled_frames_*/
+
+# Local media
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.AVI
 
 # Data - whitelist mode (ignore all except .py files)
 data/*
@@ -72,3 +81,19 @@ test.jpg
 
 # Local research notes
 local_research/
+AGENTS.md
+
+# Local experiment writeups
+baseline_qwen25vl_experiment_plan.md
+chaoshi_product_area_controlled_results.md
+chaoshi_product_area_cpu_results.md
+smart_glasses_streaming_evaluation.md
+so_cpu_controlled_results.md
+so_experiment_master_table.md
+so_simple_result_table.md
+
+# Local experiment harnesses
+scripts/benchmark_changed_token_video.py
+scripts/evaluate_qwen_video_baseline.py
+scripts/export_uniform_frames.py
+scripts/measure_qwen_ttft.py

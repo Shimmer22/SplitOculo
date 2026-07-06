@@ -22,6 +22,7 @@ from pathlib import Path
 import base64
 import time
 import json
+import threading
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -29,6 +30,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from flask import Flask, request, jsonify
+from transformers import TextIteratorStreamer
 
 from models.cloud_upsampler import CloudUpsampler, TransformerUpsampler
 from models.bottleneck import DimensionBottleneck
@@ -124,10 +126,13 @@ class CloudInferenceEngine:
         
         from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
         
+        torch_dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
+        device_map = "cpu" if self.device == "cpu" else "auto"
+
         self.qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
+            torch_dtype=torch_dtype,
+            device_map=device_map,
             trust_remote_code=True,
             local_files_only=local_only,
         )
@@ -504,6 +509,107 @@ class CloudInferenceEngine:
         return response
 
     @torch.no_grad()
+    def generate_from_visual_tokens_with_timing(self, visual_tokens, prompt, modality="image", max_new_tokens=256):
+        """Inject visual tokens and stream text to measure first-token latency and TPS."""
+        if self.qwen_model is None:
+            model_path = getattr(self, 'qwen_path', "Qwen/Qwen2.5-VL-3B-Instruct")
+            offline = getattr(self, 'offline_mode', False)
+            self.load_qwen(model_name=model_path, local_only=offline)
+
+        if modality == "video":
+            pad_token = "<|video_pad|>"
+            visual_token_id = self.qwen_model.config.video_token_id
+        else:
+            pad_token = "<|image_pad|>"
+            visual_token_id = self.qwen_model.config.image_token_id
+
+        num_visual_tokens = visual_tokens.shape[1]
+        placeholder = "<|vision_start|>" + pad_token * num_visual_tokens + "<|vision_end|>"
+        messages = [{'role': 'user', 'content': placeholder + prompt}]
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+        text_inputs = self.processor.tokenizer(text, return_tensors='pt', padding=True)
+        input_ids = text_inputs['input_ids'].to(self.device)
+        attention_mask = text_inputs['attention_mask'].to(self.device)
+
+        embed_layer = self.qwen_model.get_input_embeddings()
+        inputs_embeds = embed_layer(input_ids)
+
+        visual_mask = (input_ids == visual_token_id)
+        num_placeholders = visual_mask.sum().item()
+        visual_tokens_flat = visual_tokens.view(-1, visual_tokens.shape[-1])
+        if visual_tokens_flat.shape[0] != num_placeholders:
+            if visual_tokens_flat.shape[0] < num_placeholders:
+                pad = visual_tokens_flat[-1:].repeat(num_placeholders - visual_tokens_flat.shape[0], 1)
+                visual_tokens_flat = torch.cat([visual_tokens_flat, pad], dim=0)
+            else:
+                visual_tokens_flat = visual_tokens_flat[:num_placeholders]
+
+        visual_tokens_flat = visual_tokens_flat.to(inputs_embeds.dtype)
+        batch_indices, token_indices = torch.where(visual_mask)
+        for i, (b, t) in enumerate(zip(batch_indices, token_indices)):
+            inputs_embeds[b, t] = visual_tokens_flat[i]
+
+        streamer = TextIteratorStreamer(
+            self.processor.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        generation_kwargs = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": False,
+            "pad_token_id": self.processor.tokenizer.pad_token_id,
+            "eos_token_id": self.processor.tokenizer.eos_token_id,
+            "streamer": streamer,
+        }
+        output_holder = {}
+        error_holder = {}
+
+        def _run_generate():
+            try:
+                output_holder["outputs"] = self.qwen_model.generate(**generation_kwargs)
+            except Exception as exc:
+                error_holder["error"] = exc
+
+        generation_start = time.perf_counter()
+        thread = threading.Thread(target=_run_generate)
+        thread.start()
+
+        chunks = []
+        first_token_seconds = None
+        for chunk in streamer:
+            if chunk and first_token_seconds is None:
+                first_token_seconds = time.perf_counter() - generation_start
+            chunks.append(chunk)
+
+        thread.join()
+        generation_seconds = time.perf_counter() - generation_start
+        if "error" in error_holder:
+            raise error_holder["error"]
+
+        outputs = output_holder["outputs"]
+        generated_tokens = int(outputs[0].numel()) if outputs is not None else 0
+        answer = "".join(chunks).strip()
+        if not answer and outputs is not None:
+            answer = self.processor.tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+            if 'assistant' in answer.lower():
+                answer = answer.split('assistant')[-1].strip()
+
+        average_tps = None
+        if generated_tokens > 0 and generation_seconds > 0:
+            average_tps = generated_tokens / generation_seconds
+
+        return answer, {
+            "first_token_seconds": first_token_seconds,
+            "generation_seconds": generation_seconds,
+            "generated_tokens": generated_tokens,
+            "average_tps": average_tps,
+        }
+
+    @torch.no_grad()
     def infer_video_from_frame_features(self, compressed_frame_features, prompt="Describe this video.", max_new_tokens=256):
         """
         First-pass SplitOculo video inference: reconstruct each frame with the
@@ -529,6 +635,45 @@ class CloudInferenceEngine:
             modality="video",
             max_new_tokens=max_new_tokens,
         )
+
+    @torch.no_grad()
+    def infer_video_from_frame_features_with_timing(self, compressed_frame_features, prompt="Describe this video.", max_new_tokens=256, multilevel_payload=False):
+        """Timed SplitOculo video path with reconstruction, visual tail, and generation metrics."""
+        if compressed_frame_features.dim() == 4:
+            compressed_frame_features = compressed_frame_features.squeeze(1)
+        if compressed_frame_features.dim() != 3:
+            raise ValueError("compressed_frame_features must be [T, tokens, channels]")
+
+        reconstruct_start = time.perf_counter()
+        frame_tokens = []
+        for frame_features in compressed_frame_features:
+            if multilevel_payload:
+                upsampled = self.reconstruct_payload_tokens(frame_features.unsqueeze(0))
+            else:
+                upsampled = self.reconstruct_tokens(frame_features.unsqueeze(0))
+            frame_tokens.append(upsampled.squeeze(0))
+        reconstruct_seconds = time.perf_counter() - reconstruct_start
+
+        video_tokens = torch.cat(frame_tokens, dim=0).unsqueeze(0)
+        target_h = target_w = int(self.target_tokens ** 0.5)
+        grid_thw = torch.tensor([[len(frame_tokens), target_h, target_w]], dtype=torch.long, device=self.device)
+
+        visual_tail_start = time.perf_counter()
+        visual_tokens = self.run_visual_tail(video_tokens, grid_thw=grid_thw, modality="video")
+        visual_tail_seconds = time.perf_counter() - visual_tail_start
+
+        answer, generation_metrics = self.generate_from_visual_tokens_with_timing(
+            visual_tokens,
+            prompt=prompt,
+            modality="video",
+            max_new_tokens=max_new_tokens,
+        )
+        metrics = {
+            "reconstruct_seconds": reconstruct_seconds,
+            "visual_tail_seconds": visual_tail_seconds,
+            **generation_metrics,
+        }
+        return answer, metrics
 
 
 # 全局引擎实例

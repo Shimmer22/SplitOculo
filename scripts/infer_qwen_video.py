@@ -15,6 +15,8 @@ Examples:
 import argparse
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -22,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import numpy as np
 import torch
 from PIL import Image
+from transformers import TextIteratorStreamer
 
 from core.qwen_extractor import QwenFeatureExtractor
 
@@ -84,6 +87,22 @@ def read_video_frames(video_path, max_frames=None, sample_fps=None):
     if not video_path.exists():
         raise FileNotFoundError(video_path)
 
+    if video_path.is_file() and video_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+        frame = Image.open(video_path).convert("RGB")
+        return [frame], 0.0, "image_file"
+
+    if video_path.is_dir():
+        image_paths = sorted(
+            p for p in video_path.iterdir()
+            if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+        )
+        if max_frames is not None:
+            image_paths = image_paths[:max_frames]
+        frames = [Image.open(p).convert("RGB") for p in image_paths]
+        if frames:
+            return frames, 0.0, "image_dir"
+        raise RuntimeError(f"decoded zero frames from image directory: {video_path}")
+
     errors = []
     for reader in (_read_video_torchvision, _read_video_cv2):
         try:
@@ -140,6 +159,96 @@ def generate_video_answer(extractor, frames, prompt, max_new_tokens):
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )[0].strip()
+
+
+@torch.no_grad()
+def generate_video_answer_with_timing(extractor, frames, prompt, max_new_tokens):
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "video", "video": "sampled_frames"},
+            {"type": "text", "text": prompt},
+        ],
+    }]
+    text = extractor.processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = extractor.processor(
+        text=[text],
+        videos=[frames],
+        return_tensors="pt",
+        padding=True,
+    )
+    inputs = batch_to_device(inputs, extractor.device)
+
+    streamer = TextIteratorStreamer(
+        extractor.processor.tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    generation_kwargs = {
+        **inputs,
+        "max_new_tokens": max_new_tokens,
+        "do_sample": False,
+        "streamer": streamer,
+    }
+    output_holder = {}
+    error_holder = {}
+
+    def _run_generate():
+        try:
+            output_holder["output_ids"] = extractor.model.generate(**generation_kwargs)
+        except Exception as exc:
+            error_holder["error"] = exc
+
+    generation_start = time.perf_counter()
+    thread = threading.Thread(target=_run_generate)
+    thread.start()
+
+    chunks = []
+    first_chunk_seconds = None
+    for chunk in streamer:
+        if chunk and first_chunk_seconds is None:
+            first_chunk_seconds = time.perf_counter() - generation_start
+        chunks.append(chunk)
+
+    thread.join()
+    generation_seconds = time.perf_counter() - generation_start
+    if "error" in error_holder:
+        raise error_holder["error"]
+
+    output_ids = output_holder["output_ids"]
+    generated_ids = [
+        out_ids[len(in_ids):]
+        for in_ids, out_ids in zip(inputs["input_ids"], output_ids)
+    ]
+    generated_tokens = int(generated_ids[0].numel()) if generated_ids else 0
+    answer = "".join(chunks).strip()
+    if not answer and generated_ids:
+        answer = extractor.processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0].strip()
+
+    first_token_seconds = first_chunk_seconds
+    decode_seconds_after_first = None
+    average_tps = None
+    if generated_tokens > 0 and generation_seconds > 0:
+        average_tps = generated_tokens / generation_seconds
+    if first_token_seconds is not None:
+        decode_seconds_after_first = max(0.0, generation_seconds - first_token_seconds)
+
+    return answer, {
+        "first_token_seconds": first_token_seconds,
+        "generation_seconds": generation_seconds,
+        "generated_tokens": generated_tokens,
+        "average_tps": average_tps,
+        "decode_seconds_after_first": decode_seconds_after_first,
+    }
 
 
 def main():

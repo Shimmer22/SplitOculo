@@ -63,10 +63,13 @@ class QwenFeatureExtractor:
         
         print(f"Loading Qwen2.5-VL from {self.model_name}...")
         
+        torch_dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
+        device_map = "cpu" if self.device == "cpu" else "auto"
+
         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             self.model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
+            torch_dtype=torch_dtype,
+            device_map=device_map,
             trust_remote_code=True,
             local_files_only=self.local_files_only,
         )
