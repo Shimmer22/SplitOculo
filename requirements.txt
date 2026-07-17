@@ -8,6 +8,10 @@ numpy
 matplotlib
 tqdm
 
+# Video decode and Codec acceleration
+av
+opencv-python
+
 # Edge-Cloud communication
 flask
 requests

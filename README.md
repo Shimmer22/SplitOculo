@@ -208,6 +208,70 @@ python scripts/edge_client.py \
   --timeout 300
 ```
 
+### 7. Run Video Inference
+
+The default video path independently runs the edge CNN on every sampled frame:
+
+```bash
+python scripts/infer_splitoculo_video.py \
+  --video ./test.mp4 \
+  --edge_checkpoint ./checkpoints/gan_bottleneck/split/edge_weights.pth \
+  --cloud_checkpoint ./checkpoints/gan_bottleneck/split/cloud_weights.pth \
+  --sample_fps 2 \
+  --max_frames 8 \
+  --offline
+```
+
+Add `--codec_acc` to use real motion vectors exported by the software decoder.
+The decoder backend is the default and processes intervening source P-frames so
+reference feature state reaches each sparsely sampled VLM frame:
+
+```bash
+python scripts/infer_splitoculo_video.py \
+  --video ./test.mp4 \
+  --edge_checkpoint ./checkpoints/gan_bottleneck/split/edge_weights.pth \
+  --cloud_checkpoint ./checkpoints/gan_bottleneck/split/cloud_weights.pth \
+  --sample_fps 2 \
+  --max_frames 8 \
+  --codec_acc \
+  --offline
+```
+
+The implementation uses PyAV/libavcodec `AV_FRAME_DATA_MOTION_VECTORS`. I-frames
+run the full CNN. The optimized P-frame path analytically preserves the legacy
+resize/crop/bilinear flow sampling while gathering only the source pixels needed
+by the small CNN feature grid; PyTorch `grid_sample` then recursively warps the
+reference feature on either CPU or CUDA. Selected B-frames safely fall back to
+the full CNN because their future reference is unavailable in display order.
+The current one-reference state assumes normal IP or non-reference-B streams;
+re-encode with `-bf 0` for the cleanest first deployment test. A learned
+residual correction is not applied yet.
+
+`--codec_flow_impl feature_grid` is the default numerically equivalent optimized
+path. Use `feature_grid_center` only for the faster approximate mapping, or
+`dense` to reproduce the legacy full-resolution flow pipeline.
+
+The earlier RGB/Farneback proxy remains available explicitly:
+
+```bash
+python scripts/infer_splitoculo_video.py \
+  ... \
+  --codec_acc \
+  --codec_mv_backend farneback \
+  --codec_gop_frames 4
+```
+
+`--codec_gop_frames` only controls this Farneback backend. The decoder backend
+follows actual codec I/P/B frame types and references. Run metadata records PTS,
+source frame index, frame type, MV count, block coverage, fallback reason, and
+both processed-source and sampled-frame CNN/warp counts.
+
+Synchronized CPU/CUDA benchmarks and the current go/no-go assessment are in
+[`docs/codec_mv_performance.md`](docs/codec_mv_performance.md). Direct
+feature-grid flow is faster on both CPU and CUDA, including sparse I/P-only
+sampling. Answer drift and selected B-frame fallback still prevent enabling the
+path by default.
+
 ## Bandwidth Benchmark
 
 We conducted comprehensive bandwidth-limited tests to evaluate the effectiveness of neural compression under different network conditions. The experiments simulate BLE, 3G, 4G, and LAN environments.

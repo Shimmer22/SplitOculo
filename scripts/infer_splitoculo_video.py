@@ -1,9 +1,8 @@
-"""First-pass SplitOculo video inference.
+"""SplitOculo video inference with optional warp-only edge acceleration.
 
-The video path intentionally reuses the trained single-image SplitOculo model:
-each sampled frame is encoded independently on the edge, reconstructed on the
-cloud, then the reconstructed frame tokens are concatenated in temporal order
-and passed to Qwen as video tokens.
+By default every sampled frame is encoded independently. With ``--codec_acc``,
+each GOP I-frame runs the edge CNN and P-frames recursively warp the preceding
+predicted CNN feature before the normal projector/bottleneck/cloud path.
 """
 
 import argparse
@@ -17,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import torch
 
 from models.multilevel import parse_payload_levels
+from models.codec_accelerator import CodecWarpAccelerator, DecoderMotionVectorAccelerator
+from core.codec_video_reader import read_video_records_with_mvs
 from scripts.edge_client import EdgeEncoder
 from scripts.cloud_server import CloudInferenceEngine
 from scripts.infer_qwen_video import read_video_frames
@@ -32,6 +33,18 @@ def main():
     parser.add_argument("--sample_fps", type=float, default=None)
     parser.add_argument("--level", type=str, default=None,
                         help="Optional multi-level payload, e.g. 49x64, 49x128, 196x64, 196x128")
+    parser.add_argument("--codec_acc", action="store_true",
+                        help="Use warp-only I/P CNN feature reuse on the edge")
+    parser.add_argument("--codec_mv_backend", choices=["decoder", "farneback"], default="decoder",
+                        help="Motion source for --codec_acc (default: real decoder MVs)")
+    parser.add_argument(
+        "--codec_flow_impl",
+        choices=["feature_grid", "feature_grid_center", "dense"],
+        default="feature_grid",
+        help="Decoder-MV flow path: equivalent optimized, approximate fast, or legacy dense",
+    )
+    parser.add_argument("--codec_gop_frames", type=int, default=4,
+                        help="Synthetic sampled-frame GOP for the Farneback backend only")
     parser.add_argument("--qwen_path", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
     parser.add_argument("--split_layer", type=int, default=4)
     parser.add_argument("--max_new_tokens", type=int, default=128)
@@ -51,11 +64,20 @@ def main():
 
     total_start = time.perf_counter()
     decode_start = time.perf_counter()
-    frames, native_fps, reader = read_video_frames(
-        args.video,
-        max_frames=args.max_frames,
-        sample_fps=args.sample_fps,
-    )
+    decoder_records = None
+    if args.codec_acc and args.codec_mv_backend == "decoder":
+        decoder_records, native_fps, reader = read_video_records_with_mvs(
+            args.video,
+            max_frames=args.max_frames,
+            sample_fps=args.sample_fps,
+        )
+        frames = [record["image"] for record in decoder_records if record["selected"]]
+    else:
+        frames, native_fps, reader = read_video_frames(
+            args.video,
+            max_frames=args.max_frames,
+            sample_fps=args.sample_fps,
+        )
     decode_seconds = time.perf_counter() - decode_start
     print(f"Decoded {len(frames)} frames with {reader} (native_fps={native_fps:.3f})")
 
@@ -64,15 +86,51 @@ def main():
     edge_load_seconds = time.perf_counter() - edge_load_start
     frame_features = []
     edge_encode_seconds = 0.0
-    for idx, frame in enumerate(frames):
-        encode_start = time.perf_counter()
-        if payload_level:
-            features, is_compressed = edge.encode_pil_level(frame, payload_level)
-        else:
-            features, is_compressed = edge.encode_pil(frame)
-        edge_encode_seconds += time.perf_counter() - encode_start
-        frame_features.append(features.squeeze(0).detach())
-        print(f"Encoded frame {idx + 1}/{len(frames)}: {tuple(features.shape)}, compressed={is_compressed}")
+    farneback_accelerator = (
+        CodecWarpAccelerator(edge, gop_frames=args.codec_gop_frames)
+        if args.codec_acc and args.codec_mv_backend == "farneback"
+        else None
+    )
+    decoder_accelerator = (
+        DecoderMotionVectorAccelerator(edge, flow_impl=args.codec_flow_impl)
+        if args.codec_acc and args.codec_mv_backend == "decoder"
+        else None
+    )
+    codec_frame_records = []
+    if decoder_accelerator is not None:
+        for record in decoder_records:
+            features, is_compressed, codec_info = decoder_accelerator.encode_record(
+                record, payload_level=payload_level
+            )
+            codec_frame_records.append(codec_info)
+            edge_encode_seconds += codec_info["encode_seconds"]
+            if not record["selected"]:
+                continue
+            frame_features.append(features.squeeze(0).detach())
+            print(
+                f"Encoded sampled frame {len(frame_features)}/{len(frames)} "
+                f"(source={record['source_index']}): {tuple(features.shape)}, "
+                f"compressed={is_compressed}, mode={codec_info['mode']}"
+            )
+    else:
+        for idx, frame in enumerate(frames):
+            encode_start = time.perf_counter()
+            if farneback_accelerator is not None:
+                features, is_compressed, codec_info = farneback_accelerator.encode_pil(
+                    frame, payload_level=payload_level
+                )
+                codec_frame_records.append(codec_info)
+            elif payload_level:
+                features, is_compressed = edge.encode_pil_level(frame, payload_level)
+            else:
+                features, is_compressed = edge.encode_pil(frame)
+            edge_encode_seconds += time.perf_counter() - encode_start
+            frame_features.append(features.squeeze(0).detach())
+            mode = codec_frame_records[-1]["frame_type"] if codec_frame_records else "full"
+            print(
+                f"Encoded frame {idx + 1}/{len(frames)}: {tuple(features.shape)}, "
+                f"compressed={is_compressed}, mode={mode}"
+            )
 
     compressed_frame_features = torch.stack(frame_features, dim=0)
     payload_tensor_bytes = (
@@ -92,6 +150,12 @@ def main():
                 "sample_fps": args.sample_fps,
                 "edge_checkpoint": args.edge_checkpoint,
                 "cloud_checkpoint": args.cloud_checkpoint,
+                "codec_acc": args.codec_acc,
+                "codec_gop_frames": args.codec_gop_frames
+                if args.codec_acc and args.codec_mv_backend == "farneback" else None,
+                "codec_mv_backend": args.codec_mv_backend if args.codec_acc else None,
+                "codec_flow_impl": args.codec_flow_impl
+                if args.codec_acc and args.codec_mv_backend == "decoder" else None,
             },
             payload_path,
         )
@@ -138,6 +202,37 @@ def main():
         "device": args.device,
         "max_new_tokens": args.max_new_tokens,
         "payload_level": args.level,
+        "codec_acc": args.codec_acc,
+        "codec_gop_frames": args.codec_gop_frames
+        if args.codec_acc and args.codec_mv_backend == "farneback" else None,
+        "codec_mv_backend": args.codec_mv_backend if args.codec_acc else None,
+        "codec_flow_impl": args.codec_flow_impl
+        if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+        "codec_mode": f"{args.codec_mv_backend}_warp_only" if args.codec_acc else None,
+        "codec_frame_records": codec_frame_records,
+        "codec_source_frames_processed": len(codec_frame_records) if args.codec_acc else len(frames),
+        "decoder_mv_reference_policy": (
+            "last decoded I/P reference; selected B frames use full-CNN fallback"
+            if args.codec_acc and args.codec_mv_backend == "decoder" else None
+        ),
+        "edge_cnn_frames": sum(record["cnn_executed"] for record in codec_frame_records)
+        if args.codec_acc else len(frames),
+        "edge_warp_frames": sum(
+            record.get("warp_executed", not record["cnn_executed"])
+            for record in codec_frame_records
+        ),
+        "sampled_edge_cnn_frames": sum(
+            record["selected"] and record["cnn_executed"] for record in codec_frame_records
+        ) if args.codec_acc and args.codec_mv_backend == "decoder" else (
+            sum(record["cnn_executed"] for record in codec_frame_records)
+            if args.codec_acc else len(frames)
+        ),
+        "sampled_edge_warp_frames": sum(
+            record["selected"] and record["warp_executed"] for record in codec_frame_records
+        ) if args.codec_acc and args.codec_mv_backend == "decoder" else (
+            sum(not record["cnn_executed"] for record in codec_frame_records)
+            if args.codec_acc else 0
+        ),
         "payload_tensor_bytes": int(payload_tensor_bytes),
         "payload_int8_bytes": int(payload_int8_bytes),
         "metrics": {
@@ -165,6 +260,10 @@ def main():
             "",
             f"- Video: `{args.video}`",
             f"- Frames: `{len(frames)}`",
+            f"- Codec acceleration: `{args.codec_acc}`",
+            f"- Codec MV backend: `{args.codec_mv_backend if args.codec_acc else None}`",
+            f"- Codec GOP frames: `{metadata['codec_gop_frames']}`",
+            f"- Edge CNN / warp frames: `{metadata['edge_cnn_frames']} / {metadata['edge_warp_frames']}`",
             f"- Device: `{args.device}`",
             f"- Payload tensor bytes: `{payload_tensor_bytes}`",
             f"- Payload int8 bytes estimate: `{payload_int8_bytes}`",

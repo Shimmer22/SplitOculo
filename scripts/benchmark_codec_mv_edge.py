@@ -1,0 +1,163 @@
+"""Benchmark full sampled-frame CNN encoding against decoder-MV feature warp."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import torch
+import torch.nn.functional as F
+
+from core.codec_video_reader import read_video_records_with_mvs
+from models.codec_accelerator import DecoderMotionVectorAccelerator
+from scripts.edge_client import EdgeEncoder
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--video", required=True)
+    parser.add_argument("--edge_checkpoint", required=True)
+    parser.add_argument("--sample_fps", type=float, default=None)
+    parser.add_argument("--max_frames", type=int, default=8)
+    parser.add_argument("--warmup_rounds", type=int, default=2)
+    parser.add_argument("--rounds", type=int, default=10)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--flow_impl", choices=("feature_grid", "feature_grid_center", "dense"),
+        default="feature_grid",
+        help="Decoder-MV flow construction path; dense is the legacy comparison path.",
+    )
+    parser.add_argument("--output", type=Path, default=None)
+    return parser.parse_args()
+
+
+def synchronize(device):
+    if str(device).startswith("cuda"):
+        torch.cuda.synchronize()
+
+
+@torch.no_grad()
+def run_full(edge, selected_images, device):
+    synchronize(device)
+    started = time.perf_counter()
+    payloads = [edge.encode_pil(image)[0] for image in selected_images]
+    synchronize(device)
+    return time.perf_counter() - started, payloads
+
+
+@torch.no_grad()
+def run_decoder_mv(edge, records, device, flow_impl):
+    accelerator = DecoderMotionVectorAccelerator(edge, flow_impl=flow_impl)
+    synchronize(device)
+    started = time.perf_counter()
+    payloads = []
+    frame_info = []
+    for record in records:
+        payload, _, info = accelerator.encode_record(record)
+        frame_info.append(info)
+        if record["selected"]:
+            payloads.append(payload)
+    synchronize(device)
+    return time.perf_counter() - started, payloads, frame_info
+
+
+def stats(values):
+    return {
+        "mean_ms": 1000 * statistics.mean(values),
+        "median_ms": 1000 * statistics.median(values),
+        "stdev_ms": 1000 * statistics.stdev(values) if len(values) > 1 else 0.0,
+        "min_ms": 1000 * min(values),
+        "max_ms": 1000 * max(values),
+    }
+
+
+def payload_similarity(full_payloads, mv_payloads):
+    if len(full_payloads) != len(mv_payloads) or not full_payloads:
+        return None
+    full = torch.cat([payload.detach().float().cpu() for payload in full_payloads], dim=0)
+    mv = torch.cat([payload.detach().float().cpu() for payload in mv_payloads], dim=0)
+    if full.shape != mv.shape:
+        return {"shape_match": False, "full_shape": list(full.shape), "mv_shape": list(mv.shape)}
+    return {
+        "shape_match": True,
+        "mse": float(F.mse_loss(mv, full)),
+        "cosine_similarity": float(F.cosine_similarity(mv.flatten(), full.flatten(), dim=0)),
+    }
+
+
+def main():
+    args = parse_args()
+    decode_started = time.perf_counter()
+    records, native_fps, reader = read_video_records_with_mvs(
+        args.video, max_frames=args.max_frames, sample_fps=args.sample_fps
+    )
+    decode_seconds = time.perf_counter() - decode_started
+    selected_images = [record["image"] for record in records if record["selected"]]
+    edge = EdgeEncoder(args.edge_checkpoint, device=args.device)
+
+    for _ in range(args.warmup_rounds):
+        run_full(edge, selected_images, args.device)
+        run_decoder_mv(edge, records, args.device, args.flow_impl)
+
+    full_times = []
+    mv_times = []
+    final_info = None
+    full_payloads = None
+    mv_payloads = None
+    for _ in range(args.rounds):
+        elapsed, full_payloads = run_full(edge, selected_images, args.device)
+        full_times.append(elapsed)
+        elapsed, mv_payloads, final_info = run_decoder_mv(
+            edge, records, args.device, args.flow_impl
+        )
+        mv_times.append(elapsed)
+
+    full_mean = statistics.mean(full_times)
+    mv_mean = statistics.mean(mv_times)
+    selected_info = [record for record in final_info if record["selected"]]
+    result = {
+        "video": str(Path(args.video).resolve()),
+        "reader": reader,
+        "native_fps": native_fps,
+        "sample_fps": args.sample_fps,
+        "selected_frames": len(selected_images),
+        "source_frames_processed": len(records),
+        "warmup_rounds": args.warmup_rounds,
+        "rounds": args.rounds,
+        "device": args.device,
+        "flow_impl": args.flow_impl,
+        "decode_with_mv_seconds": decode_seconds,
+        "full": stats(full_times),
+        "decoder_mv": stats(mv_times),
+        "speedup": full_mean / mv_mean,
+        "latency_change_pct": 100 * (mv_mean / full_mean - 1),
+        "processed_cnn_frames": sum(record["cnn_executed"] for record in final_info),
+        "processed_warp_frames": sum(record["warp_executed"] for record in final_info),
+        "sampled_cnn_frames": sum(record["cnn_executed"] for record in selected_info),
+        "sampled_warp_frames": sum(record["warp_executed"] for record in selected_info),
+        "selected_modes": [record["mode"] for record in selected_info],
+        "payload_similarity_to_full": payload_similarity(full_payloads, mv_payloads),
+        "notes": [
+            "Video decode and model load are excluded from both timed paths.",
+            "CUDA is synchronized before and after each timed path.",
+            "The decoder-MV path advances intervening source reference frames.",
+            "feature_grid analytically preserves the legacy two-stage bilinear sampling semantics.",
+            "feature_grid_center is the faster approximate one-MV-per-cell implementation.",
+            "dense is the legacy full-resolution Python rasterization comparison path.",
+        ],
+    }
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"Saved: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
