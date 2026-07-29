@@ -378,6 +378,21 @@ feature-grid flow is faster on both CPU and CUDA, including sparse I/P-only
 sampling. Answer drift and selected B-frame fallback still prevent enabling the
 path by default.
 
+For a local NVIDIA GPU treated as the edge device, prefer full-CNN
+microbatching whenever buffering is acceptable:
+
+```powershell
+python scripts/infer_splitoculo_video.py `
+  ... `
+  --edge_batch_size 8
+```
+
+Decoder-MV inference can instead defer only projector/bottleneck work with
+`--codec_projection_batch_size 4`. The LSFA appearance path defaults to
+`--codec_memory_rgb_mode exact`; `fast` is an explicit quality trade-off.
+Measured operating points and rejected FP16/TorchScript experiments are in
+[`docs/local_gpu_edge_optimization.md`](docs/local_gpu_edge_optimization.md).
+
 ## Bandwidth Benchmark
 
 We conducted comprehensive bandwidth-limited tests to evaluate the effectiveness of neural compression under different network conditions. The experiments simulate BLE, 3G, 4G, and LAN environments.

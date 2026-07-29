@@ -77,6 +77,12 @@ def main():
         default=0,
         help="Optional periodic full-CNN refresh after this many causal P-frames (0 disables)",
     )
+    parser.add_argument(
+        "--codec_memory_rgb_mode",
+        choices=["exact", "fast"],
+        default="exact",
+        help="Exact training-time RGB resize or faster direct feature-grid resize",
+    )
     parser.add_argument("--qwen_path", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
     parser.add_argument("--split_layer", type=int, default=4)
     parser.add_argument("--max_new_tokens", type=int, default=128)
@@ -85,12 +91,28 @@ def main():
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--edge_batch_size",
+        type=int,
+        default=1,
+        help="Microbatch size for non-codec full-CNN video encoding",
+    )
+    parser.add_argument(
+        "--codec_projection_batch_size",
+        type=int,
+        default=1,
+        help="Microbatch projector/bottleneck after decoder-MV temporal propagation",
+    )
     args = parser.parse_args()
 
     if args.codec_memory_checkpoint and not (
         args.codec_acc and args.codec_mv_backend == "decoder"
     ):
         parser.error("--codec_memory_checkpoint requires --codec_acc with --codec_mv_backend decoder")
+    if args.edge_batch_size <= 0:
+        parser.error("--edge_batch_size must be positive")
+    if args.codec_projection_batch_size <= 0:
+        parser.error("--codec_projection_batch_size must be positive")
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -98,6 +120,16 @@ def main():
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     payload_level = parse_payload_levels(args.level)[0] if args.level else None
+    if args.edge_batch_size > 1 and args.codec_acc:
+        parser.error("--edge_batch_size > 1 is only supported without --codec_acc")
+    if args.edge_batch_size > 1 and payload_level is not None:
+        parser.error("--edge_batch_size > 1 does not yet support --level")
+    if args.codec_projection_batch_size > 1 and not (
+        args.codec_acc and args.codec_mv_backend == "decoder"
+    ):
+        parser.error(
+            "--codec_projection_batch_size > 1 requires decoder --codec_acc"
+        )
 
     total_start = time.perf_counter()
     decode_start = time.perf_counter()
@@ -137,26 +169,69 @@ def main():
             reference_mode=args.codec_reference_mode,
             min_coverage=args.codec_mv_min_coverage,
             max_p_chain=args.codec_max_p_chain,
+            memory_rgb_mode=args.codec_memory_rgb_mode,
         )
         if args.codec_acc and args.codec_mv_backend == "decoder"
         else None
     )
     codec_frame_records = []
     if decoder_accelerator is not None:
+        deferred_features = []
         for record in decoder_records:
             features, is_compressed, codec_info = decoder_accelerator.encode_record(
-                record, payload_level=payload_level
+                record,
+                payload_level=payload_level,
+                defer_payload=args.codec_projection_batch_size > 1,
             )
             codec_frame_records.append(codec_info)
             edge_encode_seconds += codec_info["encode_seconds"]
             if not record["selected"]:
                 continue
-            frame_features.append(features.squeeze(0).detach())
+            if args.codec_projection_batch_size > 1:
+                deferred_features.append(features)
+            else:
+                frame_features.append(features.squeeze(0).detach())
             print(
                 f"Encoded sampled frame {len(frame_features)}/{len(frames)} "
                 f"(source={record['source_index']}): {tuple(features.shape)}, "
                 f"compressed={is_compressed}, mode={codec_info['mode']}"
             )
+        if args.codec_projection_batch_size > 1:
+            projection_start = time.perf_counter()
+            for start in range(
+                0, len(deferred_features), args.codec_projection_batch_size
+            ):
+                feature_batch = torch.cat(
+                    deferred_features[
+                        start : start + args.codec_projection_batch_size
+                    ],
+                    dim=0,
+                )
+                payload_batch, _ = decoder_accelerator.project_features(
+                    feature_batch, payload_level=payload_level
+                )
+                frame_features.extend(
+                    payload_batch[index].detach()
+                    for index in range(payload_batch.shape[0])
+                )
+            if str(args.device).startswith("cuda"):
+                torch.cuda.synchronize()
+            edge_encode_seconds += time.perf_counter() - projection_start
+    elif args.edge_batch_size > 1:
+        encode_start = time.perf_counter()
+        for start in range(0, len(frames), args.edge_batch_size):
+            batch = frames[start : start + args.edge_batch_size]
+            features, is_compressed = edge.encode_pil_batch(batch)
+            frame_features.extend(
+                features[index].detach() for index in range(features.shape[0])
+            )
+            print(
+                f"Encoded frames {start + 1}-{start + len(batch)}/{len(frames)}: "
+                f"{tuple(features.shape)}, compressed={is_compressed}, mode=full_batch"
+            )
+        if str(args.device).startswith("cuda"):
+            torch.cuda.synchronize()
+        edge_encode_seconds = time.perf_counter() - encode_start
     else:
         for idx, frame in enumerate(frames):
             encode_start = time.perf_counter()
@@ -211,6 +286,8 @@ def main():
                 if args.codec_acc and args.codec_mv_backend == "decoder" else None,
                 "codec_max_p_chain": args.codec_max_p_chain
                 if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+                "codec_memory_rgb_mode": args.codec_memory_rgb_mode
+                if args.codec_acc and args.codec_mv_backend == "decoder" else None,
             },
             payload_path,
         )
@@ -255,6 +332,8 @@ def main():
         "qwen_path": args.qwen_path,
         "split_layer": args.split_layer,
         "device": args.device,
+        "edge_batch_size": args.edge_batch_size,
+        "codec_projection_batch_size": args.codec_projection_batch_size,
         "max_new_tokens": args.max_new_tokens,
         "payload_level": args.level,
         "codec_acc": args.codec_acc,
@@ -272,6 +351,8 @@ def main():
         "codec_mv_min_coverage": args.codec_mv_min_coverage
         if args.codec_acc and args.codec_mv_backend == "decoder" else None,
         "codec_max_p_chain": args.codec_max_p_chain
+        if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+        "codec_memory_rgb_mode": args.codec_memory_rgb_mode
         if args.codec_acc and args.codec_mv_backend == "decoder" else None,
         "codec_mode": (
             f"{args.codec_mv_backend}_{args.codec_memory_arch}_residual"
@@ -339,6 +420,7 @@ def main():
             f"- Codec reference mode: `{args.codec_reference_mode}`",
             f"- MV coverage threshold: `{args.codec_mv_min_coverage}`",
             f"- Max causal P chain: `{args.codec_max_p_chain}`",
+            f"- Codec memory RGB mode: `{args.codec_memory_rgb_mode}`",
             f"- Codec GOP frames: `{metadata['codec_gop_frames']}`",
             f"- Edge CNN / warp frames: `{metadata['edge_cnn_frames']} / {metadata['edge_warp_frames']}`",
             f"- Device: `{args.device}`",

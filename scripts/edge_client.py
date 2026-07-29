@@ -153,7 +153,7 @@ class EdgeEncoder:
         else:
             self.bottleneck = None
             print(f"   No bottleneck (full dimension)")
-        
+
         # 图像预处理
         self.transform = transforms.Compose([
             transforms.Resize(self.image_size, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -163,6 +163,13 @@ class EdgeEncoder:
         ])
         
         print("Edge encoder loaded")
+
+    def input_to_device(self, image_tensor):
+        image_tensor = image_tensor.to(
+            device=self.device,
+            non_blocking=True,
+        )
+        return image_tensor
     
     @torch.no_grad()
     def encode(self, image_path):
@@ -184,7 +191,7 @@ class EdgeEncoder:
     def encode_pil(self, img):
         """Encode a PIL image as compressed SplitOculo edge features."""
         img = img.convert('RGB')
-        image_tensor = self.transform(img).unsqueeze(0).to(self.device)
+        image_tensor = self.input_to_device(self.transform(img).unsqueeze(0))
         
         # CNN + Projector
         feat = self.student(image_tensor)[-1]
@@ -197,12 +204,28 @@ class EdgeEncoder:
         
         return tokens, False
 
+    @torch.inference_mode()
+    def encode_pil_batch(self, images):
+        """Encode a microbatch of PIL images with one GPU launch sequence."""
+        if not images:
+            raise ValueError("images must contain at least one PIL image")
+        image_tensor = torch.stack(
+            [self.transform(image.convert('RGB')) for image in images],
+            dim=0,
+        )
+        image_tensor = self.input_to_device(image_tensor)
+        features = self.student(image_tensor)[-1]
+        tokens = self.projector(features)
+        if self.bottleneck is not None:
+            return self.bottleneck.encode(tokens), True
+        return tokens, False
+
     @torch.no_grad()
     def encode_pil_level(self, img, payload_level):
         """Encode a PIL image using a specific payload level such as 49x64."""
         payload_tokens, payload_dim = payload_level
         img = img.convert('RGB')
-        image_tensor = self.transform(img).unsqueeze(0).to(self.device)
+        image_tensor = self.input_to_device(self.transform(img).unsqueeze(0))
 
         feat = self.student(image_tensor)[-1]
         tokens = self.projector(feat)

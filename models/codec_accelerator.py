@@ -12,6 +12,9 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 
 from models.codec_memory import LSFAFeatureMemory, MMNetFeatureMemory
 from models.multilevel import resize_tokens, truncate_dim
@@ -44,6 +47,47 @@ class CodecWarpAccelerator:
         image = image.convert("RGB")
         normalized = self.edge.transform(image)
         return normalized, self._rgb_from_normalized(normalized)
+
+    def _edge_input(self, tensor):
+        if hasattr(self.edge, "input_to_device"):
+            return self.edge.input_to_device(tensor)
+        return tensor.to(self.device)
+
+    def _prepare_rgb(self, image, output_size=None):
+        """Apply the edge resize/crop without unnecessary normalization.
+
+        Memory-only P-frames do not run the backbone, so creating a normalized
+        224x224 tensor and immediately undoing the normalization is wasted
+        work. Keep this transform geometrically identical to EdgeEncoder.
+        """
+        image = image.convert("RGB")
+        if not isinstance(image, Image.Image):
+            _, rgb = self._prepare(image)
+            return rgb
+        image = TF.resize(
+            image,
+            self.edge.image_size,
+            interpolation=InterpolationMode.BICUBIC,
+        )
+        image = TF.center_crop(image, self.edge.image_size)
+        if output_size is not None:
+            image = TF.resize(
+                image,
+                list(output_size),
+                interpolation=InterpolationMode.BILINEAR,
+            )
+        return TF.to_tensor(image)
+
+    @staticmethod
+    def _resize_rgb_to_feature(rgb, feature_size):
+        if rgb.shape[-2:] == feature_size:
+            return rgb
+        return F.interpolate(
+            rgb[None],
+            size=feature_size,
+            mode="bilinear",
+            align_corners=False,
+        )[0]
 
     @staticmethod
     def _backward_flow(previous_rgb, current_rgb):
@@ -144,7 +188,7 @@ class CodecWarpAccelerator:
         is_i_frame = position == 0 or self.previous_feature is None
 
         if is_i_frame:
-            feature = self.edge.student(normalized[None].to(self.device))[-1]
+            feature = self.edge.student(self._edge_input(normalized[None]))[-1]
             flow_mean_pixels = None
         else:
             flow = self._backward_flow(self.previous_rgb, current_rgb)
@@ -183,6 +227,7 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
         reference_mode="recursive",
         min_coverage=0.0,
         max_p_chain=0,
+        memory_rgb_mode="exact",
     ):
         if flow_impl not in {"feature_grid", "feature_grid_center", "dense"}:
             raise ValueError(f"Unknown decoder-MV flow implementation: {flow_impl}")
@@ -196,10 +241,13 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
             raise ValueError(f"Unknown codec reference mode: {self.reference_mode}")
         self.min_coverage = float(min_coverage)
         self.max_p_chain = int(max_p_chain)
+        self.memory_rgb_mode = str(memory_rgb_mode)
         if not 0.0 <= self.min_coverage <= 1.0:
             raise ValueError(f"min_coverage must be in [0, 1], got {self.min_coverage}")
         if self.max_p_chain < 0:
             raise ValueError(f"max_p_chain must be non-negative, got {self.max_p_chain}")
+        if self.memory_rgb_mode not in {"exact", "fast"}:
+            raise ValueError(f"Unknown memory RGB mode: {self.memory_rgb_mode}")
         super().__init__(edge_encoder, gop_frames=2)
         self.reference_feature = None
         self.reference_rgb = None
@@ -252,7 +300,10 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
                 self.edge.image_size,
                 self.edge.image_size,
                 device=self.device,
+                dtype=getattr(self.edge, "compute_dtype", torch.float32),
             )
+            if getattr(self.edge, "channels_last", False):
+                dummy = dummy.contiguous(memory_format=torch.channels_last)
             feature_channels = int(self.edge.student(dummy)[-1].shape[1])
 
         checkpoint = torch.load(
@@ -297,14 +348,10 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
                 dtype=flow_feature.dtype,
             )
         feature_size = flow_feature.shape[-2:]
-        current_small = F.interpolate(
-            current_rgb[None], size=feature_size, mode="bilinear", align_corners=False
-        )
-        reference_small = F.interpolate(
-            self.reference_rgb[None], size=feature_size, mode="bilinear", align_corners=False
-        )
-        warped_rgb = self._warp_feature_grid(reference_small, flow_feature)[0]
-        return (current_small[0] - warped_rgb).clamp(-1.0, 1.0)
+        current_small = self._resize_rgb_to_feature(current_rgb, feature_size)
+        reference_small = self._resize_rgb_to_feature(self.reference_rgb, feature_size)
+        warped_rgb = self._warp_feature_grid(reference_small[None], flow_feature)[0]
+        return (current_small - warped_rgb).clamp(-1.0, 1.0)
 
     def build_feature_flow(self, motion_vectors, width, height, feature_height, feature_width):
         """Build both the warp flow and feature-resolution MMNet inputs.
@@ -539,7 +586,7 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
         return torch.from_numpy(flow), torch.from_numpy(covered)
 
     @torch.no_grad()
-    def encode_record(self, record, payload_level=None):
+    def encode_record(self, record, payload_level=None, defer_payload=False):
         started = time.perf_counter()
         frame_type = record["pict_type"]
         selected = bool(record["selected"])
@@ -556,13 +603,15 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
 
         if frame_type == "I":
             normalized, current_rgb = self._prepare(image)
-            feature = self.edge.student(normalized[None].to(self.device))[-1]
+            feature = self.edge.student(self._edge_input(normalized[None]))[-1]
             self.reference_feature = feature.detach()
             self.key_feature = feature.detach()
             self.cumulative_flow = None
             self.cumulative_covered = None
             self.p_chain_length = 0
             if self.memory is not None:
+                feature_size = feature.shape[-2:]
+                current_rgb = self._resize_rgb_to_feature(current_rgb, feature_size)
                 self.reference_rgb = current_rgb
                 self.key_rgb = current_rgb
             mode = "I"
@@ -601,7 +650,15 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
                 else:
                     warped_feature = self._warp_feature(source_feature, flow)
                 if self.memory is not None:
-                    normalized, current_rgb = self._prepare(image)
+                    output_size = (
+                        feature_flow.shape[-2:]
+                        if self.memory_rgb_mode == "fast"
+                        else None
+                    )
+                    current_rgb = self._prepare_rgb(image, output_size=output_size)
+                    current_rgb = self._resize_rgb_to_feature(
+                        current_rgb, feature_flow.shape[-2:]
+                    )
                     if self.reference_mode == "keyframe":
                         self.reference_rgb = self.key_rgb
                     residual = self._residual_proxy(current_rgb, feature_flow, feature_covered)
@@ -649,7 +706,7 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
         if needs_full:
             if normalized is None:
                 normalized, current_rgb = self._prepare(image)
-            feature = self.edge.student(normalized[None].to(self.device))[-1]
+            feature = self.edge.student(self._edge_input(normalized[None]))[-1]
             if frame_type == "P":
                 self.reference_feature = feature.detach()
                 self.key_feature = feature.detach()
@@ -657,13 +714,19 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
                 self.cumulative_covered = None
                 self.p_chain_length = 0
                 if self.memory is not None:
+                    feature_size = feature.shape[-2:]
+                    current_rgb = self._resize_rgb_to_feature(current_rgb, feature_size)
                     self.reference_rgb = current_rgb
                     self.key_rgb = current_rgb
 
         if selected:
             if feature is None:
                 raise RuntimeError(f"Selected frame {record['source_index']} produced no feature")
-            payload, is_compressed = self._project_payload(feature, payload_level)
+            if defer_payload:
+                payload = feature
+                is_compressed = False
+            else:
+                payload, is_compressed = self._project_payload(feature, payload_level)
 
         info = {
             "source_index": record["source_index"],
@@ -682,9 +745,16 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
             "reference_mode": self.reference_mode,
             "min_mv_coverage": self.min_coverage,
             "max_p_chain": self.max_p_chain,
+            "memory_rgb_mode": self.memory_rgb_mode if self.memory is not None else None,
+            "payload_deferred": bool(selected and defer_payload),
             "p_chain_length": self.p_chain_length,
             "past_mv_coverage": coverage,
             "fallback_reason": fallback_reason,
             "encode_seconds": time.perf_counter() - started,
         }
         return payload, is_compressed, info
+
+    @torch.no_grad()
+    def project_features(self, features, payload_level=None):
+        """Project a feature microbatch after temporal propagation."""
+        return self._project_payload(features, payload_level)

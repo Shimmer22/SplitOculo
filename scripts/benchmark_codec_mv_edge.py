@@ -62,6 +62,18 @@ def parse_args():
         default=0,
         help="Periodic full-CNN refresh after this many causal P frames; 0 disables.",
     )
+    parser.add_argument(
+        "--memory_rgb_mode",
+        choices=("exact", "fast"),
+        default="exact",
+        help="Exact training-time RGB resize or faster direct feature-grid resize.",
+    )
+    parser.add_argument(
+        "--projection_batch_size",
+        type=int,
+        default=1,
+        help="Microbatch projector/bottleneck after temporal feature propagation.",
+    )
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
@@ -91,6 +103,8 @@ def run_decoder_mv(
     reference_mode="recursive",
     min_coverage=0.0,
     max_p_chain=0,
+    memory_rgb_mode="exact",
+    projection_batch_size=1,
 ):
     accelerator = DecoderMotionVectorAccelerator(
         edge,
@@ -100,16 +114,34 @@ def run_decoder_mv(
         reference_mode=reference_mode,
         min_coverage=min_coverage,
         max_p_chain=max_p_chain,
+        memory_rgb_mode=memory_rgb_mode,
     )
     synchronize(device)
     started = time.perf_counter()
     payloads = []
+    deferred_features = []
     frame_info = []
     for record in records:
-        payload, _, info = accelerator.encode_record(record)
+        payload, _, info = accelerator.encode_record(
+            record,
+            defer_payload=projection_batch_size > 1,
+        )
         frame_info.append(info)
         if record["selected"]:
-            payloads.append(payload)
+            if projection_batch_size > 1:
+                deferred_features.append(payload)
+            else:
+                payloads.append(payload)
+    if projection_batch_size > 1:
+        for start in range(0, len(deferred_features), projection_batch_size):
+            feature_batch = torch.cat(
+                deferred_features[start : start + projection_batch_size], dim=0
+            )
+            payload_batch, _ = accelerator.project_features(feature_batch)
+            payloads.extend(
+                payload_batch[index : index + 1]
+                for index in range(payload_batch.shape[0])
+            )
     synchronize(device)
     return time.perf_counter() - started, payloads, frame_info
 
@@ -140,6 +172,8 @@ def payload_similarity(full_payloads, mv_payloads):
 
 def main():
     args = parse_args()
+    if args.projection_batch_size <= 0:
+        raise ValueError("--projection_batch_size must be positive")
     decode_started = time.perf_counter()
     records, native_fps, reader = read_video_records_with_mvs(
         args.video, max_frames=args.max_frames, sample_fps=args.sample_fps
@@ -160,6 +194,8 @@ def main():
             args.reference_mode,
             args.min_coverage,
             args.max_p_chain,
+            args.memory_rgb_mode,
+            args.projection_batch_size,
         )
 
     full_times = []
@@ -180,6 +216,8 @@ def main():
             args.reference_mode,
             args.min_coverage,
             args.max_p_chain,
+            args.memory_rgb_mode,
+            args.projection_batch_size,
         )
         mv_times.append(elapsed)
 
@@ -202,6 +240,8 @@ def main():
         "reference_mode": args.reference_mode,
         "min_coverage": args.min_coverage,
         "max_p_chain": args.max_p_chain,
+        "memory_rgb_mode": args.memory_rgb_mode,
+        "projection_batch_size": args.projection_batch_size,
         "decode_with_mv_seconds": decode_seconds,
         "full": stats(full_times),
         "decoder_mv": stats(mv_times),

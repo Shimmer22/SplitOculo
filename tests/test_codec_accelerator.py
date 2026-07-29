@@ -205,12 +205,19 @@ def test_mmnet_path_and_periodic_refresh_guard():
     )
 
     _, _, i_info = accelerator.encode_record(i_record)
-    _, _, p_info = accelerator.encode_record(p_record)
+    deferred, deferred_compressed, p_info = accelerator.encode_record(
+        p_record, defer_payload=True
+    )
+    projected, projected_compressed = accelerator.project_features(deferred)
     _, _, refresh_info = accelerator.encode_record(dict(p_record, source_index=2, pts=2))
 
     assert i_info["mode"] == "I"
     assert p_info["mode"] == "P_MMNET"
     assert p_info["memory_executed"]
+    assert p_info["payload_deferred"]
+    assert not deferred_compressed
+    assert not projected_compressed
+    assert torch.allclose(projected, deferred)
     assert refresh_info["mode"] == "P_FULL_FALLBACK"
     assert refresh_info["fallback_reason"] == "max_p_chain:1"
 
