@@ -47,7 +47,7 @@ make -j4
 
 Example:
 ```bash
-./edge_client ../edge_model.onnx ../test.jpg http://192.168.1.100:8080
+./edge_client ../edge_model.onnx ../test.jpg http://127.0.0.1:8080
 ```
 
 ## Structure

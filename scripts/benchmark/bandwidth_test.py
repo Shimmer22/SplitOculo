@@ -104,7 +104,7 @@ def main():
     parser = argparse.ArgumentParser(description='Bandwidth Comparison Test (Echo Server)')
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--image', type=str, required=True)
-    parser.add_argument('--server', type=str, default='http://10.29.63.170:8082')
+    parser.add_argument('--server', type=str, default='http://127.0.0.1:8082')
     parser.add_argument('--iterations', type=int, default=5)
     parser.add_argument('--device', type=str, default='cpu')
     
