@@ -1,7 +1,8 @@
-"""Warp-only I/P feature reuse for SplitOculo video inference.
+"""Codec-guided I/P feature reuse for SplitOculo video inference.
 
-This first integration uses Farneback flow estimated from decoded RGB frames as
-a codec-motion proxy. It intentionally has no learned residual correction.
+The accelerator supports the original motion-only warp path and an optional
+MMNet-style learned residual memory for decoder-MV inference. Farneback remains
+available as an RGB-only fallback backend.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from models.codec_memory import LSFAFeatureMemory, MMNetFeatureMemory
 from models.multilevel import resize_tokens, truncate_dim
 
 
@@ -172,16 +174,172 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
     reference is not available in display order; unselected B-frames are skipped.
     """
 
-    def __init__(self, edge_encoder, flow_impl="feature_grid"):
+    def __init__(
+        self,
+        edge_encoder,
+        flow_impl="feature_grid",
+        memory_checkpoint=None,
+        memory_arch="mmnet",
+        reference_mode="recursive",
+        min_coverage=0.0,
+        max_p_chain=0,
+    ):
         if flow_impl not in {"feature_grid", "feature_grid_center", "dense"}:
             raise ValueError(f"Unknown decoder-MV flow implementation: {flow_impl}")
         self.flow_impl = flow_impl
+        self.memory_checkpoint = str(memory_checkpoint) if memory_checkpoint else None
+        self.memory_arch = str(memory_arch)
+        if self.memory_arch not in {"mmnet", "lsfa"}:
+            raise ValueError(f"Unknown codec memory architecture: {self.memory_arch}")
+        self.reference_mode = str(reference_mode)
+        if self.reference_mode not in {"recursive", "keyframe"}:
+            raise ValueError(f"Unknown codec reference mode: {self.reference_mode}")
+        self.min_coverage = float(min_coverage)
+        self.max_p_chain = int(max_p_chain)
+        if not 0.0 <= self.min_coverage <= 1.0:
+            raise ValueError(f"min_coverage must be in [0, 1], got {self.min_coverage}")
+        if self.max_p_chain < 0:
+            raise ValueError(f"max_p_chain must be non-negative, got {self.max_p_chain}")
         super().__init__(edge_encoder, gop_frames=2)
         self.reference_feature = None
+        self.reference_rgb = None
+        self.key_feature = None
+        self.key_rgb = None
+        self.cumulative_flow = None
+        self.cumulative_covered = None
+        self.memory = None
+        if self.memory_checkpoint:
+            self._load_memory(self.memory_checkpoint)
 
     def reset(self):
         super().reset()
         self.reference_feature = None
+        self.reference_rgb = None
+        self.key_feature = None
+        self.key_rgb = None
+        self.cumulative_flow = None
+        self.cumulative_covered = None
+        self.p_chain_length = 0
+
+    def _keyframe_flow(self, flow_feature, feature_covered):
+        """Compose current->previous flow into current->key-frame flow.
+
+        Decoder MVs are backward flows. If ``u_t`` maps the current frame to
+        the previous reference and ``U_{t-1}`` maps that reference to the key
+        frame, the composed flow is ``u_t + warp(U_{t-1}, u_t)``. Keeping this
+        flow and warping the key feature once avoids repeated interpolation of
+        an already approximated feature map.
+        """
+        flow_feature = flow_feature.detach().cpu()
+        feature_covered = feature_covered.detach().cpu().bool()
+        if self.cumulative_flow is None:
+            return flow_feature, feature_covered
+
+        previous_flow = self._warp_feature_grid(
+            self.cumulative_flow[None], flow_feature
+        )[0]
+        previous_covered = self._warp_feature_grid(
+            self.cumulative_covered[None, None].float(), flow_feature
+        )[0, 0] > 0.5
+        return flow_feature + previous_flow, feature_covered & previous_covered
+
+    def _load_memory(self, checkpoint_path):
+        """Load the trained MMNet-style correction without changing the edge CNN."""
+        with torch.no_grad():
+            dummy = torch.zeros(
+                1,
+                3,
+                self.edge.image_size,
+                self.edge.image_size,
+                device=self.device,
+            )
+            feature_channels = int(self.edge.student(dummy)[-1].shape[1])
+
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=self.device,
+            weights_only=False,
+        )
+        checkpoint_arch = checkpoint.get("memory_arch")
+        if checkpoint_arch is None:
+            checkpoint_arch = checkpoint.get("args", {}).get("memory_arch")
+        if checkpoint_arch is not None:
+            checkpoint_arch = str(checkpoint_arch)
+            if checkpoint_arch not in {"mmnet", "lsfa"}:
+                raise ValueError(f"Unknown memory architecture in checkpoint: {checkpoint_arch}")
+            self.memory_arch = checkpoint_arch
+        state_dict = checkpoint.get(
+            "memory_state_dict",
+            checkpoint.get("model_state_dict", checkpoint),
+        )
+        saved_channels = checkpoint.get("feature_channels")
+        if saved_channels is not None and int(saved_channels) != feature_channels:
+            raise ValueError(
+                f"MMNet memory expects {saved_channels} feature channels, "
+                f"but edge CNN produces {feature_channels}"
+            )
+        memory_type = LSFAFeatureMemory if self.memory_arch == "lsfa" else MMNetFeatureMemory
+        self.memory = memory_type(feature_channels=feature_channels).to(self.device)
+        self.memory.load_state_dict(state_dict)
+        self.memory.eval()
+
+    def _residual_proxy(self, current_rgb, flow_feature, covered):
+        """Estimate appearance residual from decoded RGB and MV prediction.
+
+        PyAV exposes decoder motion vectors but not a portable tensor of the
+        inverse-transformed codec residual.  The decoded-frame difference is a
+        useful MMNet-compatible proxy and includes both residual energy and MV
+        mismatch/occlusion cues.
+        """
+        if self.reference_rgb is None:
+            return torch.zeros(
+                (3, flow_feature.shape[-2], flow_feature.shape[-1]),
+                dtype=flow_feature.dtype,
+            )
+        feature_size = flow_feature.shape[-2:]
+        current_small = F.interpolate(
+            current_rgb[None], size=feature_size, mode="bilinear", align_corners=False
+        )
+        reference_small = F.interpolate(
+            self.reference_rgb[None], size=feature_size, mode="bilinear", align_corners=False
+        )
+        warped_rgb = self._warp_feature_grid(reference_small, flow_feature)[0]
+        return (current_small[0] - warped_rgb).clamp(-1.0, 1.0)
+
+    def build_feature_flow(self, motion_vectors, width, height, feature_height, feature_width):
+        """Build both the warp flow and feature-resolution MMNet inputs.
+
+        Returns ``(warp_flow, warp_covered, feature_flow, feature_covered)``.
+        The first pair is expressed in the units expected by the selected warp
+        implementation; the second pair is always expressed at the CNN grid.
+        """
+        if self.flow_impl in {"feature_grid", "feature_grid_center"}:
+            flow_builder = (
+                self._feature_grid_flow
+                if self.flow_impl == "feature_grid"
+                else self._feature_grid_center_flow
+            )
+            flow, covered = flow_builder(
+                motion_vectors, width, height, feature_height, feature_width
+            )
+            return flow, covered, flow, covered
+
+        flow, covered = self._dense_original_flow(motion_vectors, width, height)
+        flow, covered = self._flow_to_model_crop(flow, covered, width, height)
+        feature_flow = F.interpolate(
+            flow[None],
+            size=(feature_height, feature_width),
+            mode="bilinear",
+            align_corners=False,
+        )[0]
+        feature_flow[0] *= feature_width / max(flow.shape[-1], 1)
+        feature_flow[1] *= feature_height / max(flow.shape[-2], 1)
+        feature_covered = F.interpolate(
+            covered[None, None].float(),
+            size=(feature_height, feature_width),
+            mode="nearest",
+        )[0, 0].bool()
+        return flow, covered, feature_flow, feature_covered
 
     @staticmethod
     def _dense_original_flow(motion_vectors, width, height):
@@ -393,34 +551,87 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
         fallback_reason = None
         coverage = None
         mv_count = int(len(record["motion_vectors"])) if record["motion_vectors"] is not None else 0
+        current_rgb = None
+        mode = None
 
         if frame_type == "I":
-            normalized, _ = self._prepare(image)
+            normalized, current_rgb = self._prepare(image)
             feature = self.edge.student(normalized[None].to(self.device))[-1]
             self.reference_feature = feature.detach()
+            self.key_feature = feature.detach()
+            self.cumulative_flow = None
+            self.cumulative_covered = None
+            self.p_chain_length = 0
+            if self.memory is not None:
+                self.reference_rgb = current_rgb
+                self.key_rgb = current_rgb
             mode = "I"
         elif frame_type == "P" and self.reference_feature is not None and mv_count > 0:
-            width, height = image.size
-            if self.flow_impl in {"feature_grid", "feature_grid_center"}:
-                feature_height, feature_width = self.reference_feature.shape[-2:]
-                flow_builder = (
-                    self._feature_grid_flow
-                    if self.flow_impl == "feature_grid"
-                    else self._feature_grid_center_flow
-                )
-                flow, covered = flow_builder(
-                    record["motion_vectors"], width, height, feature_height, feature_width)
+            if self.max_p_chain > 0 and self.p_chain_length >= self.max_p_chain:
+                fallback_reason = f"max_p_chain:{self.max_p_chain}"
+                mode = "P_FULL_FALLBACK"
             else:
-                flow, covered = self._dense_original_flow(record["motion_vectors"], width, height)
-                flow, covered = self._flow_to_model_crop(flow, covered, width, height)
-            coverage = float(covered.float().mean())
-            if covered.any():
-                if self.flow_impl in {"feature_grid", "feature_grid_center"}:
-                    feature = self._warp_feature_grid(self.reference_feature, flow)
+                width, height = image.size
+                feature_height, feature_width = self.reference_feature.shape[-2:]
+                flow, covered, feature_flow, feature_covered = self.build_feature_flow(
+                    record["motion_vectors"], width, height, feature_height, feature_width
+                )
+                if self.reference_mode == "keyframe":
+                    feature_flow, feature_covered = self._keyframe_flow(
+                        feature_flow, feature_covered
+                    )
+                    flow, covered = feature_flow, feature_covered
+                coverage = float(covered.float().mean())
+            if mode == "P_FULL_FALLBACK":
+                pass
+            elif self.min_coverage > 0.0 and coverage < self.min_coverage:
+                fallback_reason = f"low_mv_coverage:{coverage:.4f}"
+                mode = "P_FULL_FALLBACK"
+            elif covered.any():
+                source_feature = (
+                    self.key_feature
+                    if self.reference_mode == "keyframe"
+                    else self.reference_feature
+                )
+                if self.reference_mode == "keyframe" or self.flow_impl in {
+                    "feature_grid",
+                    "feature_grid_center",
+                }:
+                    warped_feature = self._warp_feature_grid(source_feature, flow)
                 else:
-                    feature = self._warp_feature(self.reference_feature, flow)
+                    warped_feature = self._warp_feature(source_feature, flow)
+                if self.memory is not None:
+                    normalized, current_rgb = self._prepare(image)
+                    if self.reference_mode == "keyframe":
+                        self.reference_rgb = self.key_rgb
+                    residual = self._residual_proxy(current_rgb, feature_flow, feature_covered)
+                    if self.memory_arch == "lsfa":
+                        feature = self.memory(
+                            warped_feature,
+                            residual[None],
+                            current_rgb[None],
+                            feature_flow[None],
+                            feature_covered[None, None].float(),
+                        )
+                        mode = "P_LSFA"
+                    else:
+                        feature = self.memory(
+                            warped_feature,
+                            residual[None],
+                            feature_flow[None],
+                            feature_covered[None, None].float(),
+                        )
+                        mode = "P_MMNET"
+                else:
+                    feature = warped_feature
+                    mode = "P_MV"
                 self.reference_feature = feature.detach()
-                mode = "P_MV"
+                if self.reference_mode == "keyframe":
+                    self.cumulative_flow = feature_flow.detach().cpu()
+                    self.cumulative_covered = feature_covered.detach().cpu()
+                self.p_chain_length += 1
+                if self.memory is not None and self.reference_mode == "recursive":
+                    self.reference_rgb = current_rgb
             else:
                 fallback_reason = "no_past_reference_blocks"
                 mode = "P_FULL_FALLBACK"
@@ -437,10 +648,17 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
         needs_full = mode in {"P_FULL_FALLBACK", "B_FULL_FALLBACK", "OTHER_FULL_FALLBACK"}
         if needs_full:
             if normalized is None:
-                normalized, _ = self._prepare(image)
+                normalized, current_rgb = self._prepare(image)
             feature = self.edge.student(normalized[None].to(self.device))[-1]
             if frame_type == "P":
                 self.reference_feature = feature.detach()
+                self.key_feature = feature.detach()
+                self.cumulative_flow = None
+                self.cumulative_covered = None
+                self.p_chain_length = 0
+                if self.memory is not None:
+                    self.reference_rgb = current_rgb
+                    self.key_rgb = current_rgb
 
         if selected:
             if feature is None:
@@ -455,9 +673,16 @@ class DecoderMotionVectorAccelerator(CodecWarpAccelerator):
             "selected": selected,
             "mode": mode,
             "cnn_executed": mode in {"I", "P_FULL_FALLBACK", "B_FULL_FALLBACK", "OTHER_FULL_FALLBACK"},
-            "warp_executed": mode == "P_MV",
+            "warp_executed": mode in {"P_MV", "P_MMNET", "P_LSFA"},
             "motion_vector_count": mv_count,
             "flow_impl": self.flow_impl,
+            "memory_checkpoint": self.memory_checkpoint,
+            "memory_executed": mode in {"P_MMNET", "P_LSFA"},
+            "memory_arch": self.memory_arch if self.memory is not None else None,
+            "reference_mode": self.reference_mode,
+            "min_mv_coverage": self.min_coverage,
+            "max_p_chain": self.max_p_chain,
+            "p_chain_length": self.p_chain_length,
             "past_mv_coverage": coverage,
             "fallback_reason": fallback_reason,
             "encode_seconds": time.perf_counter() - started,

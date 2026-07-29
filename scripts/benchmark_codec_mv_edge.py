@@ -1,4 +1,4 @@
-"""Benchmark full sampled-frame CNN encoding against decoder-MV feature warp."""
+"""Benchmark full CNN, decoder-MV warp, and optional MMNet memory paths."""
 
 from __future__ import annotations
 
@@ -33,6 +33,35 @@ def parse_args():
         default="feature_grid",
         help="Decoder-MV flow construction path; dense is the legacy comparison path.",
     )
+    parser.add_argument(
+        "--memory_checkpoint",
+        default=None,
+        help="Optional MMNet-style memory checkpoint for the decoder-MV path.",
+    )
+    parser.add_argument(
+        "--memory_arch",
+        choices=("mmnet", "lsfa"),
+        default="mmnet",
+        help="Memory architecture when the checkpoint has no embedded metadata.",
+    )
+    parser.add_argument(
+        "--reference_mode",
+        choices=("recursive", "keyframe"),
+        default="recursive",
+        help="Use recursive predicted features or key-frame features with composed MVs.",
+    )
+    parser.add_argument(
+        "--min_coverage",
+        type=float,
+        default=0.0,
+        help="Full-CNN fallback threshold for past-reference MV coverage.",
+    )
+    parser.add_argument(
+        "--max_p_chain",
+        type=int,
+        default=0,
+        help="Periodic full-CNN refresh after this many causal P frames; 0 disables.",
+    )
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
@@ -52,8 +81,26 @@ def run_full(edge, selected_images, device):
 
 
 @torch.no_grad()
-def run_decoder_mv(edge, records, device, flow_impl):
-    accelerator = DecoderMotionVectorAccelerator(edge, flow_impl=flow_impl)
+def run_decoder_mv(
+    edge,
+    records,
+    device,
+    flow_impl,
+    memory_checkpoint=None,
+    memory_arch="mmnet",
+    reference_mode="recursive",
+    min_coverage=0.0,
+    max_p_chain=0,
+):
+    accelerator = DecoderMotionVectorAccelerator(
+        edge,
+        flow_impl=flow_impl,
+        memory_checkpoint=memory_checkpoint,
+        memory_arch=memory_arch,
+        reference_mode=reference_mode,
+        min_coverage=min_coverage,
+        max_p_chain=max_p_chain,
+    )
     synchronize(device)
     started = time.perf_counter()
     payloads = []
@@ -103,7 +150,17 @@ def main():
 
     for _ in range(args.warmup_rounds):
         run_full(edge, selected_images, args.device)
-        run_decoder_mv(edge, records, args.device, args.flow_impl)
+        run_decoder_mv(
+            edge,
+            records,
+            args.device,
+            args.flow_impl,
+            args.memory_checkpoint,
+            args.memory_arch,
+            args.reference_mode,
+            args.min_coverage,
+            args.max_p_chain,
+        )
 
     full_times = []
     mv_times = []
@@ -114,7 +171,15 @@ def main():
         elapsed, full_payloads = run_full(edge, selected_images, args.device)
         full_times.append(elapsed)
         elapsed, mv_payloads, final_info = run_decoder_mv(
-            edge, records, args.device, args.flow_impl
+            edge,
+            records,
+            args.device,
+            args.flow_impl,
+            args.memory_checkpoint,
+            args.memory_arch,
+            args.reference_mode,
+            args.min_coverage,
+            args.max_p_chain,
         )
         mv_times.append(elapsed)
 
@@ -132,6 +197,11 @@ def main():
         "rounds": args.rounds,
         "device": args.device,
         "flow_impl": args.flow_impl,
+        "memory_checkpoint": args.memory_checkpoint,
+        "memory_arch": args.memory_arch,
+        "reference_mode": args.reference_mode,
+        "min_coverage": args.min_coverage,
+        "max_p_chain": args.max_p_chain,
         "decode_with_mv_seconds": decode_seconds,
         "full": stats(full_times),
         "decoder_mv": stats(mv_times),
@@ -150,6 +220,7 @@ def main():
             "feature_grid analytically preserves the legacy two-stage bilinear sampling semantics.",
             "feature_grid_center is the faster approximate one-MV-per-cell implementation.",
             "dense is the legacy full-resolution Python rasterization comparison path.",
+            "memory uses decoded-RGB minus MV-warped RGB as a portable residual proxy.",
         ],
     }
     print(json.dumps(result, indent=2, ensure_ascii=False))

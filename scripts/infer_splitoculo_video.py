@@ -1,8 +1,10 @@
-"""SplitOculo video inference with optional warp-only edge acceleration.
+"""SplitOculo video inference with optional codec-guided edge acceleration.
 
 By default every sampled frame is encoded independently. With ``--codec_acc``,
 each GOP I-frame runs the edge CNN and P-frames recursively warp the preceding
-predicted CNN feature before the normal projector/bottleneck/cloud path.
+predicted CNN feature before the normal projector/bottleneck/cloud path.  A
+trained ``--codec_memory_checkpoint`` enables an MMNet-style residual update
+after the motion warp.
 """
 
 import argparse
@@ -34,7 +36,7 @@ def main():
     parser.add_argument("--level", type=str, default=None,
                         help="Optional multi-level payload, e.g. 49x64, 49x128, 196x64, 196x128")
     parser.add_argument("--codec_acc", action="store_true",
-                        help="Use warp-only I/P CNN feature reuse on the edge")
+                        help="Use codec-guided I/P CNN feature reuse on the edge")
     parser.add_argument("--codec_mv_backend", choices=["decoder", "farneback"], default="decoder",
                         help="Motion source for --codec_acc (default: real decoder MVs)")
     parser.add_argument(
@@ -45,6 +47,36 @@ def main():
     )
     parser.add_argument("--codec_gop_frames", type=int, default=4,
                         help="Synthetic sampled-frame GOP for the Farneback backend only")
+    parser.add_argument(
+        "--codec_memory_checkpoint",
+        type=str,
+        default=None,
+        help="MMNet-style feature memory checkpoint trained on real codec sequences",
+    )
+    parser.add_argument(
+        "--codec_memory_arch",
+        choices=["mmnet", "lsfa"],
+        default="mmnet",
+        help="Memory architecture when the checkpoint has no embedded architecture metadata",
+    )
+    parser.add_argument(
+        "--codec_reference_mode",
+        choices=["recursive", "keyframe"],
+        default="recursive",
+        help="Use recursive predicted features or key-frame features with composed MVs",
+    )
+    parser.add_argument(
+        "--codec_mv_min_coverage",
+        type=float,
+        default=0.0,
+        help="Fallback to full CNN when past-reference MV coverage is below this value",
+    )
+    parser.add_argument(
+        "--codec_max_p_chain",
+        type=int,
+        default=0,
+        help="Optional periodic full-CNN refresh after this many causal P-frames (0 disables)",
+    )
     parser.add_argument("--qwen_path", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
     parser.add_argument("--split_layer", type=int, default=4)
     parser.add_argument("--max_new_tokens", type=int, default=128)
@@ -54,6 +86,11 @@ def main():
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+
+    if args.codec_memory_checkpoint and not (
+        args.codec_acc and args.codec_mv_backend == "decoder"
+    ):
+        parser.error("--codec_memory_checkpoint requires --codec_acc with --codec_mv_backend decoder")
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -92,7 +129,15 @@ def main():
         else None
     )
     decoder_accelerator = (
-        DecoderMotionVectorAccelerator(edge, flow_impl=args.codec_flow_impl)
+        DecoderMotionVectorAccelerator(
+            edge,
+            flow_impl=args.codec_flow_impl,
+            memory_checkpoint=args.codec_memory_checkpoint,
+            memory_arch=args.codec_memory_arch,
+            reference_mode=args.codec_reference_mode,
+            min_coverage=args.codec_mv_min_coverage,
+            max_p_chain=args.codec_max_p_chain,
+        )
         if args.codec_acc and args.codec_mv_backend == "decoder"
         else None
     )
@@ -156,6 +201,16 @@ def main():
                 "codec_mv_backend": args.codec_mv_backend if args.codec_acc else None,
                 "codec_flow_impl": args.codec_flow_impl
                 if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+                "codec_memory_checkpoint": args.codec_memory_checkpoint
+                if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+                "codec_memory_arch": args.codec_memory_arch
+                if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+                "codec_reference_mode": args.codec_reference_mode
+                if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+                "codec_mv_min_coverage": args.codec_mv_min_coverage
+                if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+                "codec_max_p_chain": args.codec_max_p_chain
+                if args.codec_acc and args.codec_mv_backend == "decoder" else None,
             },
             payload_path,
         )
@@ -208,7 +263,24 @@ def main():
         "codec_mv_backend": args.codec_mv_backend if args.codec_acc else None,
         "codec_flow_impl": args.codec_flow_impl
         if args.codec_acc and args.codec_mv_backend == "decoder" else None,
-        "codec_mode": f"{args.codec_mv_backend}_warp_only" if args.codec_acc else None,
+        "codec_memory_checkpoint": args.codec_memory_checkpoint
+        if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+        "codec_memory_arch": args.codec_memory_arch
+        if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+        "codec_reference_mode": args.codec_reference_mode
+        if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+        "codec_mv_min_coverage": args.codec_mv_min_coverage
+        if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+        "codec_max_p_chain": args.codec_max_p_chain
+        if args.codec_acc and args.codec_mv_backend == "decoder" else None,
+        "codec_mode": (
+            f"{args.codec_mv_backend}_{args.codec_memory_arch}_residual"
+            if args.codec_acc
+            and args.codec_mv_backend == "decoder"
+            and args.codec_memory_checkpoint
+            else f"{args.codec_mv_backend}_warp_only"
+            if args.codec_acc else None
+        ),
         "codec_frame_records": codec_frame_records,
         "codec_source_frames_processed": len(codec_frame_records) if args.codec_acc else len(frames),
         "decoder_mv_reference_policy": (
@@ -262,6 +334,11 @@ def main():
             f"- Frames: `{len(frames)}`",
             f"- Codec acceleration: `{args.codec_acc}`",
             f"- Codec MV backend: `{args.codec_mv_backend if args.codec_acc else None}`",
+            f"- Codec memory: `{args.codec_memory_checkpoint}`",
+            f"- Codec memory architecture: `{args.codec_memory_arch}`",
+            f"- Codec reference mode: `{args.codec_reference_mode}`",
+            f"- MV coverage threshold: `{args.codec_mv_min_coverage}`",
+            f"- Max causal P chain: `{args.codec_max_p_chain}`",
             f"- Codec GOP frames: `{metadata['codec_gop_frames']}`",
             f"- Edge CNN / warp frames: `{metadata['edge_cnn_frames']} / {metadata['edge_warp_frames']}`",
             f"- Device: `{args.device}`",
