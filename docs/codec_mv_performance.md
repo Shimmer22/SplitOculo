@@ -46,19 +46,44 @@ Sparse and real-B-frame numbers must be rerun for the equivalent path before
 being used as headline results. The earlier center-grid measurements showed
 that selected B-frame full-CNN fallback remains a separate limitation.
 
-## Quality limitation
+## Quality evaluation
 
-For the aligned BabyCrawling clip and prompt `What is the main action?`:
+The earlier headline numbers came from one unusually difficult, locally
+transcoded BabyCrawling clip. That clip remains useful as a stress test, but it
+is not the default regression sample.
 
-- Full frame encoding: `baby crawling`
-- Decoder-MV warp only: `sleeping`
+The replacement single-video sample is selected reproducibly from the sorted
+75-video UCF101 test manifest with Python `random.Random(20260729).choice(...)`:
 
-Payload similarity also decays under long recursive warp: cosine similarity to
-full CNN is about 0.55 for four aligned frames and 0.38 over 25 I/P frames.
-Decoder MVs describe prediction geometry, but they do not contain decoded
-residual information. A confidence refresh policy or learned residual
-correction remains necessary before treating this as a quality-preserving
-acceleration method.
+`BasketballDunk/v_BasketballDunk_g14_c06.avi`
+
+The standard single-video protocol uses the first 16 selected frames,
+`sample_fps=30`, recursive references, and no periodic CNN refresh. Cosine is
+measured against the full-CNN payload on exactly the same decoded frames.
+
+| Method | First P cosine | Mean P cosine | Last P cosine |
+| --- | ---: | ---: | ---: |
+| Decoder-MV warp only | 0.9772 | 0.8256 | 0.7434 |
+| LSFA, 200 videos / 20 epochs | 0.9773 | 0.8472 | 0.7823 |
+| LSFA, 300 videos / 35 epochs | 0.9771 | 0.8475 | 0.7825 |
+
+This fixed random sample is the smoke/regression reporting point. It must not
+replace the full held-out statistic in quality claims. Across all 75 held-out
+videos (1,200 selected frames), the strict no-refresh P-frame results are:
+
+| Method | Per-video first P mean | Global P mean | Per-video last P mean |
+| --- | ---: | ---: | ---: |
+| Decoder-MV warp only | 0.9469 | 0.8335 | 0.8036 |
+| LSFA, 200 videos / 20 epochs | 0.9512 | 0.8645 | 0.8442 |
+| LSFA, 300 videos / 35 epochs | 0.9516 | 0.8664 | 0.8466 |
+
+The expanded training run improves every held-out action class, but the global
+gain over the 20-epoch model is only 0.0019 P-frame cosine. Training quantity
+is therefore no longer the main limitation. Decoder MVs describe prediction
+geometry but do not contain native codec residuals, while the portable PyAV
+implementation uses a decoded-RGB residual proxy. Long sampled-frame chains
+and non-rigid motion remain difficult. `--codec_mv_min_coverage` and
+`--codec_max_p_chain` provide conservative full-CNN refresh guards.
 
 ## Decision
 
@@ -71,14 +96,25 @@ prevent enabling acceleration by default.
 ## Reproduction
 
 ```powershell
-python scripts\benchmark_codec_mv_edge.py `
-  --video video_2fps_ip.mp4 `
-  --edge_checkpoint checkpoints\...\edge_weights.pth `
-  --sample_fps 2 `
-  --max_frames 4 `
+E:\anaconda\envs\cnn_vit\python.exe scripts\evaluate_codec_manifest.py `
+  --video_manifest outputs\codec_memory_ucf101\ucf101_test_75.manifest.txt `
+  --edge_checkpoint checkpoints\cc3m10k_multilevel_layer4\split_gan_best\edge_weights.pth `
+  --memory_checkpoint `
+    outputs\codec_memory_ucf101\lsfa_ucf101_200_e20_payloadcos.pth `
+    outputs\codec_memory_ucf101\lsfa_ucf101_300_e35_payloadcos.pth `
+  --memory_arch lsfa `
+  --reference_mode recursive `
+  --sample_fps 30 `
+  --max_frames 16 `
+  --max_p_chain 0 `
   --device cuda `
-  --flow_impl feature_grid
+  --output outputs\codec_memory_ucf101\evaluation_test75_e20_vs_e35_norefresh.json
 ```
 
-Use `--flow_impl dense` for legacy rasterization or
-`--flow_impl feature_grid_center` for the maximum-speed approximate path.
+Add `--random_sample_seed 20260729` to run only the fixed BasketballDunk
+smoke/regression sample and write it to a separate output JSON. Omit the option,
+as above, for the authoritative 75-video aggregate.
+
+Set `--max_p_chain 4` for the guarded deployment candidate. The strict
+no-refresh protocol above is retained because it isolates memory quality from
+periodic full-CNN recomputation.

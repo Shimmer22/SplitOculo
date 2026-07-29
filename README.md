@@ -245,11 +245,117 @@ reference feature on either CPU or CUDA. Selected B-frames safely fall back to
 the full CNN because their future reference is unavailable in display order.
 The current one-reference state assumes normal IP or non-reference-B streams;
 re-encode with `-bf 0` for the cleanest first deployment test. A learned
-residual correction is not applied yet.
+residual correction can be enabled after training the MMNet-style memory below.
+
+### MMNet-style residual correction
+
+The codec accelerator now supports a lightweight memory module inspired by
+MMNet: decoder MVs align the previous CNN feature, while a decoded-RGB residual
+proxy corrects new appearance information. The correction is intentionally not
+randomly enabled; train it on real compressed video sequences first:
+
+```powershell
+python scripts/train_codec_memory.py `
+  --edge_checkpoint checkpoints/gan_bottleneck/split/edge_weights.pth `
+  --video outputs/codec_mv_ip_only/babycrawling_ip.mp4 `
+  --output checkpoints/codec_memory/mmnet_best.pth `
+  --epochs 10 `
+  --max_videos 200
+```
+
+Use multiple `--video` paths from the same codec family and deployment camera
+distribution, or pass a newline-delimited `--video_manifest`. The trainer
+freezes the existing edge CNN and learns a small
+gated residual memory against the full-CNN feature of each P-frame. It uses
+`decoded_current - MV_warp(decoded_reference)` as a portable residual proxy.
+
+For a small public smoke dataset, the Hugging Face `sayakpaul/ucf101-subset`
+contains 10 action classes and can be downloaded without Ego4D credentials.
+Use a balanced manifest of at most 200 training videos. The cache avoids
+re-decoding and re-running the frozen teacher CNN on every epoch:
+
+```powershell
+python scripts/train_codec_memory.py `
+  --edge_checkpoint checkpoints/cc3m10k_multilevel_layer4/split_gan_best/edge_weights.pth `
+  --video_manifest E:/datasets/ucf101_subset/ucf101_train_200.manifest.txt `
+  --max_videos 200 `
+  --max_frames 16 `
+  --sample_fps 30 `
+  --cache_dir outputs/codec_cache_ucf101_200 `
+  --target_batch_size 32 `
+  --epochs 3 `
+  --output outputs/codec_memory_ucf101/mmnet_ucf101_200.pth `
+  --device cuda
+```
+
+The UCF101 model is a codec-memory pretraining checkpoint, not an egocentric
+deployment result; validate again on first-person videos before enabling it.
+After training, enable it with a coverage guard:
+
+```powershell
+python scripts/infer_splitoculo_video.py `
+  --video ./test.mp4 `
+  --edge_checkpoint checkpoints/gan_bottleneck/split/edge_weights.pth `
+  --cloud_checkpoint checkpoints/gan_bottleneck/split/cloud_weights.pth `
+  --sample_fps 2 `
+  --max_frames 8 `
+  --codec_acc `
+  --codec_memory_checkpoint checkpoints/codec_memory/mmnet_best.pth `
+  --codec_mv_min_coverage 0.98 `
+  --codec_max_p_chain 8 `
+  --offline
+```
+
+Without `--codec_memory_checkpoint`, the path remains the original warp-only
+baseline. Metadata distinguishes `P_MV`, `P_MMNET`, and `P_FULL_FALLBACK` frames.
+`--codec_max_p_chain` adds a periodic full-CNN refresh guard for long recursive
+P chains; zero disables it.
+
+The default trainer architecture is now `lsfa`, which adds a learned residual
+projection and a compact current-RGB branch on top of MV-warped features. To
+train and run this branch explicitly:
+
+```powershell
+python scripts/train_codec_memory.py `
+  --video_manifest E:/datasets/ucf101_subset/ucf101_train_200.manifest.txt `
+  --edge_checkpoint checkpoints/cc3m10k_multilevel_layer4/split_gan_best/edge_weights.pth `
+  --memory_arch lsfa `
+  --max_videos 200 `
+  --output outputs/codec_memory_ucf101/lsfa_ucf101_200.pth
+
+python scripts/infer_splitoculo_video.py `
+  --video ./test.mp4 `
+  --edge_checkpoint checkpoints/cc3m10k_multilevel_layer4/split_gan_best/edge_weights.pth `
+  --cloud_checkpoint checkpoints/cc3m10k_multilevel_layer4/split_gan_best/cloud_weights.pth `
+  --codec_acc --codec_mv_backend decoder `
+  --codec_memory_checkpoint outputs/codec_memory_ucf101/lsfa_ucf101_200.pth `
+  --codec_memory_arch lsfa `
+  --offline
+```
+
+`lsfa` is LSFA-inspired rather than a byte-for-byte reproduction: the current
+PyAV path exposes decoded RGB and motion vectors, but not the native codec
+residual tensor. The implementation therefore uses decoded-RGB appearance
+correction at the edge feature grid and records `P_LSFA` in frame metadata.
 
 `--codec_flow_impl feature_grid` is the default numerically equivalent optimized
 path. Use `feature_grid_center` only for the faster approximate mapping, or
 `dense` to reproduce the legacy full-resolution flow pipeline.
+
+For per-frame recursive drift, run the chain benchmark:
+
+```powershell
+python scripts/benchmark_codec_chain.py `
+  --video ./test.mp4 `
+  --edge_checkpoint checkpoints/cc3m10k_multilevel_layer4/split_gan_best/edge_weights.pth `
+  --memory_checkpoint outputs/codec_memory_ucf101/mmnet_ucf101_200.pth `
+  --sample_fps 15 `
+  --max_frames 25 `
+  --output outputs/codec_memory_ucf101/chain.json
+```
+
+It reports first/last/minimum cosine, per-frame MSE, P-chain length, B-frame
+fallbacks, and the exact `P_MV`/`P_MMNET` modes.
 
 The earlier RGB/Farneback proxy remains available explicitly:
 

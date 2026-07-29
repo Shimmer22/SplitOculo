@@ -48,6 +48,7 @@ checkpoints/
 
 # Results and outputs
 results/
+outputs/
 logs/
 *.log
 wandb/
