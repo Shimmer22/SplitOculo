@@ -12,6 +12,10 @@ API:
     POST /infer
         Request: {"features": base64, "scale": float, "zero_point": float, "prompt": str}
         Response: {"response": str, "latency_ms": float}
+
+    POST /infer_qwen
+        Request: {"frames": [base64 JPEG, ...], "prompt": str}
+        Response: native full-Qwen video inference and timing metrics
     
     GET /health
         Response: {"status": "ok", "model_loaded": bool}
@@ -20,6 +24,7 @@ import argparse
 import sys
 from pathlib import Path
 import base64
+from io import BytesIO
 import time
 import json
 import threading
@@ -29,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import torch
 import torch.nn.functional as F
 import numpy as np
+from PIL import Image
 from flask import Flask, request, jsonify
 from transformers import TextIteratorStreamer
 
@@ -108,12 +114,22 @@ class CloudInferenceEngine:
         
         self.upsampler.load_state_dict(ckpt['upsampler_state_dict'])
         self.upsampler.eval()
+        self.cloud_compute_dtype = (
+            torch.bfloat16 if str(device).startswith("cuda") else torch.float32
+        )
+        self.upsampler.to(dtype=self.cloud_compute_dtype)
+        if self.bottleneck is not None:
+            self.bottleneck.to(dtype=self.cloud_compute_dtype)
         
         print("Cloud components loaded")
         
         # Qwen (延迟加载)
         self.qwen_model = None
         self.processor = None
+
+    def _synchronize(self):
+        if str(self.device).startswith("cuda"):
+            torch.cuda.synchronize()
     
     def load_qwen(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct", local_only=False):
         """加载 Qwen 模型"""
@@ -141,6 +157,8 @@ class CloudInferenceEngine:
             trust_remote_code=True,
             local_files_only=local_only,
             use_fast=True,
+            min_pixels=224 * 224,
+            max_pixels=224 * 224,
         )
         
         for param in self.qwen_model.parameters():
@@ -149,7 +167,15 @@ class CloudInferenceEngine:
         
         print("Qwen loaded")
     
-    def decode_features(self, features_b64: str, scale: float, zero_point: float, payload_tokens=None, payload_dim=None):
+    def decode_features(
+        self,
+        features_b64: str,
+        scale: float,
+        zero_point: float,
+        payload_tokens=None,
+        payload_dim=None,
+        feature_shape=None,
+    ):
         """
         反序列化并反量化特征
         
@@ -170,7 +196,14 @@ class CloudInferenceEngine:
         # 确定形状
         expected_tokens = int(payload_tokens or self.transmission_tokens)
         expected_dim = int(payload_dim or (self.bottleneck_dim if self.bottleneck else self.hidden_size))
-        features_int8 = features_int8.reshape(1, expected_tokens, expected_dim)
+        if feature_shape:
+            shape = tuple(int(value) for value in feature_shape)
+            if len(shape) != 3 or shape[1] <= 0 or shape[2] <= 0:
+                raise ValueError(f"Invalid feature_shape: {feature_shape}")
+            expected_tokens, expected_dim = shape[1], shape[2]
+            features_int8 = features_int8.reshape(shape)
+        else:
+            features_int8 = features_int8.reshape(1, expected_tokens, expected_dim)
         
         # 转为 tensor 并反量化
         features = torch.from_numpy(features_int8.astype(np.float32)).to(self.device)
@@ -179,6 +212,10 @@ class CloudInferenceEngine:
         return features
 
     def decode_payload_to_edge_tokens(self, compressed_features):
+        compressed_features = compressed_features.to(
+            device=self.device,
+            dtype=self.cloud_compute_dtype,
+        )
         if self.bottleneck is not None:
             compressed_features = pad_dim(compressed_features, self.bottleneck_dim)
             edge_tokens = self.bottleneck.decode(compressed_features)
@@ -327,6 +364,10 @@ class CloudInferenceEngine:
     @torch.no_grad()
     def reconstruct_tokens(self, compressed_features):
         """Decode edge features and upsample them to split-layer visual tokens."""
+        compressed_features = compressed_features.to(
+            device=self.device,
+            dtype=self.cloud_compute_dtype,
+        )
         if self.bottleneck is not None:
             edge_tokens = self.bottleneck.decode(compressed_features)
         else:
@@ -336,19 +377,34 @@ class CloudInferenceEngine:
 
         if self.split_layer == 4:
             target_std, target_mean = 0.847, -0.022
-            current_std = upsampled.std()
-            if current_std > 0:
-                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+            current_mean = upsampled.float().mean(dim=(1, 2), keepdim=True)
+            current_std = upsampled.float().std(dim=(1, 2), keepdim=True)
+            upsampled = (
+                (upsampled - current_mean.to(upsampled.dtype))
+                / current_std.clamp_min(1e-6).to(upsampled.dtype)
+                * target_std
+                + target_mean
+            )
         elif self.split_layer == 8:
             target_std, target_mean = 1.066, -0.021
-            current_std = upsampled.std()
-            if current_std > 0:
-                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+            current_mean = upsampled.float().mean(dim=(1, 2), keepdim=True)
+            current_std = upsampled.float().std(dim=(1, 2), keepdim=True)
+            upsampled = (
+                (upsampled - current_mean.to(upsampled.dtype))
+                / current_std.clamp_min(1e-6).to(upsampled.dtype)
+                * target_std
+                + target_mean
+            )
         elif self.split_layer == 0:
             target_std, target_mean = 0.362, -0.0001
-            current_std = upsampled.std()
-            if current_std > 0:
-                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+            current_mean = upsampled.float().mean(dim=(1, 2), keepdim=True)
+            current_std = upsampled.float().std(dim=(1, 2), keepdim=True)
+            upsampled = (
+                (upsampled - current_mean.to(upsampled.dtype))
+                / current_std.clamp_min(1e-6).to(upsampled.dtype)
+                * target_std
+                + target_mean
+            )
 
         return upsampled
 
@@ -360,19 +416,34 @@ class CloudInferenceEngine:
 
         if self.split_layer == 4:
             target_std, target_mean = 0.847, -0.022
-            current_std = upsampled.std()
-            if current_std > 0:
-                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+            current_mean = upsampled.float().mean(dim=(1, 2), keepdim=True)
+            current_std = upsampled.float().std(dim=(1, 2), keepdim=True)
+            upsampled = (
+                (upsampled - current_mean.to(upsampled.dtype))
+                / current_std.clamp_min(1e-6).to(upsampled.dtype)
+                * target_std
+                + target_mean
+            )
         elif self.split_layer == 8:
             target_std, target_mean = 1.066, -0.021
-            current_std = upsampled.std()
-            if current_std > 0:
-                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+            current_mean = upsampled.float().mean(dim=(1, 2), keepdim=True)
+            current_std = upsampled.float().std(dim=(1, 2), keepdim=True)
+            upsampled = (
+                (upsampled - current_mean.to(upsampled.dtype))
+                / current_std.clamp_min(1e-6).to(upsampled.dtype)
+                * target_std
+                + target_mean
+            )
         elif self.split_layer == 0:
             target_std, target_mean = 0.362, -0.0001
-            current_std = upsampled.std()
-            if current_std > 0:
-                upsampled = (upsampled - upsampled.mean()) / current_std * target_std + target_mean
+            current_mean = upsampled.float().mean(dim=(1, 2), keepdim=True)
+            current_std = upsampled.float().std(dim=(1, 2), keepdim=True)
+            upsampled = (
+                (upsampled - current_mean.to(upsampled.dtype))
+                / current_std.clamp_min(1e-6).to(upsampled.dtype)
+                * target_std
+                + target_mean
+            )
 
         return upsampled
 
@@ -389,6 +460,35 @@ class CloudInferenceEngine:
             modality="image",
             max_new_tokens=max_new_tokens,
         )
+
+    @torch.no_grad()
+    def infer_payload_with_timing(self, compressed_features, prompt="Describe this image.", max_new_tokens=256):
+        """Timed image path with TTFT measured at the first streamed token."""
+        self._synchronize()
+        reconstruct_start = time.perf_counter()
+        upsampled = self.reconstruct_payload_tokens(compressed_features)
+        self._synchronize()
+        reconstruct_seconds = time.perf_counter() - reconstruct_start
+
+        target_h = target_w = int(self.target_tokens ** 0.5)
+        grid_thw = torch.tensor([[1, target_h, target_w]], dtype=torch.long, device=self.device)
+        visual_tail_start = time.perf_counter()
+        visual_tokens = self.run_visual_tail(upsampled, grid_thw=grid_thw, modality="image")
+        self._synchronize()
+        visual_tail_seconds = time.perf_counter() - visual_tail_start
+
+        answer, generation_metrics = self.generate_from_visual_tokens_with_timing(
+            visual_tokens,
+            prompt=prompt,
+            modality="image",
+            max_new_tokens=max_new_tokens,
+        )
+        return answer, {
+            **generation_metrics,
+            "reconstruct_seconds": reconstruct_seconds,
+            "visual_tail_seconds": visual_tail_seconds,
+            "ttft_seconds": reconstruct_seconds + visual_tail_seconds + generation_metrics.get("ttft_seconds", 0.0),
+        }
 
     @torch.no_grad()
     def run_visual_tail(self, upsampled, grid_thw=None, modality="image"):
@@ -468,6 +568,7 @@ class CloudInferenceEngine:
             pad_token = "<|image_pad|>"
             visual_token_id = self.qwen_model.config.image_token_id
 
+        generation_prepare_start = time.perf_counter()
         num_visual_tokens = visual_tokens.shape[1]
         placeholder = "<|vision_start|>" + pad_token * num_visual_tokens + "<|vision_end|>"
         messages = [{'role': 'user', 'content': placeholder + prompt}]
@@ -523,6 +624,7 @@ class CloudInferenceEngine:
             pad_token = "<|image_pad|>"
             visual_token_id = self.qwen_model.config.image_token_id
 
+        generation_prepare_start = time.perf_counter()
         num_visual_tokens = visual_tokens.shape[1]
         placeholder = "<|vision_start|>" + pad_token * num_visual_tokens + "<|vision_end|>"
         messages = [{'role': 'user', 'content': placeholder + prompt}]
@@ -575,6 +677,7 @@ class CloudInferenceEngine:
                 error_holder["error"] = exc
 
         generation_start = time.perf_counter()
+        generation_prepare_seconds = generation_start - generation_prepare_start
         thread = threading.Thread(target=_run_generate)
         thread.start()
 
@@ -603,7 +706,9 @@ class CloudInferenceEngine:
             average_tps = generated_tokens / generation_seconds
 
         return answer, {
+            "generation_prepare_seconds": generation_prepare_seconds,
             "first_token_seconds": first_token_seconds,
+            "ttft_seconds": generation_prepare_seconds + (first_token_seconds or generation_seconds),
             "generation_seconds": generation_seconds,
             "generated_tokens": generated_tokens,
             "average_tps": average_tps,
@@ -644,22 +749,32 @@ class CloudInferenceEngine:
         if compressed_frame_features.dim() != 3:
             raise ValueError("compressed_frame_features must be [T, tokens, channels]")
 
+        self._synchronize()
         reconstruct_start = time.perf_counter()
-        frame_tokens = []
-        for frame_features in compressed_frame_features:
-            if multilevel_payload:
-                upsampled = self.reconstruct_payload_tokens(frame_features.unsqueeze(0))
-            else:
-                upsampled = self.reconstruct_tokens(frame_features.unsqueeze(0))
-            frame_tokens.append(upsampled.squeeze(0))
+        if multilevel_payload:
+            upsampled = self.reconstruct_payload_tokens(
+                compressed_frame_features
+            )
+        else:
+            upsampled = self.reconstruct_tokens(compressed_frame_features)
+        self._synchronize()
         reconstruct_seconds = time.perf_counter() - reconstruct_start
 
-        video_tokens = torch.cat(frame_tokens, dim=0).unsqueeze(0)
+        frame_count = int(upsampled.shape[0])
+        video_tokens = upsampled.reshape(
+            1, frame_count * upsampled.shape[1], upsampled.shape[2]
+        )
         target_h = target_w = int(self.target_tokens ** 0.5)
-        grid_thw = torch.tensor([[len(frame_tokens), target_h, target_w]], dtype=torch.long, device=self.device)
+        grid_thw = torch.tensor(
+            [[frame_count, target_h, target_w]],
+            dtype=torch.long,
+            device=self.device,
+        )
 
+        self._synchronize()
         visual_tail_start = time.perf_counter()
         visual_tokens = self.run_visual_tail(video_tokens, grid_thw=grid_thw, modality="video")
+        self._synchronize()
         visual_tail_seconds = time.perf_counter() - visual_tail_start
 
         answer, generation_metrics = self.generate_from_visual_tokens_with_timing(
@@ -669,11 +784,160 @@ class CloudInferenceEngine:
             max_new_tokens=max_new_tokens,
         )
         metrics = {
+            **generation_metrics,
             "reconstruct_seconds": reconstruct_seconds,
             "visual_tail_seconds": visual_tail_seconds,
-            **generation_metrics,
+            "ttft_seconds": reconstruct_seconds + visual_tail_seconds + generation_metrics.get("ttft_seconds", 0.0),
+            "cloud_compute_dtype": str(self.cloud_compute_dtype),
+            "frame_count": frame_count,
+            "visual_grid_thw": grid_thw.detach().cpu().tolist(),
+            "visual_tokens_after_merge": int(
+                frame_count * target_h * target_w
+                // (self.qwen_model.visual.spatial_merge_size**2)
+            ),
         }
         return answer, metrics
+
+    @torch.no_grad()
+    def infer_qwen_frames_with_timing(
+        self,
+        frames,
+        prompt="Describe this video.",
+        max_new_tokens=256,
+        video_pixel_budget=224 * 224,
+        video_fps=2.0,
+    ):
+        """Run the complete native Qwen vision encoder and language model."""
+        if not frames:
+            raise ValueError("Pure Qwen inference requires at least one RGB frame")
+        if self.qwen_model is None:
+            model_path = getattr(
+                self, 'qwen_path', "Qwen/Qwen2.5-VL-3B-Instruct"
+            )
+            offline = getattr(self, 'offline_mode', False)
+            self.load_qwen(model_name=model_path, local_only=offline)
+
+        modality = "image" if len(frames) == 1 else "video"
+        media_content = (
+            {"type": "image", "image": "sampled_frame"}
+            if modality == "image"
+            else {"type": "video", "video": "sampled_frames"}
+        )
+        messages = [{
+            "role": "user",
+            "content": [
+                media_content,
+                {"type": "text", "text": prompt},
+            ],
+        }]
+
+        processor_start = time.perf_counter()
+        text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        processor_kwargs = {
+            "text": [text],
+            "return_tensors": "pt",
+            "padding": True,
+        }
+        if modality == "image":
+            processor_kwargs["images"] = [frames[0]]
+        else:
+            processor_kwargs["videos"] = [frames]
+            processor_kwargs["videos_kwargs"] = {
+                "size": {
+                    "shortest_edge": int(video_pixel_budget),
+                    "longest_edge": int(video_pixel_budget),
+                },
+                "fps": float(video_fps),
+            }
+        inputs = self.processor(**processor_kwargs)
+        grid_key = "image_grid_thw" if modality == "image" else "video_grid_thw"
+        native_grid_thw = inputs[grid_key].detach().cpu().tolist()
+        merge_size = (
+            self.processor.image_processor.merge_size
+            if modality == "image"
+            else self.processor.video_processor.merge_size
+        )
+        native_visual_tokens = sum(
+            int(grid[0] * grid[1] * grid[2]) // (merge_size**2)
+            for grid in native_grid_thw
+        )
+        inputs = {
+            key: value.to(self.device) if hasattr(value, "to") else value
+            for key, value in inputs.items()
+        }
+        processor_seconds = time.perf_counter() - processor_start
+
+        streamer = TextIteratorStreamer(
+            self.processor.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        generation_kwargs = {
+            **inputs,
+            "max_new_tokens": int(max_new_tokens),
+            "do_sample": False,
+            "streamer": streamer,
+        }
+        output_holder = {}
+        error_holder = {}
+
+        def _run_generate():
+            try:
+                output_holder["outputs"] = self.qwen_model.generate(
+                    **generation_kwargs
+                )
+            except Exception as exc:
+                error_holder["error"] = exc
+
+        generation_start = time.perf_counter()
+        thread = threading.Thread(target=_run_generate)
+        thread.start()
+        chunks = []
+        first_token_seconds = None
+        for chunk in streamer:
+            if chunk and first_token_seconds is None:
+                first_token_seconds = time.perf_counter() - generation_start
+            chunks.append(chunk)
+        thread.join()
+        generation_seconds = time.perf_counter() - generation_start
+        if "error" in error_holder:
+            raise error_holder["error"]
+
+        outputs = output_holder["outputs"]
+        generated_ids = [
+            output_ids[len(input_ids):]
+            for input_ids, output_ids in zip(inputs["input_ids"], outputs)
+        ]
+        generated_tokens = int(generated_ids[0].numel()) if generated_ids else 0
+        answer = "".join(chunks).strip()
+        if not answer and generated_ids:
+            answer = self.processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0].strip()
+        effective_first_token = first_token_seconds or generation_seconds
+        return answer, {
+            "processor_seconds": processor_seconds,
+            "first_token_seconds": first_token_seconds,
+            "generation_seconds": generation_seconds,
+            "generated_tokens": generated_tokens,
+            "average_tps": (
+                generated_tokens / generation_seconds
+                if generated_tokens > 0 and generation_seconds > 0
+                else None
+            ),
+            "ttft_seconds": processor_seconds + effective_first_token,
+            "modality": modality,
+            "frames": len(frames),
+            "native_grid_thw": native_grid_thw,
+            "native_visual_tokens": native_visual_tokens,
+        }
 
 
 # 全局引擎实例
@@ -691,10 +955,31 @@ def health():
     })
 
 
+@app.route('/warmup', methods=['POST'])
+def warmup():
+    """Load Qwen before the first measured request."""
+    started = time.perf_counter()
+    try:
+        if engine is None:
+            return jsonify({'error': 'cloud engine is not loaded'}), 503
+        if engine.qwen_model is None:
+            model_path = getattr(engine, 'qwen_path', 'Qwen/Qwen2.5-VL-3B-Instruct')
+            offline = getattr(engine, 'offline_mode', False)
+            engine.load_qwen(model_name=model_path, local_only=offline)
+        return jsonify({
+            'status': 'ok',
+            'model_loaded': True,
+            'qwen_loaded': True,
+            'warmup_ms': (time.perf_counter() - started) * 1000,
+        })
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
 @app.route('/infer', methods=['POST'])
 def infer():
     """推理端点"""
-    start_time = time.time()
+    start_time = time.perf_counter()
     
     try:
         data = request.json
@@ -702,6 +987,8 @@ def infer():
         scale = data['scale']
         zero_point = data['zero_point']
         prompt = data.get('prompt', 'Describe this image.')
+        modality = data.get('modality', 'image')
+        decode_start = time.perf_counter()
         
         # 反序列化特征
         features = engine.decode_features(
@@ -710,20 +997,87 @@ def infer():
             zero_point,
             payload_tokens=data.get('payload_tokens'),
             payload_dim=data.get('payload_dim'),
+            feature_shape=data.get('feature_shape'),
         )
         
         # 推理
-        response = engine.infer_payload(features, prompt)
+        cloud_decode_ms = (time.perf_counter() - decode_start) * 1000
+        infer_start = time.perf_counter()
+        if modality == 'video':
+            response, inference_metrics = engine.infer_video_from_frame_features_with_timing(
+                features,
+                prompt=prompt,
+                max_new_tokens=int(data.get('max_new_tokens', 256)),
+                multilevel_payload=bool(data.get('payload_tokens')),
+            )
+        else:
+            response, inference_metrics = engine.infer_payload_with_timing(
+                features,
+                prompt,
+                max_new_tokens=int(data.get('max_new_tokens', 256)),
+            )
+        cloud_inference_ms = (time.perf_counter() - infer_start) * 1000
         
-        latency_ms = (time.time() - start_time) * 1000
+        cloud_process_ms = (time.perf_counter() - start_time) * 1000
         
         return jsonify({
             'response': response,
-            'latency_ms': latency_ms
+            'latency_ms': cloud_process_ms,
+            'cloud_process_ms': cloud_process_ms,
+            'cloud_decode_ms': cloud_decode_ms,
+            'cloud_inference_ms': cloud_inference_ms,
+            'cloud_ttft_ms': float(inference_metrics.get('ttft_seconds', 0.0)) * 1000,
+            'inference_metrics': inference_metrics,
+            'modality': modality,
         })
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/infer_qwen', methods=['POST'])
+def infer_qwen():
+    """Run native Qwen on uploaded JPEG RGB frames."""
+    start_time = time.perf_counter()
+    try:
+        data = request.json or {}
+        encoded_frames = data.get("frames") or []
+        if not isinstance(encoded_frames, list) or not encoded_frames:
+            return jsonify({'error': 'frames must be a non-empty list'}), 400
+
+        decode_start = time.perf_counter()
+        frames = []
+        for encoded in encoded_frames:
+            image_bytes = base64.b64decode(encoded, validate=True)
+            with Image.open(BytesIO(image_bytes)) as image:
+                frames.append(image.convert("RGB").copy())
+        cloud_decode_ms = (time.perf_counter() - decode_start) * 1000
+
+        inference_start = time.perf_counter()
+        response, inference_metrics = engine.infer_qwen_frames_with_timing(
+            frames,
+            prompt=data.get("prompt", "Describe this video."),
+            max_new_tokens=int(data.get("max_new_tokens", 256)),
+            video_pixel_budget=int(data.get("video_pixel_budget", 224 * 224)),
+            video_fps=float(data.get("video_fps", 2.0)),
+        )
+        cloud_inference_ms = (time.perf_counter() - inference_start) * 1000
+        cloud_process_ms = (time.perf_counter() - start_time) * 1000
+        return jsonify({
+            'response': response,
+            'latency_ms': cloud_process_ms,
+            'cloud_process_ms': cloud_process_ms,
+            'cloud_decode_ms': cloud_decode_ms,
+            'cloud_inference_ms': cloud_inference_ms,
+            'cloud_ttft_ms': (
+                float(inference_metrics.get('ttft_seconds', 0.0)) * 1000
+            ),
+            'inference_metrics': inference_metrics,
+            'modality': inference_metrics.get('modality', 'video'),
+            'pure_qwen': True,
+        })
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
 
 
 def main():

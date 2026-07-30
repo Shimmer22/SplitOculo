@@ -46,7 +46,43 @@ def _picture_type(frame):
     }.get(value, f"UNKNOWN_{value}")
 
 
-def read_video_records_with_mvs(video_path, max_frames=None, sample_fps=None):
+def _select_best_effort_ip(records, target_fps, target_count):
+    """Select the latest causal I/P frame at each output deadline."""
+    if not target_fps or target_fps <= 0 or not records:
+        return
+    for record in records:
+        record["selected"] = False
+
+    cursor = 0
+    latest_ip = None
+    selected_sources = set()
+    for output_index in range(target_count):
+        deadline = output_index / target_fps
+        while cursor < len(records):
+            record = records[cursor]
+            timestamp = record["time_seconds"]
+            if timestamp is None:
+                break
+            if timestamp > deadline + 1e-6:
+                break
+            if record["pict_type"] in {"I", "P"}:
+                latest_ip = record
+            cursor += 1
+        if latest_ip is not None and latest_ip["source_index"] not in selected_sources:
+            latest_ip["selected"] = True
+            latest_ip["output_deadline_seconds"] = deadline
+            latest_ip["deadline_lag_seconds"] = deadline - float(
+                latest_ip["time_seconds"] or 0.0
+            )
+            selected_sources.add(latest_ip["source_index"])
+
+
+def read_video_records_with_mvs(
+    video_path,
+    max_frames=None,
+    sample_fps=None,
+    selection_policy="fixed",
+):
     """Decode through the last sampled frame and retain AVMotionVector arrays.
 
     All source frames are returned because reference feature state must advance
@@ -108,9 +144,23 @@ def read_video_records_with_mvs(video_path, max_frames=None, sample_fps=None):
         })
     container.close()
 
-    decoded_selected = [record["source_index"] for record in records if record["selected"]]
-    if decoded_selected != selected_indices[: len(decoded_selected)] or len(decoded_selected) != len(selected_indices):
-        raise RuntimeError(
-            f"Decoded samples {decoded_selected} do not match requested indices {selected_indices}"
-        )
-    return records, native_fps, "pyav_export_mvs"
+    if selection_policy == "best_effort_ip":
+        _select_best_effort_ip(records, sample_fps, len(selected_indices))
+        if not any(record["selected"] for record in records):
+            raise RuntimeError(f"No causal I/P frames selected from {video_path}")
+        reader = "pyav_export_mvs_best_effort_ip"
+    elif selection_policy == "fixed":
+        decoded_selected = [
+            record["source_index"] for record in records if record["selected"]
+        ]
+        if (
+            decoded_selected != selected_indices[: len(decoded_selected)]
+            or len(decoded_selected) != len(selected_indices)
+        ):
+            raise RuntimeError(
+                f"Decoded samples {decoded_selected} do not match requested indices {selected_indices}"
+            )
+        reader = "pyav_export_mvs"
+    else:
+        raise ValueError(f"Unknown codec selection policy: {selection_policy}")
+    return records, native_fps, reader

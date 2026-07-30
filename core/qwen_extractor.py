@@ -85,6 +85,17 @@ class QwenFeatureExtractor:
             self.model_name,
             **processor_kwargs,
         )
+        # In current transformers releases the top-level min/max pixel kwargs
+        # can configure the image processor without updating the video
+        # processor's active ``size`` dictionary. Set both explicitly so a
+        # requested 224-scale video does not silently run near source resolution.
+        if hasattr(self.processor, "video_processor"):
+            video_size = dict(self.processor.video_processor.size)
+            if self.min_pixels is not None:
+                video_size["shortest_edge"] = int(self.min_pixels)
+            if self.max_pixels is not None:
+                video_size["longest_edge"] = int(self.max_pixels)
+            self.processor.video_processor.size = video_size
         
         # 冻结所有参数
         for param in self.model.parameters():

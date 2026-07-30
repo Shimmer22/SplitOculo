@@ -68,11 +68,14 @@ def _read_video_cv2(video_path, max_frames=None, sample_fps=None):
     native_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     indices = set(_fps_indices(total_frames, native_fps, sample_fps, max_frames))
+    last_index = max(indices) if indices else -1
     frames = []
     frame_idx = 0
     while True:
         ok, frame = cap.read()
         if not ok:
+            break
+        if last_index >= 0 and frame_idx > last_index:
             break
         if frame_idx in indices:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -104,7 +107,8 @@ def read_video_frames(video_path, max_frames=None, sample_fps=None):
         raise RuntimeError(f"decoded zero frames from image directory: {video_path}")
 
     errors = []
-    for reader in (_read_video_torchvision, _read_video_cv2):
+    readers = (_read_video_cv2, _read_video_torchvision) if sample_fps else (_read_video_torchvision, _read_video_cv2)
+    for reader in readers:
         try:
             frames, native_fps = reader(video_path, max_frames=max_frames, sample_fps=sample_fps)
             if frames:

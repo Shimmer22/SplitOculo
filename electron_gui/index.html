@@ -1,287 +1,95 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SplitOculo - Edge-Cloud VLM Console</title>
+  <title>SplitOculo Demo</title>
   <link rel="stylesheet" href="styles/main.css">
 </head>
 <body>
-  <header class="app-header">
-    <div class="logo-section">
-      <h1>SplitOculo</h1>
-      <span class="subtitle">Edge-Cloud VLM Inference</span>
+  <header class="topbar">
+    <div>
+      <div class="brand">SplitOculo <span>Demo</span></div>
+      <div class="muted">端云协同视觉推理测试台</div>
     </div>
-    <div class="status-indicators">
-      <div class="status-item" id="edge-status">
-        <span class="status-dot offline"></span>
-        <span>Edge: Offline</span>
-      </div>
-      <div class="status-item" id="cloud-status">
-        <span class="status-dot offline"></span>
-        <span>Cloud: Offline</span>
-      </div>
+    <div class="top-actions">
+      <span id="server-state" class="state offline">云端未启动</span>
+      <button id="server-button" class="button secondary">启动云端</button>
+      <button id="settings-button" class="button secondary">设置</button>
     </div>
   </header>
 
-  <nav class="tab-nav">
-    <button class="tab-button active" data-tab="dashboard">
-      Dashboard
-    </button>
-    <button class="tab-button" data-tab="testing">
-      Testing
-    </button>
-    <button class="tab-button" data-tab="config">
-      Config
-    </button>
-    <button class="tab-button" data-tab="logs">
-      Logs
-    </button>
-  </nav>
-
-  <main class="content-area">
-    <section class="tab-content active" id="dashboard-tab">
-      <div class="dashboard-grid">
-        <div class="card status-card">
-          <h3>Cloud Server</h3>
-          <div class="status-content">
-            <div class="status-indicator" id="cloud-indicator">
-              <div class="status-circle offline"></div>
-              <span id="cloud-status-text">Offline</span>
-            </div>
-            <div class="server-info">
-              <p><strong>Weights:</strong> <span id="cloud-weight-size">N/A</span></p>
-              <p><strong>Port:</strong> <span id="cloud-port">8080</span></p>
-            </div>
-            <button class="btn btn-primary" id="toggle-cloud-server">Start Server</button>
-          </div>
-        </div>
-
-        <div class="card status-card">
-          <h3>Edge Client</h3>
-          <div class="status-content">
-            <div class="status-indicator" id="edge-indicator">
-              <div class="status-circle ready"></div>
-              <span id="edge-status-text">Ready</span>
-            </div>
-            <div class="server-info">
-              <p><strong>Weights:</strong> <span id="edge-weight-size">N/A</span></p>
-              <p><strong>Device:</strong> <span id="edge-device">cuda</span></p>
-            </div>
-          </div>
-        </div>
-
-        <div class="card quick-inference-card">
-          <h3>Quick Inference</h3>
-          <div class="dropzone" id="quick-dropzone">
-            <div class="dropzone-content">
-              <p class="dropzone-icon">IMG</p>
-              <p class="dropzone-text">Drop image here or click to select</p>
-              <input type="file" id="quick-file-input" accept="image/*" hidden>
-            </div>
-          </div>
-          <div id="quick-result" class="inference-result hidden">
-            <p class="result-text"></p>
-            <div class="result-metrics">
-              <span class="metric">Latency <span id="quick-latency">0</span>ms</span>
-              <span class="metric">Payload <span id="quick-payload">0</span>KB</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="card chart-card">
-          <h3>Latency Trend</h3>
-          <canvas id="latency-chart"></canvas>
-        </div>
-
-        <div class="card chart-card">
-          <h3>Compression Ratio</h3>
-          <canvas id="compression-chart"></canvas>
-        </div>
-
-        <div class="card metrics-card">
-          <h3>Performance Metrics</h3>
-          <div class="metrics-grid">
-            <div class="metric-item">
-              <span class="metric-label">Avg Latency</span>
-              <span class="metric-value" id="avg-latency">--</span>
-            </div>
-            <div class="metric-item">
-              <span class="metric-label">Compression</span>
-              <span class="metric-value" id="compression-ratio">--</span>
-            </div>
-            <div class="metric-item">
-              <span class="metric-label">Throughput</span>
-              <span class="metric-value" id="throughput">--</span>
-            </div>
-            <div class="metric-item">
-              <span class="metric-label">Total Inferences</span>
-              <span class="metric-value" id="total-inferences">0</span>
-            </div>
-          </div>
-        </div>
+  <main class="page">
+    <section class="card input-card">
+      <div class="section-title"><h2>输入</h2><span id="input-kind" class="tag">未选择</span></div>
+      <div id="dropzone" class="dropzone">
+        <div class="drop-title">拖入图片、视频或裸帧文件</div>
+        <div class="muted">支持 PNG / JPEG（不同质量）/ WebP、H.264 / H.265 视频、RGB/BGR/灰度裸帧</div>
+        <button id="choose-input" class="button primary">选择文件</button>
+        <input id="input-file" type="file" hidden accept="image/*,video/*,.mp4,.mkv,.mov,.avi,.h264,.h265,.hevc,.raw,.rgb,.bgr,.yuv">
+      </div>
+      <div id="selected-input" class="selected-input hidden"></div>
+      <div id="media-info" class="muted media-info"></div>
+      <div class="field">
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt" rows="3">请描述视频。</textarea>
       </div>
     </section>
 
-    <section class="tab-content" id="testing-tab">
-      <div class="testing-grid">
-        <div class="card upload-card">
-          <h3>Image Upload</h3>
-          <div class="dropzone large" id="test-dropzone">
-            <div class="dropzone-content">
-              <p class="dropzone-icon">IMG</p>
-              <p class="dropzone-text">Drop image here or click to select</p>
-              <input type="file" id="test-file-input" accept="image/*" hidden>
-            </div>
-            <img id="preview-image" class="preview-image hidden" alt="Preview">
-          </div>
-        </div>
-
-        <div class="card settings-card">
-          <h3>Inference Settings</h3>
-          <div class="form-group">
-            <label>Edge Checkpoint</label>
-            <div class="file-selector">
-              <input type="text" id="test-edge-checkpoint" placeholder="Select checkpoint file" readonly>
-              <button class="btn-icon" id="select-edge-checkpoint">...</button>
-            </div>
-          </div>
-          <div class="form-group">
-            <label>Server URL</label>
-            <input type="text" id="test-server-url" value="http://localhost:8080">
-          </div>
-          <div class="form-group">
-            <label>Prompt</label>
-            <input type="text" id="test-prompt" value="What is in this image?">
-          </div>
-          <div class="form-group">
-            <label>Timeout (seconds)</label>
-            <input type="number" id="test-timeout" value="300">
-          </div>
-          <button class="btn btn-primary btn-large" id="run-inference-btn" disabled>
-            Run Inference
-          </button>
-        </div>
-
-        <div class="card result-card">
-          <h3>Inference Result</h3>
-          <div id="test-result-container" class="result-container">
-            <p class="placeholder-text">Run an inference to see results here</p>
-          </div>
-          <div id="test-metrics" class="metrics-display hidden">
-            <div class="metric-row">
-              <span class="label">Edge Encode:</span>
-              <span class="value" id="result-encode-time">--</span>
-            </div>
-            <div class="metric-row">
-              <span class="label">Payload Size:</span>
-              <span class="value" id="result-payload">--</span>
-            </div>
-            <div class="metric-row">
-              <span class="label">Network Time:</span>
-              <span class="value" id="result-network">--</span>
-            </div>
-            <div class="metric-row">
-              <span class="label">Cloud Latency:</span>
-              <span class="value" id="result-cloud">--</span>
-            </div>
-            <div class="metric-row">
-              <span class="label">Total Time:</span>
-              <span class="value" id="result-total">--</span>
-            </div>
-          </div>
+    <section class="card controls-card">
+      <div class="section-title"><h2>项目输入</h2><span class="muted">按列表顺序执行，可重复</span></div>
+      <div id="projects-list" class="projects-list"><div class="empty project-empty">尚未添加项目。</div></div>
+      <button id="add-project" class="button secondary add-project">＋ 添加项目</button>
+      <div class="bandwidth-box">
+        <label class="switch-row"><input id="bandwidth-enabled" type="checkbox"><span>模拟带宽限制</span></label>
+        <div class="bandwidth-inputs">
+          <select id="bandwidth-preset">
+            <option value="62.5">BLE · 62.5 KB/s</option>
+            <option value="125">BLE · 125 KB/s</option>
+            <option value="0">不限制</option>
+            <option value="custom">手动输入</option>
+          </select>
+          <input id="bandwidth-custom" type="number" min="0.1" step="0.1" placeholder="KB/s" disabled>
         </div>
       </div>
+      <button id="run-button" class="button primary run-button" disabled>开始推理</button>
+      <div id="run-status" class="muted status-line"></div>
     </section>
 
-    <section class="tab-content" id="config-tab">
-      <div class="config-grid">
-        <div class="card config-card">
-          <h3>Cloud Server Configuration</h3>
-          <div class="form-group">
-            <label>Checkpoint Path</label>
-            <div class="file-selector">
-              <input type="text" id="config-cloud-checkpoint" placeholder="Select checkpoint file">
-              <button class="btn-icon" id="select-cloud-checkpoint">...</button>
-            </div>
-          </div>
-          <div class="form-group">
-            <label>Host</label>
-            <input type="text" id="config-cloud-host" value="0.0.0.0">
-          </div>
-          <div class="form-group">
-            <label>Port</label>
-            <input type="number" id="config-cloud-port" value="8080">
-          </div>
-          <div class="form-group">
-            <label>Qwen Model Path</label>
-            <input type="text" id="config-qwen-path" value="Qwen/Qwen2.5-VL-3B-Instruct">
-          </div>
-          <div class="form-group">
-            <label class="checkbox-label">
-              <input type="checkbox" id="config-offline-mode">
-              Offline Mode (use cached model)
-            </label>
-          </div>
-          <div class="form-group">
-            <label class="checkbox-label">
-              <input type="checkbox" id="config-preload-qwen">
-              Preload Qwen on startup
-            </label>
-          </div>
-        </div>
-
-        <div class="card config-card">
-          <h3>Edge Client Configuration</h3>
-          <div class="form-group">
-            <label>Default Checkpoint Path</label>
-            <div class="file-selector">
-              <input type="text" id="config-edge-checkpoint" placeholder="Select checkpoint file">
-              <button class="btn-icon" id="select-edge-config-checkpoint">...</button>
-            </div>
-          </div>
-          <div class="form-group">
-            <label>Device</label>
-            <select id="config-edge-device">
-              <option value="cuda">CUDA (GPU)</option>
-              <option value="cpu">CPU</option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label>Default Timeout (seconds)</label>
-            <input type="number" id="config-edge-timeout" value="300">
-          </div>
-        </div>
-
-        <div class="card config-actions">
-          <button class="btn btn-success btn-large" id="save-config-btn">Save Configuration</button>
-          <button class="btn btn-secondary btn-large" id="load-config-btn">Load Configuration</button>
-          <div id="config-message" class="config-message hidden"></div>
-        </div>
-      </div>
-    </section>
-
-    <section class="tab-content" id="logs-tab">
-      <div class="logs-container">
-        <div class="logs-header">
-          <h3>System Logs</h3>
-          <div class="logs-controls">
-            <button class="btn btn-small" id="clear-logs-btn">Clear</button>
-            <button class="btn btn-small" id="export-logs-btn">Export</button>
-          </div>
-        </div>
-        <div class="logs-content" id="logs-content">
-          <p class="log-entry info">[INFO] SplitOculo GUI started</p>
-        </div>
-      </div>
+    <section class="card results-card">
+      <div class="section-title"><h2>结果</h2><button id="clear-results" class="button link-button">清空</button></div>
+      <div id="results"><div class="empty">运行后显示响应与时延指标。</div></div>
     </section>
   </main>
 
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <script src="renderer/dashboard.js"></script>
-  <script src="renderer/testing.js"></script>
-  <script src="renderer/config.js"></script>
-  <script src="renderer/logs.js"></script>
-  <script src="renderer/navigation.js"></script>
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal-panel">
+      <div class="section-title"><h2>设置</h2><button id="close-settings" class="button link-button">关闭</button></div>
+      <div class="settings-grid">
+        <label>Python 路径<input id="setting-python" type="text"></label>
+        <label>云端 checkpoint<input id="setting-cloud-checkpoint" type="text"></label>
+        <label>端侧 checkpoint<input id="setting-edge-checkpoint" type="text"></label>
+        <label>Qwen 模型路径<input id="setting-qwen" type="text"></label>
+        <label>服务器 IP / 地址<input id="setting-server-address" type="text"></label>
+        <label>云端监听地址<input id="setting-host" type="text"></label>
+        <label>端口<input id="setting-port" type="number"></label>
+        <label>设备<select id="setting-device"><option value="cuda">CUDA</option><option value="cpu">CPU</option></select></label>
+        <label>超时（秒）<input id="setting-timeout" type="number"></label>
+        <label>输入视频总帧数<input id="setting-max-frames" type="number" min="1"></label>
+        <label>视频采样 FPS<input id="setting-sample-fps" type="number" min="0.1" step="0.1"></label>
+        <label>空间 payload<input id="setting-spatial-level" type="text" placeholder="49x64"></label>
+        <label>裸帧宽<input id="setting-raw-width" type="number"></label>
+        <label>裸帧高<input id="setting-raw-height" type="number"></label>
+        <label>裸帧 FPS<input id="setting-raw-fps" type="number" step="0.1"></label>
+        <label>裸帧格式<select id="setting-raw-format"><option value="rgb24">RGB24</option><option value="bgr24">BGR24</option><option value="gray8">GRAY8</option></select></label>
+      </div>
+      <label class="switch-row inline"><input id="setting-offline" type="checkbox"><span>离线加载 Qwen 缓存</span></label>
+      <label class="switch-row inline"><input id="setting-preload" type="checkbox"><span>启动服务器时预加载 Qwen</span></label>
+      <div class="muted settings-note">模型输入尺寸由 checkpoint 决定；当前默认 checkpoint 使用 224×224。裸帧宽高只用于解析裸帧文件，不会改变模型输入尺寸。</div>
+      <button id="save-settings" class="button primary">保存设置</button>
+      <div id="settings-message" class="muted status-line"></div>
+    </div>
+  </div>
+  <script src="renderer/demo.js"></script>
 </body>
 </html>
