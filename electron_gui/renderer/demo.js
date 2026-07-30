@@ -2,6 +2,7 @@ const state = { config: null, inputPath: '', running: false, streamedResults: 0,
 const PROJECT_OPTIONS = [
   ['baseline', '纯 Qwen Baseline'],
   ['so', '逐帧 SplitOculo'],
+  ['temporal', 'SplitOculo + Qwen 时序融合'],
   ['codec', 'Codec + Qwen 时序融合'],
 ];
 
@@ -195,7 +196,7 @@ async function runInference() {
   if (state.projects.some((project) => project !== 'baseline') && !state.config.edgeCheckpoint) {
     $('settings-modal').classList.remove('hidden'); $('settings-message').textContent = '请先设置端侧 checkpoint'; return;
   }
-  if (state.projects.includes('codec') && !state.config.temporalCheckpoint) {
+  if (state.projects.some((project) => ['temporal', 'codec'].includes(project)) && !state.config.temporalCheckpoint) {
     $('settings-modal').classList.remove('hidden'); $('settings-message').textContent = '请先设置时序融合 checkpoint'; return;
   }
   if (!state.projects.length) { $('run-status').textContent = '请先通过“＋ 添加项目”添加至少一个项目'; return; }

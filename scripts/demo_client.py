@@ -124,6 +124,7 @@ def _payload(features: torch.Tensor, modality: str, prompt: str, level=None):
 PROJECTS = {
     "baseline": ("纯 Qwen Baseline", False, False, False, True),
     "so": ("逐帧 SplitOculo", True, False, False, False),
+    "temporal": ("SplitOculo + Qwen 时序融合", True, False, True, False),
     "codec": ("Codec + Qwen 时序融合", True, True, True, False),
 }
 
@@ -543,7 +544,11 @@ def main():
     parser.add_argument("--prompt", default="Describe this image.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--timeout", type=int, default=300)
-    parser.add_argument("--projects", default="baseline", help="Comma-separated project ids: baseline,so,codec")
+    parser.add_argument(
+        "--projects",
+        default="baseline",
+        help="Comma-separated project ids: baseline,so,temporal,codec",
+    )
     parser.add_argument("--bandwidth_kb_s", type=float, default=0.0)
     parser.add_argument("--spatial_level", default="49x64")
     parser.add_argument("--max_frames", type=int, default=8)
