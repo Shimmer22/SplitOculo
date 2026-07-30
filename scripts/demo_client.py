@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core.codec_video_reader import read_video_records_with_mvs
 from models.codec_accelerator import CodecWarpAccelerator, DecoderMotionVectorAccelerator
 from models.multilevel import parse_payload_levels
+from models.temporal_pair import load_temporal_pair_fusion
 from scripts.edge_client import EdgeEncoder
 from scripts.infer_qwen_video import read_video_frames
 
@@ -121,9 +122,9 @@ def _payload(features: torch.Tensor, modality: str, prompt: str, level=None):
 
 
 PROJECTS = {
-    "baseline": ("纯 Qwen Baseline", False, False, True),
-    "so": ("空间特征加速", True, False, False),
-    "codec": ("帧间冗余加速", True, True, False),
+    "baseline": ("纯 Qwen Baseline", False, False, False, True),
+    "so": ("逐帧 SplitOculo", True, False, False, False),
+    "codec": ("Codec + Qwen 时序融合", True, True, True, False),
 }
 
 
@@ -138,7 +139,42 @@ def _variant_specs(args):
     return [PROJECTS[name] for name in names]
 
 
-def _encode_variant(encoder, path: Path, args, spatial_acc: bool, codec_acc: bool):
+@torch.inference_mode()
+def _full_backbone_features(encoder, frames):
+    image_tensor = torch.stack(
+        [encoder.transform(frame.convert("RGB")) for frame in frames], dim=0
+    )
+    return encoder.student(encoder.input_to_device(image_tensor))[-1]
+
+
+@torch.inference_mode()
+def _temporal_payload(encoder, temporal_fusion, backbone_features):
+    if temporal_fusion is None:
+        raise ValueError(
+            "Temporal demo project requires --temporal_pair_checkpoint"
+        )
+    if backbone_features.shape[0] % 2:
+        backbone_features = torch.cat(
+            (backbone_features, backbone_features[-1:]), dim=0
+        )
+    fused = temporal_fusion(
+        backbone_features[0::2], backbone_features[1::2]
+    )
+    tokens = encoder.projector(fused)
+    if encoder.bottleneck is not None:
+        tokens = encoder.bottleneck.encode(tokens)
+    return tokens
+
+
+def _encode_variant(
+    encoder,
+    temporal_fusion,
+    path: Path,
+    args,
+    spatial_acc: bool,
+    codec_acc: bool,
+    temporal_acc: bool,
+):
     read_start = time.perf_counter()
     frames, native_fps, reader, records = _read_input(path, args, codec_acc)
     decode_ms = (time.perf_counter() - read_start) * 1000
@@ -146,9 +182,16 @@ def _encode_variant(encoder, path: Path, args, spatial_acc: bool, codec_acc: boo
         raise ValueError("Input produced no frames")
 
     level = parse_payload_levels(args.spatial_level)[0] if spatial_acc else None
+    # Temporal-pair training targets the checkpoint's complete 49x64 payload.
+    # Arbitrary multilevel truncation was not part of that training objective.
+    if temporal_acc and level != (49, 64):
+        raise ValueError(
+            "Temporal demo currently requires --spatial_level 49x64"
+        )
     encode_start = time.perf_counter()
     codec_records = []
     features = []
+    source_frame_count = len(frames)
 
     if codec_acc and records is not None:
         accelerator = DecoderMotionVectorAccelerator(
@@ -159,16 +202,29 @@ def _encode_variant(encoder, path: Path, args, spatial_acc: bool, codec_acc: boo
             max_p_chain=args.codec_max_p_chain,
         )
         for record in records:
-            encoded, _, info = accelerator.encode_record(record, payload_level=level)
+            encoded, _, info = accelerator.encode_record(
+                record,
+                payload_level=None if temporal_acc else level,
+                defer_payload=temporal_acc,
+            )
             codec_records.append(info)
             if record["selected"]:
                 features.append(encoded.squeeze(0).detach())
-    elif codec_acc:
+        if temporal_acc:
+            backbone = torch.stack(features, dim=0)
+            tensor = _temporal_payload(
+                encoder, temporal_fusion, backbone
+            )
+            features = []
+    elif codec_acc and not temporal_acc:
         accelerator = CodecWarpAccelerator(encoder, gop_frames=args.codec_gop_frames)
         for frame in frames:
             encoded, _, info = accelerator.encode_pil(frame, payload_level=level)
             codec_records.append(info)
             features.append(encoded.squeeze(0).detach())
+    elif temporal_acc:
+        backbone = _full_backbone_features(encoder, frames)
+        tensor = _temporal_payload(encoder, temporal_fusion, backbone)
     else:
         if level:
             for frame in frames:
@@ -181,16 +237,28 @@ def _encode_variant(encoder, path: Path, args, spatial_acc: bool, codec_acc: boo
     if str(args.device).startswith("cuda"):
         torch.cuda.synchronize()
     encode_ms = (time.perf_counter() - encode_start) * 1000
-    tensor = features[0].unsqueeze(0) if len(features) == 1 else torch.stack(features, dim=0)
-    modality = "image" if len(features) == 1 else "video"
-    payload, payload_bytes = _payload(tensor, modality, args.prompt, level)
+    if not temporal_acc:
+        tensor = (
+            features[0].unsqueeze(0)
+            if len(features) == 1
+            else torch.stack(features, dim=0)
+        )
+    modality = "image" if source_frame_count == 1 else "video"
+    payload, payload_bytes = _payload(
+        tensor,
+        modality,
+        args.prompt,
+        None if temporal_acc else level,
+    )
     return payload, {
         "modality": modality,
         "decode_ms": decode_ms,
         "encode_ms": encode_ms,
         "payload_bytes": payload_bytes,
         "feature_shape": list(tensor.shape),
-        "frames": len(features),
+        "frames": source_frame_count,
+        "temporal_grids": int(tensor.shape[0]),
+        "temporal_pair_fusion": bool(temporal_acc),
         "native_fps": native_fps,
         "reader": reader,
         "codec_frames": codec_records,
@@ -317,14 +385,32 @@ def _run_pure_qwen(path, args, label):
     }
 
 
-def _run_variant(encoder, path, args, label, spatial_acc, codec_acc, pure_qwen):
+def _run_variant(
+    encoder,
+    temporal_fusion,
+    path,
+    args,
+    label,
+    spatial_acc,
+    codec_acc,
+    temporal_acc,
+    pure_qwen,
+):
     if pure_qwen:
         return _run_pure_qwen(path, args, label)
     if encoder is None:
         raise ValueError("SplitOculo projects require --edge_checkpoint")
 
     started = time.perf_counter()
-    payload, edge_metrics = _encode_variant(encoder, path, args, spatial_acc, codec_acc)
+    payload, edge_metrics = _encode_variant(
+        encoder,
+        temporal_fusion,
+        path,
+        args,
+        spatial_acc,
+        codec_acc,
+        temporal_acc,
+    )
     modality = edge_metrics["modality"]
     payload_size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     bandwidth_delay_ms = 0.0
@@ -360,6 +446,7 @@ def _run_variant(encoder, path, args, label, spatial_acc, codec_acc, pure_qwen):
         "pure_qwen": False,
         "spatial_acceleration": bool(spatial_acc),
         "temporal_redundancy_acceleration": bool(codec_acc),
+        "temporal_pair_fusion": bool(temporal_acc),
         "edge_encode_ms": edge_metrics["encode_ms"],
         "edge_decode_ms": edge_metrics["decode_ms"],
         "cloud_process_ms": cloud_process_ms,
@@ -371,11 +458,15 @@ def _run_variant(encoder, path, args, label, spatial_acc, codec_acc, pure_qwen):
         "upload_delay_ms": bandwidth_delay_ms,
         "bandwidth_kb_s": args.bandwidth_kb_s,
         "payload_bytes": edge_metrics["payload_bytes"],
-        "payload_scope": f"{edge_metrics['frames']} frame(s) total",
+        "payload_scope": (
+            f"{edge_metrics['temporal_grids']} temporal grid(s) from "
+            f"{edge_metrics['frames']} frame(s)"
+        ),
         "payload_per_frame_bytes": edge_metrics["payload_bytes"] / max(edge_metrics["frames"], 1),
         "request_bytes": payload_size,
         "feature_shape": edge_metrics["feature_shape"],
         "frames": edge_metrics["frames"],
+        "temporal_grids": edge_metrics["temporal_grids"],
         "sample_fps": args.sample_fps if modality == "video" else None,
         "sampled_prefix_seconds": (
             edge_metrics["frames"] / args.sample_fps
@@ -447,6 +538,7 @@ def main():
     parser = argparse.ArgumentParser(description="SplitOculo Electron demo client")
     parser.add_argument("--input", required=True)
     parser.add_argument("--edge_checkpoint", default=None)
+    parser.add_argument("--temporal_pair_checkpoint", default=None)
     parser.add_argument("--server", default="http://localhost:8080")
     parser.add_argument("--prompt", default="Describe this image.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -483,9 +575,11 @@ def main():
     path = Path(args.input)
     project_specs = _variant_specs(args)
     encoder = None
+    temporal_fusion = None
+    temporal_metadata = None
     load_ms = 0.0
     results = []
-    for label, spatial_acc, codec_acc, pure_qwen in project_specs:
+    for label, spatial_acc, codec_acc, temporal_acc, pure_qwen in project_specs:
         try:
             if not pure_qwen and encoder is None:
                 if not args.edge_checkpoint:
@@ -497,9 +591,37 @@ def main():
                     args.edge_checkpoint, device=args.device
                 )
                 load_ms += (time.perf_counter() - load_started) * 1000
+            if temporal_acc and temporal_fusion is None:
+                if not args.temporal_pair_checkpoint:
+                    raise ValueError(
+                        "Temporal demo project requires "
+                        "--temporal_pair_checkpoint"
+                    )
+                load_started = time.perf_counter()
+                temporal_fusion, temporal_metadata = (
+                    load_temporal_pair_fusion(
+                        args.temporal_pair_checkpoint,
+                        device=args.device,
+                    )
+                )
+                temporal_fusion.eval()
+                load_ms += (time.perf_counter() - load_started) * 1000
             row = _run_variant(
-                encoder, path, args, label, spatial_acc, codec_acc, pure_qwen
+                encoder,
+                temporal_fusion,
+                path,
+                args,
+                label,
+                spatial_acc,
+                codec_acc,
+                temporal_acc,
+                pure_qwen,
             )
+            if temporal_acc:
+                row["temporal_checkpoint"] = args.temporal_pair_checkpoint
+                row["temporal_patch_size"] = int(
+                    temporal_metadata.get("temporal_patch_size", 2)
+                )
             results.append(row)
             print("DEMO_RESULT_ITEM=" + json.dumps(row, ensure_ascii=False), flush=True)
         except Exception as exc:
@@ -508,6 +630,7 @@ def main():
                 "pure_qwen": bool(pure_qwen),
                 "spatial_acceleration": bool(spatial_acc),
                 "temporal_redundancy_acceleration": bool(codec_acc),
+                "temporal_pair_fusion": bool(temporal_acc),
                 "error": str(exc),
             }
             results.append(row)

@@ -1,8 +1,8 @@
 const state = { config: null, inputPath: '', running: false, streamedResults: 0, projects: [] };
 const PROJECT_OPTIONS = [
   ['baseline', '纯 Qwen Baseline'],
-  ['so', '空间特征加速'],
-  ['codec', '帧间冗余加速'],
+  ['so', '逐帧 SplitOculo'],
+  ['codec', 'Codec + Qwen 时序融合'],
 ];
 
 const $ = (id) => document.getElementById(id);
@@ -52,6 +52,7 @@ function renderProjects() {
 function loadSettingsForm(config) {
   const values = {
     python: config.pythonPath || '', cloudCheckpoint: config.cloudCheckpoint || '', edgeCheckpoint: config.edgeCheckpoint || '',
+    temporalCheckpoint: config.temporalCheckpoint || '',
     qwen: config.qwenPath || '', serverAddress: config.serverAddress || 'localhost', host: config.serverHost || '0.0.0.0', port: config.serverPort || 8080,
     device: config.device || 'cuda', timeout: config.timeout || 300, maxFrames: config.maxFrames || 8, sampleFps: config.sampleFps || 2,
     spatialLevel: config.spatialLevel || '49x64', rawWidth: config.rawWidth || 224, rawHeight: config.rawHeight || 224,
@@ -68,6 +69,7 @@ function loadSettingsForm(config) {
 function readSettingsForm() {
   return {
     pythonPath: $('setting-python').value.trim(), cloudCheckpoint: $('setting-cloud-checkpoint').value.trim(), edgeCheckpoint: $('setting-edge-checkpoint').value.trim(),
+    temporalCheckpoint: $('setting-temporal-checkpoint').value.trim(),
     qwenPath: $('setting-qwen').value.trim(), serverAddress: $('setting-server-address').value.trim(), serverHost: $('setting-host').value.trim(), serverPort: Number($('setting-port').value),
     device: $('setting-device').value, timeout: Number($('setting-timeout').value), maxFrames: Number($('setting-max-frames').value), sampleFps: Number($('setting-sample-fps').value),
     spatialLevel: $('setting-spatial-level').value.trim() || '49x64', rawWidth: Number($('setting-raw-width').value), rawHeight: Number($('setting-raw-height').value),
@@ -166,6 +168,9 @@ function appendResult(row) {
     item.append(metrics);
     const detail = document.createElement('div'); detail.className = 'muted';
     const sampling = row.sample_fps ? ` · 采样 ${row.sample_fps} FPS / 前缀约 ${Number(row.sampled_prefix_seconds || 0).toFixed(2)} s` : '';
+    const temporalPair = row.temporal_pair_fusion
+      ? ` · 时序网格 ${row.temporal_grids || 0}（由 ${row.frames || 0} 帧融合）`
+      : '';
     const codecSource = row.temporal_redundancy_acceleration
       ? ` · codec 源帧处理 ${row.codec_source_frames_processed}`
         + ` · 输出帧型 ${(row.codec_selected_frame_types || []).join('/') || '未知'}`
@@ -173,7 +178,7 @@ function appendResult(row) {
         + ` · 含解码 ${Number(row.codec_total_realtime_factor || 0).toFixed(2)}× realtime`
       : '';
     const nativeTokens = row.pure_qwen ? ` · Qwen视觉token ${row.native_visual_tokens || 0} · grid ${JSON.stringify(row.native_video_grid_thw || [])}` : '';
-    detail.textContent = `云端 TTFT ${ms(row.cloud_ttft_ms)} · HTTP 往返（含完整生成）${ms(row.http_roundtrip_ms)} · 云端解码 ${ms(row.cloud_decode_ms)} · 请求体 ${kb(row.request_bytes)} · 单帧 payload ${kb(row.payload_per_frame_bytes)} · ${row.bandwidth_kb_s ? `${row.bandwidth_kb_s} KB/s` : '带宽不限'}${sampling}${codecSource}${nativeTokens} · 特征 ${JSON.stringify(row.feature_shape || [])}`;
+    detail.textContent = `云端 TTFT ${ms(row.cloud_ttft_ms)} · HTTP 往返（含完整生成）${ms(row.http_roundtrip_ms)} · 云端解码 ${ms(row.cloud_decode_ms)} · 请求体 ${kb(row.request_bytes)} · 单输入帧 payload ${kb(row.payload_per_frame_bytes)} · ${row.bandwidth_kb_s ? `${row.bandwidth_kb_s} KB/s` : '带宽不限'}${sampling}${temporalPair}${codecSource}${nativeTokens} · 特征 ${JSON.stringify(row.feature_shape || [])}`;
     item.append(detail);
   }
   container.append(item);
@@ -190,6 +195,9 @@ async function runInference() {
   if (state.projects.some((project) => project !== 'baseline') && !state.config.edgeCheckpoint) {
     $('settings-modal').classList.remove('hidden'); $('settings-message').textContent = '请先设置端侧 checkpoint'; return;
   }
+  if (state.projects.includes('codec') && !state.config.temporalCheckpoint) {
+    $('settings-modal').classList.remove('hidden'); $('settings-message').textContent = '请先设置时序融合 checkpoint'; return;
+  }
   if (!state.projects.length) { $('run-status').textContent = '请先通过“＋ 添加项目”添加至少一个项目'; return; }
   state.running = true; state.streamedResults = 0; $('results').innerHTML = '<div class="empty">等待第一条消融结果…</div>'; $('run-button').disabled = true;
   try {
@@ -204,7 +212,8 @@ async function runInference() {
       await warmupCloud();
     }
     const result = await window.electronAPI.runDemoInference({
-      inputPath: state.inputPath, edgeCheckpoint: state.config.edgeCheckpoint, serverUrl: serverUrl(state.config), prompt: $('prompt').value,
+      inputPath: state.inputPath, edgeCheckpoint: state.config.edgeCheckpoint, temporalCheckpoint: state.config.temporalCheckpoint,
+      serverUrl: serverUrl(state.config), prompt: $('prompt').value,
       device: state.config.device, timeout: state.config.timeout, maxFrames: state.config.maxFrames, spatialLevel: state.config.spatialLevel,
       projects: state.projects,
       sampleFps: state.config.sampleFps,

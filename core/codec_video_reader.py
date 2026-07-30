@@ -56,8 +56,19 @@ def _select_best_effort_ip(records, target_fps, target_count):
     cursor = 0
     latest_ip = None
     selected_sources = set()
+    # Decoded streams can start at a small positive PTS (for example 80 ms).
+    # Anchor sampling to the actual stream origin so the t=0 request does not
+    # silently lose its first output frame.
+    stream_origin = next(
+        (
+            float(record["time_seconds"])
+            for record in records
+            if record["time_seconds"] is not None
+        ),
+        0.0,
+    )
     for output_index in range(target_count):
-        deadline = output_index / target_fps
+        deadline = stream_origin + output_index / target_fps
         while cursor < len(records):
             record = records[cursor]
             timestamp = record["time_seconds"]

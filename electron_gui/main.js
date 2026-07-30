@@ -14,12 +14,14 @@ let cloudServerProcess = null;
 let edgeClientProcess = null;
 let demoClientProcess = null;
 
-const defaultCheckpointDir = 'E:\\experiments\\SplitOculo\\checkpoints\\cc3m10k_multilevel_layer4\\split_gan_best';
+const defaultCheckpointDir = 'E:\\experiments\\SplitOculo\\checkpoints\\qwen_vit_h1280_layer4_224_b64_t256\\split_imported';
+const defaultTemporalCheckpoint = 'E:\\experiments\\SplitOculo\\checkpoints\\temporal_pair_ucf101\\temporal_pair_best.pth';
 
 // Configuration - Load defaults
 let config = {
   cloudCheckpoint: defaultCheckpointDir,
   edgeCheckpoint: defaultCheckpointDir,
+  temporalCheckpoint: defaultTemporalCheckpoint,
   serverHost: '0.0.0.0',
   serverAddress: 'localhost',
   serverPort: 8080,
@@ -333,14 +335,18 @@ ipcMain.handle('run-demo-inference', async (event, options) => {
       '--raw_height', String(options.rawHeight || 224),
       '--raw_fps', String(options.rawFps || 10),
       '--raw_format', options.rawFormat || 'rgb24',
-      '--codec_flow_impl', options.codecFlowImpl || 'feature_grid_center',
+      '--codec_flow_impl', options.codecFlowImpl || 'feature_grid',
       '--codec_selection_policy', options.codecSelectionPolicy || 'best_effort_ip',
       '--codec_reference_mode', options.codecReferenceMode || 'recursive',
+      '--codec_max_p_chain', String(options.codecMaxPChain ?? 4),
       '--codec_gop_frames', String(options.codecGopFrames || 4),
       '--projects', (options.projects || []).join(','),
     ];
     if (options.edgeCheckpoint) {
       args.push('--edge_checkpoint', resolveCheckpoint(options.edgeCheckpoint, 'edge'));
+    }
+    if (options.temporalCheckpoint) {
+      args.push('--temporal_pair_checkpoint', options.temporalCheckpoint);
     }
     if (options.bandwidthEnabled) args.push('--bandwidth_kb_s', String(options.bandwidthKbS || 62.5));
     if (options.sampleFps) args.push('--sample_fps', String(options.sampleFps));

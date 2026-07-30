@@ -19,6 +19,7 @@ import torch
 
 from models.multilevel import parse_payload_levels
 from models.codec_accelerator import CodecWarpAccelerator, DecoderMotionVectorAccelerator
+from models.temporal_pair import load_temporal_pair_fusion
 from core.codec_video_reader import read_video_records_with_mvs
 from scripts.edge_client import EdgeEncoder
 from scripts.cloud_server import CloudInferenceEngine
@@ -30,6 +31,12 @@ def main():
     parser.add_argument("--video", type=str, required=True)
     parser.add_argument("--edge_checkpoint", type=str, required=True)
     parser.add_argument("--cloud_checkpoint", type=str, required=True)
+    parser.add_argument(
+        "--temporal_pair_checkpoint",
+        type=str,
+        default=None,
+        help="Fuse adjacent frames into Qwen-native temporal grid units",
+    )
     parser.add_argument("--prompt", type=str, default="Describe this video briefly.")
     parser.add_argument("--max_frames", type=int, default=4)
     parser.add_argument("--sample_fps", type=float, default=None)
@@ -120,6 +127,10 @@ def main():
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     payload_level = parse_payload_levels(args.level)[0] if args.level else None
+    if args.temporal_pair_checkpoint and args.codec_acc:
+        parser.error("--temporal_pair_checkpoint does not yet support --codec_acc")
+    if args.temporal_pair_checkpoint and payload_level is not None:
+        parser.error("--temporal_pair_checkpoint currently requires the checkpoint's full payload")
     if args.edge_batch_size > 1 and args.codec_acc:
         parser.error("--edge_batch_size > 1 is only supported without --codec_acc")
     if args.edge_batch_size > 1 and payload_level is not None:
@@ -152,6 +163,23 @@ def main():
 
     edge_load_start = time.perf_counter()
     edge = EdgeEncoder(args.edge_checkpoint, device=args.device)
+    temporal_fusion = None
+    temporal_metadata = None
+    if args.temporal_pair_checkpoint:
+        temporal_fusion, temporal_metadata = load_temporal_pair_fusion(
+            args.temporal_pair_checkpoint, device=args.device
+        )
+        checkpoint_split_layer = int(
+            temporal_metadata.get("split_layer", args.split_layer)
+        )
+        if checkpoint_split_layer != args.split_layer:
+            parser.error(
+                "--split_layer does not match temporal checkpoint: "
+                f"{args.split_layer} != {checkpoint_split_layer}"
+            )
+        if int(temporal_metadata.get("temporal_patch_size", 2)) != 2:
+            parser.error("Only temporal_patch_size=2 checkpoints are supported")
+        temporal_fusion.eval()
     edge_load_seconds = time.perf_counter() - edge_load_start
     frame_features = []
     edge_encode_seconds = 0.0
@@ -175,7 +203,33 @@ def main():
         else None
     )
     codec_frame_records = []
-    if decoder_accelerator is not None:
+    if temporal_fusion is not None:
+        encode_start = time.perf_counter()
+        paired_frames = []
+        for index in range(0, len(frames), 2):
+            frame0 = frames[index]
+            frame1 = frames[index + 1] if index + 1 < len(frames) else frame0
+            paired_frames.extend((frame0, frame1))
+        image_tensor = torch.stack(
+            [edge.transform(frame.convert("RGB")) for frame in paired_frames],
+            dim=0,
+        )
+        image_tensor = edge.input_to_device(image_tensor)
+        with torch.inference_mode():
+            backbone = edge.student(image_tensor)[-1]
+            fused = temporal_fusion(backbone[0::2], backbone[1::2])
+            tokens = edge.projector(fused)
+            if edge.bottleneck is not None:
+                tokens = edge.bottleneck.encode(tokens)
+            frame_features.extend(tokens[index].detach() for index in range(tokens.shape[0]))
+        if str(args.device).startswith("cuda"):
+            torch.cuda.synchronize()
+        edge_encode_seconds = time.perf_counter() - encode_start
+        print(
+            f"Encoded {len(frames)} frames as {len(frame_features)} native temporal pairs: "
+            f"{tuple(tokens.shape)}"
+        )
+    elif decoder_accelerator is not None:
         deferred_features = []
         for record in decoder_records:
             features, is_compressed, codec_info = decoder_accelerator.encode_record(
@@ -271,6 +325,8 @@ def main():
                 "edge_checkpoint": args.edge_checkpoint,
                 "cloud_checkpoint": args.cloud_checkpoint,
                 "codec_acc": args.codec_acc,
+                "temporal_pair_checkpoint": args.temporal_pair_checkpoint,
+                "temporal_patch_size": 2 if temporal_fusion is not None else 1,
                 "codec_gop_frames": args.codec_gop_frames
                 if args.codec_acc and args.codec_mv_backend == "farneback" else None,
                 "codec_mv_backend": args.codec_mv_backend if args.codec_acc else None,
@@ -326,7 +382,11 @@ def main():
         "native_fps": native_fps,
         "reader": reader,
         "edge_feature_shape": list(compressed_frame_features.shape),
-        "video_grid_thw": [len(frames), target_side, target_side],
+        "video_grid_thw": [
+            int(compressed_frame_features.shape[0]),
+            target_side,
+            target_side,
+        ],
         "edge_checkpoint": args.edge_checkpoint,
         "cloud_checkpoint": args.cloud_checkpoint,
         "qwen_path": args.qwen_path,
@@ -336,6 +396,18 @@ def main():
         "codec_projection_batch_size": args.codec_projection_batch_size,
         "max_new_tokens": args.max_new_tokens,
         "payload_level": args.level,
+        "temporal_pair_checkpoint": args.temporal_pair_checkpoint,
+        "temporal_pair_metadata": {
+            "split_layer": temporal_metadata.get("split_layer"),
+            "temporal_patch_size": temporal_metadata.get("temporal_patch_size", 2),
+            "sample_fps": args.sample_fps,
+            "seconds_per_grid": (
+                2.0 / args.sample_fps
+                if args.sample_fps and args.sample_fps > 0
+                else None
+            ),
+        } if temporal_metadata is not None else None,
+        "temporal_grid_count": int(compressed_frame_features.shape[0]),
         "codec_acc": args.codec_acc,
         "codec_gop_frames": args.codec_gop_frames
         if args.codec_acc and args.codec_mv_backend == "farneback" else None,
