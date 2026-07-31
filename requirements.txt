@@ -4,7 +4,9 @@ torch>=2.0.0
 torchvision
 timm>=0.9.0
 pandas
-numpy
+# The current PyTorch/OpenCV stack in the deployment image is built against
+# NumPy 1.x; NumPy 2.x makes torch.from_numpy unavailable at runtime.
+numpy<2
 matplotlib
 tqdm
 

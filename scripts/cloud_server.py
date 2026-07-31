@@ -273,7 +273,7 @@ class CloudInferenceEngine:
             offline = getattr(self, 'offline_mode', False)
             self.load_qwen(model_name=model_path, local_only=offline)
         
-        visual = self.qwen_model.visual
+        visual = self.qwen_model.model.visual
         B = upsampled.shape[0]
         target_h = target_w = int(self.target_tokens ** 0.5)
         
@@ -498,7 +498,7 @@ class CloudInferenceEngine:
             offline = getattr(self, 'offline_mode', False)
             self.load_qwen(model_name=model_path, local_only=offline)
 
-        visual = self.qwen_model.visual
+        visual = self.qwen_model.model.visual
         batch_size = upsampled.shape[0]
         if grid_thw is None:
             target_h = target_w = int(self.target_tokens ** 0.5)
@@ -793,7 +793,7 @@ class CloudInferenceEngine:
             "visual_grid_thw": grid_thw.detach().cpu().tolist(),
             "visual_tokens_after_merge": int(
                 frame_count * target_h * target_w
-                // (self.qwen_model.visual.spatial_merge_size**2)
+                // (self.qwen_model.model.visual.spatial_merge_size**2)
             ),
         }
         return answer, metrics

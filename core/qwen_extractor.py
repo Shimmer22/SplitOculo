@@ -103,10 +103,11 @@ class QwenFeatureExtractor:
         self.model.eval()
         
         # 获取实际层数及 patch 维度
-        self.total_layers = len(self.model.visual.blocks)
+        visual = self.model.model.visual
+        self.total_layers = len(visual.blocks)
         # 计算 pixel patch dim: patch_embed 的 proj 权重 shape = (out_ch, in_ch, kH, kW)
         # in_ch * kH * kW = pixel_patch_dim
-        proj_w = self.model.visual.patch_embed.proj.weight
+        proj_w = visual.patch_embed.proj.weight
         self._pixel_patch_dim = proj_w.shape[1] * proj_w.shape[2] * proj_w.shape[3]
         print(f"Model loaded (ViT has {self.total_layers} layers, extract layer {self.extract_layer})")
         if self.extract_layer == -1:
@@ -165,7 +166,7 @@ class QwenFeatureExtractor:
         else:
             # 提取中间层 (layer 0 = patch_embed, layer N = after N blocks)
             hidden_states = self._extract_intermediate_layer(
-                pixel_values.to(self.model.visual.patch_embed.proj.weight.dtype),
+                pixel_values.to(self.model.model.visual.patch_embed.proj.weight.dtype),
                 grid_thw=grid_thw
             )
         
@@ -229,7 +230,7 @@ class QwenFeatureExtractor:
             hidden_states = self._extract_pixel_patches(pixel_values)
         else:
             hidden_states = self._extract_intermediate_layer(
-                pixel_values.to(self.model.visual.patch_embed.proj.weight.dtype),
+                pixel_values.to(self.model.model.visual.patch_embed.proj.weight.dtype),
                 grid_thw=grid_thw,
             )
 
@@ -258,7 +259,7 @@ class QwenFeatureExtractor:
         
         完全匹配 Qwen2_5_VisionTransformerPretrainedModel.forward() 实现
         """
-        visual = self.model.visual
+        visual = self.model.model.visual
         
         # 1. Patch embedding
         hidden_states = visual.patch_embed(pixel_values)

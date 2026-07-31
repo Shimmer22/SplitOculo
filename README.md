@@ -247,6 +247,76 @@ The current one-reference state assumes normal IP or non-reference-B streams;
 re-encode with `-bf 0` for the cleanest first deployment test. A learned
 residual correction can be enabled after training the MMNet-style memory below.
 
+### 8. Train temporal pair fusion from an existing checkpoint
+
+The temporal module is trained separately from the existing edge/cloud models.
+The old `edge_weights.pth` and `cloud_weights.pth` stay frozen; only the small
+`TemporalPairFusion` is optimized against native two-frame Qwen visual features.
+An old spatial checkpoint can therefore support the temporal demo without
+retraining the split GAN.
+
+For mainland-China connectivity, download the public 10-class UCF101 subset and
+create balanced manifests:
+
+```bash
+python scripts/download_ucf101_subset.py \
+  --output_dir data/ucf101_subset \
+  --train_limit 100 \
+  --val_limit 30 \
+  --test_limit 30
+```
+
+The script supports resumable downloads, safe extraction, and writes train/val/
+test manifests. It falls back to PyAV when OpenCV cannot decode an AVI file.
+
+Cache native frame-pair targets with the locally cached Qwen2.5-VL-32B model:
+
+```bash
+QWEN32B=/path/to/Qwen2.5-VL-32B-Instruct
+python scripts/train_temporal_pair.py \
+  --stage cache \
+  --video_manifest data/ucf101_subset/ucf101_train_100.manifest.txt \
+  --cache_dir outputs/temporal_cache_ucf101_train100 \
+  --qwen_path "$QWEN32B" \
+  --split_layer 4 \
+  --max_pairs_per_video 2 \
+  --static_ratio 0.25 \
+  --device cuda \
+  --offline
+```
+
+Train and evaluate using the existing split checkpoints:
+
+```bash
+python scripts/train_temporal_pair.py \
+  --stage train \
+  --cache_dir outputs/temporal_cache_ucf101_train100 \
+  --val_cache_dir outputs/temporal_cache_ucf101_val30 \
+  --edge_checkpoint checkpoints/ckpt/split/edge_weights.pth \
+  --cloud_checkpoint checkpoints/ckpt/split/cloud_weights.pth \
+  --qwen_path Qwen/Qwen2.5-VL-32B-Instruct \
+  --split_layer 4 \
+  --epochs 10 \
+  --batch_size 8 \
+  --output_dir outputs/temporal_pair_ucf101_32b \
+  --device cuda \
+  --offline
+
+python scripts/train_temporal_pair.py \
+  --stage eval \
+  --cache_dir outputs/temporal_cache_ucf101_val30 \
+  --temporal_checkpoint outputs/temporal_pair_ucf101_32b/temporal_pair_best.pth \
+  --edge_checkpoint checkpoints/ckpt/split/edge_weights.pth \
+  --cloud_checkpoint checkpoints/ckpt/split/cloud_weights.pth \
+  --split_layer 4 \
+  --device cuda \
+  --offline
+```
+
+Existing teacher-cache entries are reused; add `--overwrite_cache` to rebuild
+them. Resume a temporal run with `--resume_checkpoint ...`; `--epochs` is the
+total target epoch count.
+
 ### MMNet-style residual correction
 
 The codec accelerator now supports a lightweight memory module inspired by

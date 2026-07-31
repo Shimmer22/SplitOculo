@@ -30,7 +30,7 @@ from scripts.edge_client import EdgeEncoder
 VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 
-def find_videos(video_dir=None, videos=None):
+def find_videos(video_dir=None, videos=None, video_manifest=None):
     paths = []
     if video_dir:
         root = Path(video_dir)
@@ -38,6 +38,16 @@ def find_videos(video_dir=None, videos=None):
             path for path in root.rglob("*")
             if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES
         )
+    if video_manifest:
+        manifest_path = Path(video_manifest)
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            path = Path(value)
+            if not path.is_absolute():
+                path = manifest_path.parent / path
+            paths.append(path)
     paths.extend(Path(path) for path in (videos or []))
     unique = []
     seen = set()
@@ -45,9 +55,13 @@ def find_videos(video_dir=None, videos=None):
         resolved = str(path.resolve())
         if resolved not in seen:
             seen.add(resolved)
+            if not path.is_file():
+                raise FileNotFoundError(f"Video does not exist: {path}")
             unique.append(path)
     if not unique:
-        raise ValueError("No videos found. Pass --video or --video_dir.")
+        raise ValueError(
+            "No videos found. Pass --video, --video_dir, or --video_manifest."
+        )
     return unique
 
 
@@ -71,13 +85,51 @@ def square_center_crop(image, image_size):
     )
 
 
+def _read_video_pairs_pyav(video_path, pair_count, sample_fps):
+    import av
+
+    container = av.open(str(video_path))
+    stream = container.streams.video[0]
+    native_fps = float(stream.average_rate or stream.guessed_rate or 0.0)
+    total_frames = int(stream.frames or 0)
+    if total_frames <= 0:
+        total_frames = sum(1 for _ in container.decode(video=0))
+        container.seek(0)
+    gap = max(1, int(round(native_fps / sample_fps))) if native_fps > 0 else 1
+    latest_start = max(0, total_frames - gap - 1)
+    if pair_count == 1:
+        starts = [latest_start // 2]
+    else:
+        starts = np.linspace(0, latest_start, pair_count + 2)[1:-1]
+        starts = np.rint(starts).astype(int).tolist()
+    wanted = {
+        index
+        for start in starts
+        for index in (int(start), min(int(start) + gap, max(0, total_frames - 1)))
+    }
+    decoded = {}
+    for index, frame in enumerate(container.decode(video=0)):
+        if index in wanted:
+            decoded[index] = Image.fromarray(frame.to_ndarray(format="rgb24"))
+        if index > max(wanted, default=-1):
+            break
+    container.close()
+    pairs = [
+        (decoded[start], decoded[end], start, end)
+        for start in starts
+        for end in [min(int(start) + gap, max(0, total_frames - 1))]
+        if start in decoded and end in decoded
+    ]
+    return pairs, native_fps, "pyav"
+
+
 def read_video_pairs(video_path, pair_count, sample_fps):
-    """Read evenly spaced pairs without decoding an entire video."""
+    """Read evenly spaced pairs, falling back to PyAV for difficult AVI files."""
     import cv2
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
+        return _read_video_pairs_pyav(video_path, pair_count, sample_fps)
     native_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     gap = max(1, int(round(native_fps / sample_fps))) if native_fps > 0 else 1
@@ -102,16 +154,19 @@ def read_video_pairs(video_path, pair_count, sample_fps):
         if len(decoded) == 2:
             pairs.append((decoded[0], decoded[1], int(start), int(start) + gap))
     cap.release()
+    if not pairs:
+        return _read_video_pairs_pyav(video_path, pair_count, sample_fps)
     return pairs, native_fps, "cv2_seek"
 
 
 def create_teacher_cache(args):
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    for stale in cache_dir.glob("pair_*.pt"):
-        stale.unlink()
+    if args.overwrite_cache:
+        for stale in cache_dir.glob("pair_*.pt"):
+            stale.unlink()
 
-    videos = find_videos(args.video_dir, args.video)
+    videos = find_videos(args.video_dir, args.video, args.video_manifest)
     samples = []
     for video_path in videos:
         pairs, native_fps, reader = read_video_pairs(
@@ -159,14 +214,24 @@ def create_teacher_cache(args):
         )
     random.Random(args.seed).shuffle(samples)
 
-    extractor = QwenFeatureExtractor(
-        model_name=args.qwen_path,
-        device=args.device,
-        extract_layer=args.split_layer,
-        local_files_only=args.offline,
-        min_pixels=args.image_size * args.image_size,
-        max_pixels=args.image_size * args.image_size,
-    ).load()
+    pending_indices = [
+        index
+        for index in range(len(samples))
+        if args.overwrite_cache
+        or not (cache_dir / f"pair_{index:05d}.pt").is_file()
+    ]
+    extractor = (
+        QwenFeatureExtractor(
+            model_name=args.qwen_path,
+            device=args.device,
+            extract_layer=args.split_layer,
+            local_files_only=args.offline,
+            min_pixels=args.image_size * args.image_size,
+            max_pixels=args.image_size * args.image_size,
+        ).load()
+        if pending_indices
+        else None
+    )
 
     manifest = {
         "qwen_path": args.qwen_path,
@@ -177,41 +242,57 @@ def create_teacher_cache(args):
         "samples": [],
     }
     for sample_index, sample in enumerate(tqdm(samples, desc="Caching native Qwen pairs")):
-        teacher, grid_thw = extractor.extract_video_features(
-            [sample["frame0"], sample["frame1"]]
-        )
-        if int(grid_thw[0]) != 1:
-            raise RuntimeError(f"Two frames should produce grid_t=1, got {grid_thw.tolist()}")
-        expected_side = args.image_size // 14
-        if tuple(int(value) for value in grid_thw.tolist()) != (
-            1,
-            expected_side,
-            expected_side,
-        ):
-            raise RuntimeError(
-                f"Expected square teacher grid [1,{expected_side},{expected_side}], "
-                f"got {grid_thw.tolist()}"
-            )
         output_path = cache_dir / f"pair_{sample_index:05d}.pt"
-        torch.save(
-            {
-                "frames_uint8": torch.stack(
-                    (
-                        pil_to_uint8_tensor(sample["frame0"]),
-                        pil_to_uint8_tensor(sample["frame1"]),
-                    )
-                ),
-                "teacher_features": teacher.float(),
-                "video_grid_thw": grid_thw,
-                "static": sample["static"],
-                "source": sample["source"],
-                "source_pair": sample["source_pair"],
-                "source_frames": sample["source_frames"],
-                "label": sample["label"],
-                "split": sample["split"],
-            },
-            output_path,
-        )
+        if output_path.is_file() and not args.overwrite_cache:
+            cached = torch.load(output_path, map_location="cpu", weights_only=False)
+            if (
+                cached.get("source") != sample["source"]
+                or cached.get("source_frames") != sample["source_frames"]
+                or bool(cached.get("static")) != bool(sample["static"])
+            ):
+                raise RuntimeError(
+                    f"Cache entry {output_path} belongs to different input data; "
+                    "pass --overwrite_cache to rebuild the cache"
+                )
+            teacher = cached["teacher_features"]
+            grid_thw = cached["video_grid_thw"]
+        else:
+            teacher, grid_thw = extractor.extract_video_features(
+                [sample["frame0"], sample["frame1"]]
+            )
+            if int(grid_thw[0]) != 1:
+                raise RuntimeError(
+                    f"Two frames should produce grid_t=1, got {grid_thw.tolist()}"
+                )
+            expected_side = args.image_size // 14
+            if tuple(int(value) for value in grid_thw.tolist()) != (
+                1,
+                expected_side,
+                expected_side,
+            ):
+                raise RuntimeError(
+                    f"Expected square teacher grid [1,{expected_side},{expected_side}], "
+                    f"got {grid_thw.tolist()}"
+            )
+            torch.save(
+                {
+                    "frames_uint8": torch.stack(
+                        (
+                            pil_to_uint8_tensor(sample["frame0"]),
+                            pil_to_uint8_tensor(sample["frame1"]),
+                        )
+                    ),
+                    "teacher_features": teacher.float(),
+                    "video_grid_thw": grid_thw,
+                    "static": sample["static"],
+                    "source": sample["source"],
+                    "source_pair": sample["source_pair"],
+                    "source_frames": sample["source_frames"],
+                    "label": sample["label"],
+                    "split": sample["split"],
+                },
+                output_path,
+            )
         manifest["samples"].append(
             {
                 "file": output_path.name,
@@ -437,9 +518,35 @@ def make_loader(cache_dir, transform, batch_size, shuffle):
 
 def train_temporal_fusion(args):
     device, edge, cloud, in_channels = build_frozen_pipeline(args)
+    resume = None
+    if args.resume_checkpoint:
+        resume = torch.load(
+            args.resume_checkpoint, map_location=device, weights_only=False
+        )
+        saved_channels = int(resume["in_channels"])
+        if saved_channels != in_channels:
+            raise ValueError(
+                f"Resume checkpoint has {saved_channels} input channels, "
+                f"but edge checkpoint produces {in_channels}"
+            )
+        saved_hidden = int(resume.get("hidden_channels", args.temporal_hidden))
+        expected_hidden = min(int(args.temporal_hidden), in_channels)
+        if saved_hidden != expected_hidden:
+            raise ValueError(
+                f"Resume checkpoint has temporal_hidden={saved_hidden}, "
+                f"but --temporal_hidden resolves to {expected_hidden}"
+            )
+        saved_split = int(resume.get("split_layer", args.split_layer))
+        if saved_split != args.split_layer:
+            raise ValueError(
+                f"Resume checkpoint uses split_layer={saved_split}, "
+                f"but --split_layer is {args.split_layer}"
+            )
     fusion = TemporalPairFusion(
         in_channels=in_channels, hidden_channels=args.temporal_hidden
     ).to(device)
+    if resume is not None:
+        fusion.load_state_dict(resume["temporal_fusion_state_dict"])
 
     loader = make_loader(
         args.cache_dir, edge.transform, args.batch_size, shuffle=True
@@ -451,13 +558,25 @@ def train_temporal_fusion(args):
     optimizer = torch.optim.AdamW(
         fusion.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
+    if resume is not None and resume.get("optimizer_state_dict"):
+        optimizer.load_state_dict(resume["optimizer_state_dict"])
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    history = []
-    global_step = 0
-    best_val_mse = float("inf")
-    for epoch in range(1, args.epochs + 1):
+    history = list(resume.get("history", [])) if resume is not None else []
+    global_step = int(resume.get("global_step", 0)) if resume is not None else 0
+    best_val_mse = (
+        float(resume.get("best_val_mse", float("inf")))
+        if resume is not None
+        else float("inf")
+    )
+    start_epoch = int(resume.get("epoch", len(history))) + 1 if resume else 1
+    if start_epoch > args.epochs:
+        raise ValueError(
+            f"Resume checkpoint is already at epoch {start_epoch - 1}; "
+            f"set --epochs above {start_epoch - 1}"
+        )
+    for epoch in range(start_epoch, args.epochs + 1):
         fusion.train()
         totals = {
             "loss": 0.0,
@@ -532,6 +651,12 @@ def train_temporal_fusion(args):
             val_metrics = evaluate_fusion(edge, cloud, fusion, val_loader, device)
             metrics["val"] = val_metrics
         history.append(metrics)
+        is_best = False
+        if val_loader is not None:
+            val_mse = metrics["val"]["dynamic"]["mse"]
+            if val_mse is not None and val_mse < best_val_mse:
+                best_val_mse = val_mse
+                is_best = True
         checkpoint = {
             "temporal_fusion_state_dict": fusion.state_dict(),
             "in_channels": in_channels,
@@ -549,13 +674,14 @@ def train_temporal_fusion(args):
                 "keep": args.lambda_keep,
             },
             "history": history,
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_val_mse": best_val_mse,
+            "optimizer_state_dict": optimizer.state_dict(),
         }
         torch.save(checkpoint, output_dir / "temporal_pair_latest.pth")
-        if val_loader is not None:
-            val_mse = metrics["val"]["dynamic"]["mse"]
-            if val_mse is not None and val_mse < best_val_mse:
-                best_val_mse = val_mse
-                torch.save(checkpoint, output_dir / "temporal_pair_best.pth")
+        if is_best:
+            torch.save(checkpoint, output_dir / "temporal_pair_best.pth")
         if args.max_steps and global_step >= args.max_steps:
             break
 
@@ -594,6 +720,7 @@ def parse_args():
     )
     parser.add_argument("--video_dir")
     parser.add_argument("--video", action="append", default=[])
+    parser.add_argument("--video_manifest")
     parser.add_argument("--cache_dir", required=True)
     parser.add_argument("--val_cache_dir")
     parser.add_argument("--edge_checkpoint")
@@ -617,6 +744,15 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=0)
     parser.add_argument("--output_dir", default="checkpoints/temporal_pair")
     parser.add_argument("--temporal_checkpoint")
+    parser.add_argument(
+        "--resume_checkpoint",
+        help="Continue training from temporal_pair_latest.pth; --epochs is total epochs",
+    )
+    parser.add_argument(
+        "--overwrite_cache",
+        action="store_true",
+        help="Delete and rebuild existing pair_*.pt teacher cache entries",
+    )
     parser.add_argument(
         "--eval_output", default="outputs/temporal_pair/evaluation.json"
     )
