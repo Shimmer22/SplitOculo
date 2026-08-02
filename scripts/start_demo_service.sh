@@ -18,9 +18,11 @@ cd "$ROOT_DIR"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv-temporal/bin/python}"
 CLOUD_HOST="${CLOUD_HOST:-127.0.0.1}"
 CLOUD_PORT="${CLOUD_PORT:-8080}"
-QWEN_PATH="${QWEN_PATH:-Qwen/Qwen2.5-VL-3B-Instruct}"
+QWEN_PATH="${QWEN_PATH:-Qwen/Qwen2.5-VL-32B-Instruct}"
 MAX_VIDEO_FRAMES="${MAX_VIDEO_FRAMES:-16}"
-CLOUD_CHECKPOINT="${CLOUD_CHECKPOINT:-$ROOT_DIR/checkpoints/ckpt/split/cloud_weights.pth}"
+# Default to the spatial cloud half of the validated LLaVA-558K split model.
+# Override with CLOUD_CHECKPOINT=/path/to/cloud_weights.pth for another run.
+CLOUD_CHECKPOINT="${CLOUD_CHECKPOINT:-$ROOT_DIR/checkpoints/llava558k_32b_49x64_rolling/split/cloud_weights.pth}"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs}"
 CLOUD_LOG="${CLOUD_LOG:-$LOG_DIR/cloud_server.log}"
 NGROK_LOG="${NGROK_LOG:-$LOG_DIR/ngrok.log}"
@@ -125,7 +127,10 @@ start_cloud() {
     die "port $CLOUD_PORT is already occupied, but it is not a ready SplitOculo cloud server; inspect with: ss -ltnp | grep :$CLOUD_PORT"
   else
     echo "starting cloud server with $QWEN_PATH ..."
-    nohup "$PYTHON_BIN" scripts/cloud_server.py \
+    # Start in a fresh session so the cloud server survives the shell/tool
+    # that launched this helper.  nohup alone does not detach the process
+    # group in all container environments.
+    setsid "$PYTHON_BIN" scripts/cloud_server.py \
       --checkpoint "$CLOUD_CHECKPOINT" \
       --host "$CLOUD_HOST" \
       --port "$CLOUD_PORT" \
@@ -174,7 +179,7 @@ start_ngrok() {
   fi
 
   echo "starting ngrok tunnel ..."
-  nohup ngrok http "$CLOUD_HOST:$CLOUD_PORT" \
+  setsid ngrok http "$CLOUD_HOST:$CLOUD_PORT" \
     --basic-auth "$NGROK_BASIC_AUTH_USER:$NGROK_BASIC_AUTH_PASSWORD" \
     --log=stdout \
     >"$NGROK_LOG" 2>&1 < /dev/null &
