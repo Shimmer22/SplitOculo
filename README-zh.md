@@ -208,6 +208,31 @@ python scripts/edge_client.py \
   --timeout 300
 ```
 
+如果云端服务器已经运行，但希望由客户端指定云端使用的 cloud checkpoint，
+可以在边端命令中加入 `--cloud_checkpoint`：
+
+```bash
+python scripts/edge_client.py \
+  --checkpoint ./checkpoints/gan_bottleneck/split/edge_weights.pth \
+  --cloud_checkpoint /models/experiment_b/cloud_weights.pth \
+  --image ./test.jpg \
+  --server http://CLOUD_IP:8080
+```
+
+该参数是“云端可访问”的路径，不是边端机器上的路径。服务器也提供等价的
+HTTP 接口：
+
+```bash
+curl -X POST http://CLOUD_IP:8080/load_checkpoint \
+  -H 'Content-Type: application/json' \
+  -d '{"checkpoint_path":"/models/experiment_b/cloud_weights.pth"}'
+```
+
+`checkpoint_path` 可以是云端本地文件路径（传目录时会自动查找其中的
+`cloud_weights.pth`），也可以是云端能够访问的绝对 `http(s)` 地址。切换过程
+会与推理串行化；加载失败时旧 checkpoint 仍保持有效。由于 PyTorch checkpoint
+使用 pickle 反序列化，这个接口只应开放给可信客户端和受信任的 checkpoint 来源。
+
 ## 当前限制
 
 - OCR、图表和结构化图文理解仍弱于完整 Qwen 基线

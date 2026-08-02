@@ -208,6 +208,34 @@ python scripts/edge_client.py \
   --timeout 300
 ```
 
+If the cloud server is already running and the edge client should select the
+cloud-side checkpoint, pass a path that is visible on the cloud host:
+
+```bash
+python scripts/edge_client.py \
+  --checkpoint ./checkpoints/gan_bottleneck/split/edge_weights.pth \
+  --cloud_checkpoint /models/experiment_b/cloud_weights.pth \
+  --image ./test.jpg \
+  --server http://CLOUD_IP:8080
+```
+
+The server exposes the same operation as `POST /load_checkpoint` (also
+available as `/load_ckpt`):
+
+```bash
+curl -X POST http://CLOUD_IP:8080/load_checkpoint \
+  -H 'Content-Type: application/json' \
+  -d '{"checkpoint_path":"/models/experiment_b/cloud_weights.pth"}'
+```
+
+`checkpoint_path` is resolved on the cloud host, not on the edge client. It may
+also be an absolute `http(s)` URL that the cloud host can download. Passing a
+directory makes the server look for `cloud_weights.pth` inside it. Checkpoint
+switching is serialized with inference, and a failed load leaves the previous
+checkpoint active. PyTorch checkpoints are deserialized with pickle, so this
+endpoint should only be exposed to trusted clients and trusted checkpoint
+sources.
+
 ### 7. Run Video Inference
 
 The default video path independently runs the edge CNN on every sampled frame:

@@ -28,6 +28,7 @@ from scripts.edge_client import EdgeEncoder
 
 
 VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+_OPENCV_IMPORT_WARNING_SHOWN = False
 
 
 def find_videos(video_dir=None, videos=None, video_manifest=None):
@@ -66,13 +67,29 @@ def find_videos(video_dir=None, videos=None, video_manifest=None):
 
 
 def pil_to_uint8_tensor(image):
-    array = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
-    return torch.from_numpy(array).permute(2, 0, 1)
+    # Avoid torch.from_numpy here.  The supplied PyTorch wheel was built
+    # against NumPy 1.x while this environment has NumPy 2.x, so PyTorch
+    # deliberately disables its NumPy bridge.  PIL's raw RGB bytes are stable
+    # and preserve the exact uint8 image without that bridge.
+    image = image.convert("RGB")
+    width, height = image.size
+    raw = bytearray(image.tobytes())
+    return (
+        torch.frombuffer(raw, dtype=torch.uint8)
+        .clone()
+        .view(height, width, 3)
+        .permute(2, 0, 1)
+        .contiguous()
+    )
 
 
 def uint8_tensor_to_pil(tensor):
-    array = tensor.permute(1, 2, 0).cpu().numpy()
-    return Image.fromarray(array)
+    tensor = tensor.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    channels, height, width = tensor.shape
+    if channels != 3:
+        raise ValueError(f"Expected RGB tensor with 3 channels, got {tensor.shape}")
+    raw = bytes(tensor.permute(1, 2, 0).contiguous().view(-1).tolist())
+    return Image.frombytes("RGB", (width, height), raw)
 
 
 def square_center_crop(image, image_size):
@@ -125,7 +142,23 @@ def _read_video_pairs_pyav(video_path, pair_count, sample_fps):
 
 def read_video_pairs(video_path, pair_count, sample_fps):
     """Read evenly spaced pairs, falling back to PyAV for difficult AVI files."""
-    import cv2
+    # OpenCV is convenient for random access, but some environments ship a
+    # wheel built against NumPy 1.x while the runtime has NumPy 2.x.  Import
+    # failure must not make the temporal cache unusable; PyAV is a complete
+    # fallback and is already required for difficult AVI files.
+    try:
+        import cv2
+        # Some LLaVA-Video MP4s make OpenCV's image-sequence probe emit a
+        # noisy warning before we fall back to PyAV.  This is an expected
+        # reader fallback, not a data error; keep the long cache logs usable.
+        if hasattr(cv2, "setLogLevel"):
+            cv2.setLogLevel(0)
+    except Exception as exc:
+        global _OPENCV_IMPORT_WARNING_SHOWN
+        if not _OPENCV_IMPORT_WARNING_SHOWN:
+            print(f"OpenCV unavailable ({exc!r}); using PyAV for all videos")
+            _OPENCV_IMPORT_WARNING_SHOWN = True
+        return _read_video_pairs_pyav(video_path, pair_count, sample_fps)
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -228,17 +261,24 @@ def create_teacher_cache(args):
             local_files_only=args.offline,
             min_pixels=args.image_size * args.image_size,
             max_pixels=args.image_size * args.image_size,
+            visual_only=True,
         ).load()
         if pending_indices
         else None
     )
 
+    cache_dtype = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }[args.teacher_dtype]
     manifest = {
         "qwen_path": args.qwen_path,
         "split_layer": args.split_layer,
         "sample_fps": args.sample_fps,
         "image_size": args.image_size,
         "temporal_patch_size": 2,
+        "teacher_dtype": args.teacher_dtype,
         "samples": [],
     }
     for sample_index, sample in enumerate(tqdm(samples, desc="Caching native Qwen pairs")):
@@ -282,7 +322,10 @@ def create_teacher_cache(args):
                             pil_to_uint8_tensor(sample["frame1"]),
                         )
                     ),
-                    "teacher_features": teacher.float(),
+                    # The training loader promotes this back to float32.  A
+                    # bfloat16 cache halves the teacher storage while keeping
+                    # the dynamic range needed by the Qwen visual features.
+                    "teacher_features": teacher.to(cache_dtype),
                     "video_grid_thw": grid_thw,
                     "static": sample["static"],
                     "source": sample["source"],
@@ -657,6 +700,36 @@ def train_temporal_fusion(args):
             if val_mse is not None and val_mse < best_val_mse:
                 best_val_mse = val_mse
                 is_best = True
+
+        # Report validation immediately after every epoch.  Previously val was
+        # computed and embedded in the checkpoint, but the training process did
+        # not print it and train_metrics.json was only written after all epochs,
+        # making a running job look as if it had no validation at all.
+        if val_loader is not None:
+            val_all = metrics["val"]["all"]
+            val_dynamic = metrics["val"]["dynamic"]
+            print(
+                f"Epoch {epoch}/{args.epochs} summary | "
+                f"train_loss={metrics['loss']:.6f} | "
+                f"val_all_mse={val_all['mse']:.6f} "
+                f"val_all_cos={val_all['cosine']:.6f} | "
+                f"val_dynamic_mse={val_dynamic['mse']:.6f} "
+                f"val_dynamic_cos={val_dynamic['cosine']:.6f} | "
+                f"dynamic_vs_baseline_mse={val_dynamic['mse_improvement']:.6f}",
+                flush=True,
+            )
+        else:
+            print(
+                f"Epoch {epoch}/{args.epochs} summary | "
+                f"train_loss={metrics['loss']:.6f}",
+                flush=True,
+            )
+
+        # Persist history after each epoch so it is available while training
+        # is still running, not only after the final epoch.
+        (output_dir / "train_metrics.json").write_text(
+            json.dumps(history, indent=2), encoding="utf-8"
+        )
         checkpoint = {
             "temporal_fusion_state_dict": fusion.state_dict(),
             "in_channels": in_channels,
@@ -725,12 +798,18 @@ def parse_args():
     parser.add_argument("--val_cache_dir")
     parser.add_argument("--edge_checkpoint")
     parser.add_argument("--cloud_checkpoint")
-    parser.add_argument("--qwen_path", default="Qwen/Qwen2.5-VL-3B-Instruct")
+    parser.add_argument("--qwen_path", default="Qwen/Qwen2.5-VL-32B-Instruct")
     parser.add_argument("--split_layer", type=int, default=4)
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--sample_fps", type=float, default=2.0)
     parser.add_argument("--max_pairs_per_video", type=int, default=8)
     parser.add_argument("--static_ratio", type=float, default=0.25)
+    parser.add_argument(
+        "--teacher_dtype",
+        choices=("float32", "bfloat16", "float16"),
+        default="bfloat16",
+        help="dtype stored on disk for Qwen teacher features; loader restores float32",
+    )
     parser.add_argument("--temporal_hidden", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=2)

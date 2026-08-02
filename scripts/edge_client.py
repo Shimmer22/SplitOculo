@@ -7,7 +7,8 @@ Usage:
     python scripts/edge_client.py \
         --checkpoint ./checkpoints/gan_bottleneck/gan_best.pth \
         --image ./test.jpg \
-        --server http://localhost:8080
+        --server http://localhost:8080 \
+        --cloud_checkpoint /models/cloud_weights.pth
 
 特点:
 - 仅加载端侧模型 (CNN + Projector + Bottleneck.encoder)
@@ -36,6 +37,21 @@ from models.pooling_projector import PoolingTokenProjector
 from models.strided_projector import StridedTokenProjector
 from models.bottleneck import DimensionBottleneck
 from models.multilevel import parse_payload_levels, resize_tokens, truncate_dim
+
+
+def load_cloud_checkpoint(server, checkpoint_path, timeout=300, force_reload=False):
+    """Ask the cloud server to load a checkpoint visible on the cloud host."""
+    response = requests.post(
+        f"{server.rstrip('/')}/load_checkpoint",
+        json={
+            'checkpoint_path': checkpoint_path,
+            'force_reload': bool(force_reload),
+        },
+        headers={'Content-Type': 'application/json'},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 class EdgeProjector(nn.Module):
@@ -335,6 +351,12 @@ def main():
                         help='Path to input image')
     parser.add_argument('--server', type=str, default='http://localhost:8080',
                         help='Cloud server URL')
+    parser.add_argument(
+        '--cloud_checkpoint',
+        type=str,
+        default=None,
+        help='Optional checkpoint path/URL visible to the cloud server; load it before inference',
+    )
     parser.add_argument('--prompt', type=str, default='Describe this image.',
                         help='Prompt for the model')
     parser.add_argument('--device', type=str,
@@ -370,8 +392,19 @@ def main():
     
     try:
         start_time = time.time()
+        if args.cloud_checkpoint:
+            print(f"   Loading cloud checkpoint: {args.cloud_checkpoint}")
+            checkpoint_result = load_cloud_checkpoint(
+                args.server,
+                args.cloud_checkpoint,
+                timeout=args.timeout,
+            )
+            print(
+                "   Cloud checkpoint ready: "
+                f"{checkpoint_result.get('checkpoint_path', args.cloud_checkpoint)}"
+            )
         response = requests.post(
-            f"{args.server}/infer",
+            f"{args.server.rstrip('/')}/infer",
             json=payload,
             headers={'Content-Type': 'application/json'},
             timeout=args.timeout

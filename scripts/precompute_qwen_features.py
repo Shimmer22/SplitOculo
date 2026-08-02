@@ -111,8 +111,10 @@ def main():
                         help='Resume from checkpoint')
     
     # 模型参数
-    parser.add_argument('--qwen_model', type=str, default='Qwen/Qwen2.5-VL-3B-Instruct',
+    parser.add_argument('--qwen_model', type=str, default='Qwen/Qwen2.5-VL-32B-Instruct',
                         help='Qwen model name')
+    parser.add_argument('--offline', action='store_true',
+                        help='load Qwen only from the local Hugging Face cache')
     parser.add_argument('--layer', type=int, default=8,
                         help='Which ViT layer to extract (1-32, default 8 for shallow, -1 for merger output)')
     parser.add_argument('--device', type=str,
@@ -158,7 +160,11 @@ def main():
     extractor = QwenFeatureExtractor(
         model_name=args.qwen_model,
         device=args.device,
-        extract_layer=args.layer
+        extract_layer=args.layer,
+        local_files_only=args.offline,
+        min_pixels=224 * 224,
+        max_pixels=224 * 224,
+        visual_only=True,
     ).load()
     
     # 预处理 transform (只做基本的 resize)

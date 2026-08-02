@@ -213,7 +213,7 @@ async function runInference() {
       await warmupCloud();
     }
     const result = await window.electronAPI.runDemoInference({
-      inputPath: state.inputPath, edgeCheckpoint: state.config.edgeCheckpoint, temporalCheckpoint: state.config.temporalCheckpoint,
+      inputPath: state.inputPath, cloudCheckpoint: state.config.cloudCheckpoint, edgeCheckpoint: state.config.edgeCheckpoint, temporalCheckpoint: state.config.temporalCheckpoint,
       serverUrl: serverUrl(state.config), prompt: $('prompt').value,
       device: state.config.device, timeout: state.config.timeout, maxFrames: state.config.maxFrames, spatialLevel: state.config.spatialLevel,
       projects: state.projects,

@@ -29,7 +29,7 @@ from core.codec_video_reader import read_video_records_with_mvs
 from models.codec_accelerator import CodecWarpAccelerator, DecoderMotionVectorAccelerator
 from models.multilevel import parse_payload_levels
 from models.temporal_pair import load_temporal_pair_fusion
-from scripts.edge_client import EdgeEncoder
+from scripts.edge_client import EdgeEncoder, load_cloud_checkpoint
 from scripts.infer_qwen_video import read_video_frames
 
 
@@ -539,6 +539,11 @@ def main():
     parser = argparse.ArgumentParser(description="SplitOculo Electron demo client")
     parser.add_argument("--input", required=True)
     parser.add_argument("--edge_checkpoint", default=None)
+    parser.add_argument(
+        "--cloud_checkpoint",
+        default=None,
+        help="Optional checkpoint path/URL visible to the cloud server; load before SplitOculo requests",
+    )
     parser.add_argument("--temporal_pair_checkpoint", default=None)
     parser.add_argument("--server", default="http://localhost:8080")
     parser.add_argument("--prompt", default="Describe this image.")
@@ -579,6 +584,21 @@ def main():
         raise ValueError("--baseline_input_size must be positive")
     path = Path(args.input)
     project_specs = _variant_specs(args)
+    if args.cloud_checkpoint and any(not spec[4] for spec in project_specs):
+        try:
+            checkpoint_result = load_cloud_checkpoint(
+                args.server,
+                args.cloud_checkpoint,
+                timeout=args.timeout,
+            )
+            print(
+                "Cloud checkpoint ready: "
+                f"{checkpoint_result.get('checkpoint_path', args.cloud_checkpoint)}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"Cloud checkpoint load failed: {exc}", file=sys.stderr, flush=True)
+            return 1
     encoder = None
     temporal_fusion = None
     temporal_metadata = None

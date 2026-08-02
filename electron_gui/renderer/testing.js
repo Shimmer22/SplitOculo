@@ -150,6 +150,7 @@ async function runInference() {
 
         const options = {
             checkpoint,
+            cloudCheckpoint: configResult.config.cloudCheckpoint || '',
             imagePath: currentImagePath,
             serverUrl,
             device,

@@ -11,9 +11,38 @@ Qwen2.5-VL 视觉特征提取器
   layer  0 : patch_embed 输出 (无 transformer block)  dim = 1280
   layer  N : 经过 N 个 transformer block 之后的输出   dim = 1280
 """
+import gc
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+
+
+def _patch_numpy_legacy_aliases():
+    """Keep old SciPy/sklearn imports usable with NumPy 1.26.
+
+    The container's PyTorch/OpenCV wheels require NumPy 1.x, while the
+    installed SciPy stack still references aliases removed in NumPy 1.24.
+    Adding these aliases is local, reversible compatibility glue and avoids
+    importing a second incompatible numerical stack just for Qwen loading.
+    """
+    aliases = {
+        "bool": np.bool_,
+        "int": int,
+        "float": float,
+        "complex": complex,
+        "object": object,
+        "str": str,
+        "long": np.int64,
+        "ulong": np.uint64,
+    }
+    for name, value in aliases.items():
+        if name not in np.__dict__:
+            setattr(np, name, value)
+
+
+_patch_numpy_legacy_aliases()
 
 
 class QwenFeatureExtractor:
@@ -28,9 +57,9 @@ class QwenFeatureExtractor:
                     可在任意层提取
     """
     
-    def __init__(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct", device='cuda',
+    def __init__(self, model_name="Qwen/Qwen2.5-VL-32B-Instruct", device='cuda',
                  extract_layer=4, local_files_only=False, min_pixels=None,
-                 max_pixels=None):
+                 max_pixels=None, visual_only=False):
         """
         Args:
             model_name: Qwen 模型名称或本地路径
@@ -48,9 +77,10 @@ class QwenFeatureExtractor:
         self.local_files_only = local_files_only
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
+        self.visual_only = visual_only
         self.model = None
         self.processor = None
-        self.total_layers = 32  # Qwen 3B 有 32 层
+        self.total_layers = 32  # Qwen2.5-VL 视觉塔的当前配置为 32 层
         self._pixel_patch_dim = None  # 延迟初始化，加载模型后确定
         self._loaded = False
         
@@ -109,6 +139,24 @@ class QwenFeatureExtractor:
         # in_ch * kH * kW = pixel_patch_dim
         proj_w = visual.patch_embed.proj.weight
         self._pixel_patch_dim = proj_w.shape[1] * proj_w.shape[2] * proj_w.shape[3]
+
+        if self.visual_only:
+            # Feature training never calls generate(); retaining the 32B
+            # language tower would consume most of an 80GB card for no useful
+            # work. Keep the original model object/API and its visual tower,
+            # but detach the language module and lm_head so CUDA can reclaim
+            # their storage. Generation-oriented callers keep the default
+            # ``visual_only=False`` behavior.
+            language_model = getattr(self.model.model, "language_model", None)
+            if language_model is not None:
+                self.model.model.language_model = None
+            if hasattr(self.model, "lm_head"):
+                self.model.lm_head = None
+            gc.collect()
+            if self.device.startswith("cuda"):
+                torch.cuda.empty_cache()
+            print("  Retained visual tower only (language decoder released)")
+
         print(f"Model loaded (ViT has {self.total_layers} layers, extract layer {self.extract_layer})")
         if self.extract_layer == -1:
             print(f"  Mode: pixel patches (JPEG level), dim={self._pixel_patch_dim}")
@@ -182,8 +230,68 @@ class QwenFeatureExtractor:
         Returns:
             features_list: [(num_tokens, hidden_size), ...] tensor 列表
         """
-        # 由于不同图片 token 数量可能不同，逐个处理
-        return [self.extract_features(img) for img in pil_images]
+        if not pil_images:
+            raise ValueError("pil_images must contain at least one image")
+        if len(pil_images) == 1:
+            return [self.extract_features(pil_images[0])]
+
+        if not self._loaded:
+            self.load()
+
+        # Keep the Qwen processor and visual tower in the main process.  The
+        # old implementation called extract_features() once per image, which
+        # paid the processor/model launch overhead for every sample.  At the
+        # fixed 224x224 training resolution all images normally have the same
+        # token count, but we still split by image_grid_thw so this remains
+        # correct for variable-resolution callers.
+        # ``apply_chat_template`` expects a conversation (a list of message
+        # dictionaries) even when that conversation contains one image. Keep
+        # the same shape as the single-image path for current Transformers.
+        messages = [
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": image}],
+                }
+            ]
+            for image in pil_images
+        ]
+        texts = [
+            self.processor.apply_chat_template(
+                message, tokenize=False, add_generation_prompt=True
+            )
+            for message in messages
+        ]
+        inputs = self.processor(
+            text=texts,
+            images=list(pil_images),
+            return_tensors="pt",
+            padding=True,
+        )
+
+        pixel_values = inputs["pixel_values"].to(self.device)
+        grid_thw = inputs["image_grid_thw"].to(self.device)
+        if self.extract_layer == -1:
+            hidden_states = self._extract_pixel_patches(pixel_values)
+        else:
+            hidden_states = self._extract_intermediate_layer(
+                pixel_values.to(self.model.model.visual.patch_embed.proj.weight.dtype),
+                grid_thw=grid_thw,
+            )
+
+        token_counts = [
+            int(grid[0]) * int(grid[1]) * int(grid[2])
+            for grid in grid_thw.detach().cpu().tolist()
+        ]
+        expected_tokens = sum(token_counts)
+        if hidden_states.shape[0] != expected_tokens:
+            raise RuntimeError(
+                "Batched Qwen feature extraction returned an unexpected number "
+                f"of tokens: got {hidden_states.shape[0]}, expected {expected_tokens} "
+                f"from image_grid_thw={grid_thw.detach().cpu().tolist()}"
+            )
+
+        return list(hidden_states.cpu().split(token_counts, dim=0))
 
     @torch.no_grad()
     def extract_video_features(self, pil_frames):

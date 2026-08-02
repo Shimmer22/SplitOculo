@@ -16,9 +16,14 @@ API:
     POST /infer_qwen
         Request: {"frames": [base64 JPEG, ...], "prompt": str}
         Response: native full-Qwen video inference and timing metrics
+
+    POST /load_checkpoint (alias: /load_ckpt)
+        Request: {"checkpoint_path": "/path/on/the/cloud"}
+        The path is resolved on the cloud server. An absolute http(s) URL is
+        also accepted and downloaded to a temporary cloud-local file.
     
     GET /health
-        Response: {"status": "ok", "model_loaded": bool}
+        Response includes the active checkpoint metadata.
 """
 import argparse
 import sys
@@ -28,6 +33,13 @@ from io import BytesIO
 import time
 import json
 import threading
+import gc
+import os
+import tempfile
+import traceback
+from functools import wraps
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -43,15 +55,65 @@ from models.bottleneck import DimensionBottleneck
 from models.multilevel import pad_dim, resize_tokens
 
 
+MAX_REMOTE_CHECKPOINT_BYTES = 4 * 1024 * 1024 * 1024
+REMOTE_CHECKPOINT_CHUNK_BYTES = 8 * 1024 * 1024
+REMOTE_CHECKPOINT_TIMEOUT_SECONDS = 60
+DEFAULT_MAX_VIDEO_FRAMES = 16
+
+
+def _is_remote_checkpoint_reference(reference):
+    return urlparse(str(reference)).scheme.lower() in {'http', 'https'}
+
+
+def _is_windows_drive_path(reference):
+    reference = str(reference)
+    return (
+        len(reference) >= 3
+        and reference[1] == ':'
+        and reference[2] in {'/', '\\'}
+    )
+
+
 class CloudInferenceEngine:
     """云端推理引擎"""
     
-    def __init__(self, checkpoint_path, device='cuda', split_layer=4):
+    def __init__(
+        self,
+        checkpoint_path,
+        device='cuda',
+        split_layer=4,
+        max_video_frames=None,
+    ):
         self.device = device
         self.split_layer = split_layer
+        self.max_video_frames = (
+            int(max_video_frames) if max_video_frames is not None else None
+        )
+        checkpoint_reference = str(checkpoint_path)
+        temporary_path = None
+        if _is_remote_checkpoint_reference(checkpoint_reference):
+            local_path, source_key, temporary_path = _materialize_checkpoint_reference(
+                checkpoint_reference
+            )
+        else:
+            local_path = Path(checkpoint_reference).expanduser()
+            if local_path.is_dir():
+                local_path = local_path / 'cloud_weights.pth'
+            local_path = local_path.resolve()
+            source_key = str(local_path)
+        self.checkpoint_path = str(local_path)
+        self.checkpoint_source = source_key
+        self._checkpoint_temp_path = (
+            str(temporary_path) if temporary_path else None
+        )
         
-        print(f"Loading cloud components from {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        print(f"Loading cloud components from {self.checkpoint_path}")
+        try:
+            ckpt = torch.load(self.checkpoint_path, map_location=device, weights_only=False)
+        except Exception:
+            if temporary_path:
+                Path(temporary_path).unlink(missing_ok=True)
+            raise
         args = ckpt.get('args', {})
         
         self.transmission_tokens = args.get('transmission_tokens', 49)
@@ -126,46 +188,131 @@ class CloudInferenceEngine:
         # Qwen (延迟加载)
         self.qwen_model = None
         self.processor = None
+        self.qwen_model_name = None
+        self._qwen_lock = threading.RLock()
 
     def _synchronize(self):
         if str(self.device).startswith("cuda"):
             torch.cuda.synchronize()
-    
-    def load_qwen(self, model_name="Qwen/Qwen2.5-VL-3B-Instruct", local_only=False):
-        """加载 Qwen 模型"""
-        if self.qwen_model is not None:
-            return
-        
-        print(f"Loading Qwen from {model_name}...")
-        if local_only:
-            print("   offline mode; not connecting to HuggingFace")
-        
-        from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-        
-        torch_dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
-        device_map = "cpu" if self.device == "cpu" else "auto"
 
-        self.qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_name,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-            trust_remote_code=True,
-            local_files_only=local_only,
+    def _limit_video_tensor(self, compressed_frame_features):
+        """Uniformly subsample video features before expensive Qwen work."""
+        input_frame_count = int(compressed_frame_features.shape[0])
+        max_frames = self.max_video_frames
+        if (
+            max_frames is None
+            or max_frames <= 0
+            or input_frame_count <= max_frames
+        ):
+            return compressed_frame_features, input_frame_count
+
+        indices = torch.linspace(
+            0,
+            input_frame_count - 1,
+            steps=max_frames,
+            device=compressed_frame_features.device,
+        ).round().to(dtype=torch.long)
+        print(
+            f"Video payload has {input_frame_count} frames; "
+            f"uniformly sampling {max_frames} before Qwen inference."
         )
-        self.processor = AutoProcessor.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            local_files_only=local_only,
-            use_fast=True,
-            min_pixels=224 * 224,
-            max_pixels=224 * 224,
+        return compressed_frame_features.index_select(0, indices), input_frame_count
+
+    def _limit_video_frames(self, frames):
+        """Uniformly subsample RGB frames before native Qwen processing."""
+        input_frame_count = len(frames)
+        max_frames = self.max_video_frames
+        if (
+            max_frames is None
+            or max_frames <= 0
+            or input_frame_count <= max_frames
+        ):
+            return frames, input_frame_count
+
+        indices = np.linspace(
+            0,
+            input_frame_count - 1,
+            num=max_frames,
+        ).round().astype(np.int64)
+        print(
+            f"Native Qwen request has {input_frame_count} frames; "
+            f"uniformly sampling {max_frames} before processing."
         )
-        
-        for param in self.qwen_model.parameters():
-            param.requires_grad = False
-        self.qwen_model.eval()
-        
-        print("Qwen loaded")
+        return [frames[int(index)] for index in indices], input_frame_count
+
+    def _unload_qwen_locked(self):
+        """Release the cached Qwen model; caller must hold _qwen_lock."""
+        self.qwen_model = None
+        self.processor = None
+        self.qwen_model_name = None
+        gc.collect()
+        if str(self.device).startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def unload_qwen(self):
+        """Unload the cached Qwen model."""
+        with self._qwen_lock:
+            self._unload_qwen_locked()
+
+    def load_qwen(
+        self,
+        model_name="Qwen/Qwen2.5-VL-3B-Instruct",
+        local_only=False,
+        force_reload=False,
+    ):
+        """Load or switch the cached Qwen model.
+
+        Previously this method returned whenever any Qwen model was already
+        cached.  Consequently changing qwen_path in a client had no effect
+        until the whole cloud process was restarted.
+        """
+        model_name = str(model_name)
+        with self._qwen_lock:
+            if (
+                self.qwen_model is not None
+                and self.qwen_model_name == model_name
+                and not force_reload
+            ):
+                return False
+
+            if self.qwen_model is not None:
+                print(f"Switching Qwen model: {self.qwen_model_name} -> {model_name}")
+                self._unload_qwen_locked()
+
+            print(f"Loading Qwen from {model_name}...")
+            if local_only:
+                print("   offline mode; not connecting to HuggingFace")
+
+            from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+
+            torch_dtype = torch.float32 if self.device == "cpu" else torch.bfloat16
+            device_map = "cpu" if self.device == "cpu" else "auto"
+
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_name,
+                torch_dtype=torch_dtype,
+                device_map=device_map,
+                trust_remote_code=True,
+                local_files_only=local_only,
+            )
+            processor = AutoProcessor.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                local_files_only=local_only,
+                use_fast=True,
+                min_pixels=224 * 224,
+                max_pixels=224 * 224,
+            )
+
+            for param in model.parameters():
+                param.requires_grad = False
+            model.eval()
+            self.qwen_model = model
+            self.processor = processor
+            self.qwen_model_name = model_name
+
+            print("Qwen loaded")
+            return True
     
     def decode_features(
         self,
@@ -222,6 +369,26 @@ class CloudInferenceEngine:
         else:
             edge_tokens = pad_dim(compressed_features, self.hidden_size)
         return resize_tokens(edge_tokens, self.transmission_tokens, mode="bilinear")
+
+    def is_multilevel_payload(self, features, declared=False):
+        """Determine whether a payload needs bottleneck-dimension padding.
+
+        Older clients did not always send payload_dim for temporal/codec
+        requests.  The tensor shape is still authoritative: a checkpoint
+        with bottleneck_dim=128 cannot send a 64-channel tensor directly to
+        the decoder.
+        """
+        if declared:
+            return True
+        if self.bottleneck is None or features.shape[-1] == self.bottleneck_dim:
+            return False
+        if features.shape[-1] < self.bottleneck_dim:
+            return True
+        raise ValueError(
+            "Payload channel dimension "
+            f"{features.shape[-1]} exceeds checkpoint bottleneck_dim "
+            f"{self.bottleneck_dim}"
+        )
     
     @torch.no_grad()
     def infer(self, compressed_features, prompt="Describe this image."):
@@ -675,6 +842,11 @@ class CloudInferenceEngine:
                 output_holder["outputs"] = self.qwen_model.generate(**generation_kwargs)
             except Exception as exc:
                 error_holder["error"] = exc
+                print("Qwen generation failed:", file=sys.stderr)
+                traceback.print_exc()
+                # TextIteratorStreamer otherwise waits forever because the
+                # consumer is blocked in ``for chunk in streamer``.
+                streamer.end()
 
         generation_start = time.perf_counter()
         generation_prepare_seconds = generation_start - generation_prepare_start
@@ -725,9 +897,16 @@ class CloudInferenceEngine:
         if compressed_frame_features.dim() != 3:
             raise ValueError("compressed_frame_features must be [T, tokens, channels]")
 
+        compressed_frame_features, _ = self._limit_video_tensor(
+            compressed_frame_features
+        )
+
         frame_tokens = []
         for frame_features in compressed_frame_features:
-            upsampled = self.reconstruct_tokens(frame_features.unsqueeze(0))
+            if self.is_multilevel_payload(frame_features):
+                upsampled = self.reconstruct_payload_tokens(frame_features.unsqueeze(0))
+            else:
+                upsampled = self.reconstruct_tokens(frame_features.unsqueeze(0))
             frame_tokens.append(upsampled.squeeze(0))
 
         video_tokens = torch.cat(frame_tokens, dim=0).unsqueeze(0)
@@ -749,8 +928,16 @@ class CloudInferenceEngine:
         if compressed_frame_features.dim() != 3:
             raise ValueError("compressed_frame_features must be [T, tokens, channels]")
 
+        compressed_frame_features, input_frame_count = self._limit_video_tensor(
+            compressed_frame_features
+        )
+
         self._synchronize()
         reconstruct_start = time.perf_counter()
+        multilevel_payload = self.is_multilevel_payload(
+            compressed_frame_features,
+            declared=multilevel_payload,
+        )
         if multilevel_payload:
             upsampled = self.reconstruct_payload_tokens(
                 compressed_frame_features
@@ -789,7 +976,13 @@ class CloudInferenceEngine:
             "visual_tail_seconds": visual_tail_seconds,
             "ttft_seconds": reconstruct_seconds + visual_tail_seconds + generation_metrics.get("ttft_seconds", 0.0),
             "cloud_compute_dtype": str(self.cloud_compute_dtype),
+            "input_frame_count": input_frame_count,
             "frame_count": frame_count,
+            "frame_sampling": (
+                "uniform"
+                if input_frame_count != frame_count
+                else "none"
+            ),
             "visual_grid_thw": grid_thw.detach().cpu().tolist(),
             "visual_tokens_after_merge": int(
                 frame_count * target_h * target_w
@@ -810,6 +1003,7 @@ class CloudInferenceEngine:
         """Run the complete native Qwen vision encoder and language model."""
         if not frames:
             raise ValueError("Pure Qwen inference requires at least one RGB frame")
+        frames, input_frame_count = self._limit_video_frames(frames)
         if self.qwen_model is None:
             model_path = getattr(
                 self, 'qwen_path', "Qwen/Qwen2.5-VL-3B-Instruct"
@@ -893,6 +1087,11 @@ class CloudInferenceEngine:
                 )
             except Exception as exc:
                 error_holder["error"] = exc
+                print("Qwen generation failed:", file=sys.stderr)
+                traceback.print_exc()
+                # Wake the consumer so the original exception can be
+                # returned by the Flask handler instead of deadlocking it.
+                streamer.end()
 
         generation_start = time.perf_counter()
         thread = threading.Thread(target=_run_generate)
@@ -934,28 +1133,280 @@ class CloudInferenceEngine:
             ),
             "ttft_seconds": processor_seconds + effective_first_token,
             "modality": modality,
+            "input_frame_count": input_frame_count,
             "frames": len(frames),
+            "frame_sampling": (
+                "uniform"
+                if input_frame_count != len(frames)
+                else "none"
+            ),
             "native_grid_thw": native_grid_thw,
             "native_visual_tokens": native_visual_tokens,
         }
 
 
-# 全局引擎实例
+# 全局引擎实例。动态切换 checkpoint 时，所有模型访问都通过这把锁串行化，
+# 避免在一次推理使用旧模型的过程中替换模块或释放 CUDA 内存。
 engine = None
+_engine_lock = threading.RLock()
 app = Flask(__name__)
+
+
+def _engine_access(func):
+    """Serialize model access for Flask's threaded request handler."""
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        with _engine_lock:
+            return func(*args, **kwargs)
+
+    return wrapped
+
+
+def _as_bool(value, default=False):
+    """Parse JSON booleans without treating the string ``"false"`` as true."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {'1', 'true', 'yes', 'on'}:
+            return True
+        if normalized in {'0', 'false', 'no', 'off', ''}:
+            return False
+    return bool(value)
+
+
+def _checkpoint_reference_from_request(data):
+    """Read the supported checkpoint field aliases from a JSON request."""
+    for key in (
+        'checkpoint_path',
+        'ckpt_path',
+        'checkpoint',
+        'ckpt',
+        'cloud_checkpoint',
+        'cloud_ckpt',
+        'checkpoint_url',
+    ):
+        value = data.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _local_checkpoint_path(reference):
+    """Normalize a checkpoint path visible to the cloud server."""
+    path = Path(reference).expanduser()
+    if path.is_dir():
+        path = path / 'cloud_weights.pth'
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Cloud checkpoint does not exist on the server: {path}"
+        )
+    return path
+
+
+def _download_checkpoint(reference):
+    """Download an HTTP(S) checkpoint to a temporary cloud-local file."""
+    parsed = urlparse(reference)
+    if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
+        raise ValueError(
+            'checkpoint URL must be an absolute http(s) URL, or provide a '
+            'filesystem path visible to the cloud server'
+        )
+
+    fd, temporary_name = tempfile.mkstemp(
+        prefix='splitoculo-cloud-checkpoint-',
+        suffix='.pth',
+    )
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    downloaded_bytes = 0
+    try:
+        request = Request(
+            reference,
+            headers={'User-Agent': 'SplitOculo-cloud-server/1.0'},
+        )
+        with urlopen(request, timeout=REMOTE_CHECKPOINT_TIMEOUT_SECONDS) as response:
+            content_length = response.headers.get('Content-Length')
+            if content_length and int(content_length) > MAX_REMOTE_CHECKPOINT_BYTES:
+                raise ValueError(
+                    'remote checkpoint is larger than the server limit '
+                    f'({MAX_REMOTE_CHECKPOINT_BYTES} bytes)'
+                )
+            with temporary_path.open('wb') as output:
+                while True:
+                    chunk = response.read(REMOTE_CHECKPOINT_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    downloaded_bytes += len(chunk)
+                    if downloaded_bytes > MAX_REMOTE_CHECKPOINT_BYTES:
+                        raise ValueError(
+                            'remote checkpoint is larger than the server limit '
+                            f'({MAX_REMOTE_CHECKPOINT_BYTES} bytes)'
+                        )
+                    output.write(chunk)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+    if downloaded_bytes <= 0:
+        temporary_path.unlink(missing_ok=True)
+        raise ValueError('remote checkpoint response was empty')
+    return temporary_path
+
+
+def _materialize_checkpoint_reference(reference):
+    """Return ``(local_path, source_key, temporary_path)`` for a request ref."""
+    parsed = urlparse(reference)
+    if _is_remote_checkpoint_reference(reference):
+        temporary_path = _download_checkpoint(reference)
+        return temporary_path, reference, temporary_path
+    if parsed.scheme and not _is_windows_drive_path(reference):
+        raise ValueError(
+            'checkpoint_path must be a cloud-local filesystem path or an '
+            'absolute http(s) URL'
+        )
+    local_path = _local_checkpoint_path(reference)
+    return local_path, str(local_path), None
+
+
+def _checkpoint_info(current_engine):
+    if current_engine is None:
+        return {
+            'checkpoint_path': None,
+            'checkpoint_source': None,
+            'checkpoint_hidden_size': None,
+            'checkpoint_bottleneck_dim': None,
+            'checkpoint_transmission_tokens': None,
+            'checkpoint_target_tokens': None,
+        }
+    return {
+        'checkpoint_path': current_engine.checkpoint_path,
+        'checkpoint_source': current_engine.checkpoint_source,
+        'checkpoint_hidden_size': current_engine.hidden_size,
+        'checkpoint_bottleneck_dim': current_engine.bottleneck_dim,
+        'checkpoint_transmission_tokens': current_engine.transmission_tokens,
+        'checkpoint_target_tokens': current_engine.target_tokens,
+    }
+
+
+def _remove_temporary_checkpoint(path):
+    if path:
+        Path(path).unlink(missing_ok=True)
+
+
+def _switch_checkpoint_locked(reference, force_reload=False, preload_qwen=None):
+    """Switch the global cloud engine; caller must hold ``_engine_lock``."""
+    global engine
+
+    if engine is None:
+        raise RuntimeError('cloud engine is not loaded')
+
+    current_engine = engine
+    parsed = urlparse(reference)
+    if _is_remote_checkpoint_reference(reference):
+        source_key = reference
+    elif parsed.scheme and not _is_windows_drive_path(reference):
+        raise ValueError(
+            'checkpoint_path must be a cloud-local filesystem path or an '
+            'absolute http(s) URL'
+        )
+    else:
+        source_key = str(_local_checkpoint_path(reference))
+
+    if not force_reload and current_engine.checkpoint_source == source_key:
+        if preload_qwen and getattr(current_engine, 'qwen_model', None) is None:
+            current_engine.load_qwen(
+                model_name=getattr(
+                    current_engine,
+                    'qwen_path',
+                    'Qwen/Qwen2.5-VL-3B-Instruct',
+                ),
+                local_only=getattr(current_engine, 'offline_mode', False),
+            )
+        return current_engine, False
+
+    local_path = None
+    temporary_path = None
+    replacement = None
+    old_temporary_path = getattr(current_engine, '_checkpoint_temp_path', None)
+    old_qwen_loaded = getattr(current_engine, 'qwen_model', None) is not None
+    qwen_path = getattr(
+        current_engine,
+        'qwen_path',
+        'Qwen/Qwen2.5-VL-3B-Instruct',
+    )
+    offline_mode = getattr(current_engine, 'offline_mode', False)
+    if preload_qwen is None:
+        preload_qwen = old_qwen_loaded
+
+    try:
+        if _is_remote_checkpoint_reference(reference):
+            local_path, _, temporary_path = _materialize_checkpoint_reference(reference)
+        else:
+            local_path = _local_checkpoint_path(reference)
+
+        # The old Qwen model is the largest allocation in the usual deployment.
+        # Release it before constructing the replacement to leave room for the
+        # temporary overlap of the old and new cloud components.
+        current_engine.unload_qwen()
+        replacement = CloudInferenceEngine(
+            checkpoint_path=local_path,
+            device=current_engine.device,
+            split_layer=current_engine.split_layer,
+            max_video_frames=current_engine.max_video_frames,
+        )
+        replacement.checkpoint_source = source_key
+        replacement._checkpoint_temp_path = (
+            str(temporary_path) if temporary_path else None
+        )
+        replacement.qwen_path = qwen_path
+        replacement.offline_mode = offline_mode
+        if preload_qwen:
+            replacement.load_qwen(
+                model_name=replacement.qwen_path,
+                local_only=replacement.offline_mode,
+            )
+    except Exception:
+        if replacement is not None:
+            replacement.unload_qwen()
+        _remove_temporary_checkpoint(temporary_path)
+        gc.collect()
+        if str(current_engine.device).startswith('cuda') and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise
+
+    engine = replacement
+    _remove_temporary_checkpoint(old_temporary_path)
+    del current_engine
+    gc.collect()
+    if str(replacement.device).startswith('cuda') and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return replacement, True
 
 
 @app.route('/health', methods=['GET'])
 def health():
     """健康检查"""
-    return jsonify({
+    # Health is a read-only snapshot.  It must remain responsive while an
+    # inference request is using the serialized model lock.
+    current_engine = engine
+    result = {
         'status': 'ok',
-        'model_loaded': engine is not None,
-        'qwen_loaded': engine.qwen_model is not None if engine else False
-    })
+        'model_loaded': current_engine is not None,
+        'qwen_loaded': current_engine.qwen_model is not None if current_engine else False,
+        'qwen_model_name': current_engine.qwen_model_name if current_engine else None,
+        'qwen_path': getattr(current_engine, 'qwen_path', None) if current_engine else None,
+        'max_video_frames': (
+            current_engine.max_video_frames if current_engine else None
+        ),
+    }
+    result.update(_checkpoint_info(current_engine))
+    return jsonify(result)
 
 
 @app.route('/warmup', methods=['POST'])
+@_engine_access
 def warmup():
     """Load Qwen before the first measured request."""
     started = time.perf_counter()
@@ -970,13 +1421,108 @@ def warmup():
             'status': 'ok',
             'model_loaded': True,
             'qwen_loaded': True,
+            'qwen_model_name': engine.qwen_model_name,
             'warmup_ms': (time.perf_counter() - started) * 1000,
         })
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 
 
+@app.route('/load_qwen', methods=['POST'])
+@_engine_access
+def load_qwen():
+    """Load, switch, or reload the cached Qwen model.
+
+    Request JSON:
+        {"model_name": "Qwen/Qwen2.5-VL-3B-Instruct",
+         "offline": true, "force_reload": false}
+    """
+    started = time.perf_counter()
+    try:
+        if engine is None:
+            return jsonify({'error': 'cloud engine is not loaded'}), 503
+        data = request.get_json(silent=True) or {}
+        model_name = data.get('model_name') or data.get('qwen_path')
+        if not model_name:
+            return jsonify({'error': 'model_name is required'}), 400
+
+        offline = bool(data.get('offline', getattr(engine, 'offline_mode', False)))
+        force_reload = bool(data.get('force_reload', False))
+        engine.qwen_path = str(model_name)
+        engine.offline_mode = offline
+        reloaded = engine.load_qwen(
+            model_name=engine.qwen_path,
+            local_only=offline,
+            force_reload=force_reload,
+        )
+        return jsonify({
+            'status': 'ok',
+            'qwen_loaded': True,
+            'qwen_model_name': engine.qwen_model_name,
+            'reloaded': bool(reloaded),
+            'load_ms': (time.perf_counter() - started) * 1000,
+        })
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/load_checkpoint', methods=['POST'])
+@app.route('/load_ckpt', methods=['POST'])
+@_engine_access
+def load_checkpoint():
+    """Load or switch the cloud-side SplitOculo checkpoint.
+
+    The path is resolved on the cloud machine, not on the client machine.
+    Request JSON accepts a local path or an HTTP(S) URL:
+
+        {"checkpoint_path": "/models/exp-a/cloud_weights.pth"}
+        {"checkpoint_path": "https://host.example/exp-a/cloud_weights.pth",
+         "preload_qwen": false, "force_reload": false}
+
+    ``ckpt_path``, ``checkpoint``, ``ckpt``, ``cloud_checkpoint``, ``cloud_ckpt`` and
+    ``checkpoint_url`` are accepted as aliases for clients that already use
+    those names.  The old engine remains active if the replacement fails.
+    """
+    started = time.perf_counter()
+    try:
+        if engine is None:
+            return jsonify({'error': 'cloud engine is not loaded'}), 503
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({'error': 'request body must be a JSON object'}), 400
+        reference = _checkpoint_reference_from_request(data)
+        if not reference:
+            return jsonify({
+                'error': 'checkpoint_path is required and must be visible to '
+                         'the cloud server',
+            }), 400
+
+        replacement, reloaded = _switch_checkpoint_locked(
+            reference,
+            force_reload=_as_bool(data.get('force_reload'), False),
+            preload_qwen=(
+                _as_bool(data.get('preload_qwen'))
+                if 'preload_qwen' in data
+                else None
+            ),
+        )
+        result = {
+            'status': 'ok',
+            'reloaded': bool(reloaded),
+            'load_ms': (time.perf_counter() - started) * 1000,
+            'qwen_loaded': replacement.qwen_model is not None,
+            'qwen_model_name': replacement.qwen_model_name,
+        }
+        result.update(_checkpoint_info(replacement))
+        return jsonify(result)
+    except (FileNotFoundError, ValueError) as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
 @app.route('/infer', methods=['POST'])
+@_engine_access
 def infer():
     """推理端点"""
     start_time = time.perf_counter()
@@ -1004,11 +1550,18 @@ def infer():
         cloud_decode_ms = (time.perf_counter() - decode_start) * 1000
         infer_start = time.perf_counter()
         if modality == 'video':
+            multilevel_payload = engine.is_multilevel_payload(
+                features,
+                declared=bool(
+                    data.get('payload_tokens') is not None
+                    or data.get('payload_dim') is not None
+                ),
+            )
             response, inference_metrics = engine.infer_video_from_frame_features_with_timing(
                 features,
                 prompt=prompt,
                 max_new_tokens=int(data.get('max_new_tokens', 256)),
-                multilevel_payload=bool(data.get('payload_tokens')),
+                multilevel_payload=multilevel_payload,
             )
         else:
             response, inference_metrics = engine.infer_payload_with_timing(
@@ -1036,6 +1589,7 @@ def infer():
 
 
 @app.route('/infer_qwen', methods=['POST'])
+@_engine_access
 def infer_qwen():
     """Run native Qwen on uploaded JPEG RGB frames."""
     start_time = time.perf_counter()
@@ -1098,6 +1652,15 @@ def main():
                         help='Use cached Qwen model, do not connect to HuggingFace')
     parser.add_argument('--qwen_path', type=str, default="Qwen/Qwen2.5-VL-3B-Instruct",
                         help='Qwen model path (local path or HuggingFace ID)')
+    parser.add_argument(
+        '--max_video_frames',
+        type=int,
+        default=DEFAULT_MAX_VIDEO_FRAMES,
+        help=(
+            'Maximum frames sent through the cloud Qwen path; non-positive '
+            'disables server-side sampling'
+        ),
+    )
     
     args = parser.parse_args()
     
@@ -1107,7 +1670,8 @@ def main():
     
     engine = CloudInferenceEngine(
         checkpoint_path=args.checkpoint,
-        device=args.device
+        device=args.device,
+        max_video_frames=args.max_video_frames,
     )
     
     # 存储配置供后续使用
@@ -1119,7 +1683,10 @@ def main():
     
     print(f"\nStarting server on {args.host}:{args.port}")
     print(f"   POST /infer - Run inference")
+    print(f"   POST /load_checkpoint - Load or switch cloud checkpoint")
+    print(f"   POST /load_qwen - Load or switch Qwen model")
     print(f"   GET /health - Health check")
+    print(f"   Max video frames: {args.max_video_frames}")
     
     app.run(host=args.host, port=args.port, debug=False)
 

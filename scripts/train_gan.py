@@ -29,14 +29,16 @@ Usage:
     python scripts/train_gan.py \
         --dynamic \
         --data_dir ./data/coco \
-        --qwen_model Qwen/Qwen2.5-VL-3B-Instruct \
+        --qwen_model Qwen/Qwen2.5-VL-32B-Instruct \
         --qwen_layer 4 \
         --phase warmup \
         --batch_size 8 \
         --epochs 20
 """
 import argparse
+import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -149,7 +151,7 @@ class DynamicFeatureDataset(Dataset):
     无需预计算，但需要更多显存和计算时间
     """
     
-    def __init__(self, images_dir, extractor, split='train', image_size=224):
+    def __init__(self, images_dir, extractor=None, split='train', image_size=224):
         """
         Args:
             images_dir: 图像目录
@@ -158,6 +160,10 @@ class DynamicFeatureDataset(Dataset):
             image_size: 输入图像大小
         """
         self.images_dir = Path(images_dir) / split
+        # The extractor used to live in the Dataset and was called from
+        # __getitem__, forcing one Qwen forward per sample and requiring
+        # num_workers=0.  Keep the argument for API compatibility, but batch
+        # teacher extraction in DynamicQwenBatchLoader in the main process.
         self.extractor = extractor
         
         # 扫描图像文件
@@ -189,25 +195,107 @@ class DynamicFeatureDataset(Dataset):
         img_path = self.image_files[idx]
         
         from PIL import Image
-        pil_img = Image.open(img_path).convert('RGB')
+        with Image.open(img_path) as source:
+            pil_img = source.convert('RGB')
         
         # CNN 输入
         img_tensor = self.transform(pil_img)
         
-        # Qwen 特征 (实时计算)
+        # Return the Qwen-sized PIL image.  The frozen Qwen tower is invoked
+        # once for the whole batch by DynamicQwenBatchLoader, not here.
         qwen_img = self.qwen_transform(pil_img)
-        teacher_features = self.extractor.extract_features(qwen_img)
-        
-        return img_tensor, teacher_features
+        return img_tensor, qwen_img
 
 
-def collate_fn(batch):
-    """处理不同长度的特征"""
+def dynamic_identity_collate(batch):
+    """Keep dynamic records as a Python list for main-process Qwen batching."""
+    return batch
+
+
+class DynamicQwenBatchLoader:
+    """Turn prefetched image records into batched Qwen teacher targets.
+
+    DataLoader workers only decode/resize images.  Qwen stays in the main
+    process, so it is never forked or pickled, while the workers can prefetch
+    the next CPU batch during the current GPU step.
+    """
+
+    def __init__(self, raw_loader, extractor):
+        self.raw_loader = raw_loader
+        self.extractor = extractor
+        self.last_stats = {}
+        self.epoch_stats = {}
+
+    def __len__(self):
+        return len(self.raw_loader)
+
+    def __iter__(self):
+        epoch_start = time.perf_counter()
+        totals = {
+            'batches': 0,
+            'images': 0,
+            'qwen_seconds': 0.0,
+            'total_seconds': 0.0,
+            'fetch_seconds': 0.0,
+        }
+        raw_iter = iter(self.raw_loader)
+        while True:
+            fetch_start = time.perf_counter()
+            try:
+                records = next(raw_iter)
+            except StopIteration:
+                break
+            fetch_seconds = time.perf_counter() - fetch_start
+            batch_start = fetch_start
+            images = torch.stack([record[0] for record in records])
+            qwen_images = [record[1] for record in records]
+            qwen_start = time.perf_counter()
+            teacher_features = self.extractor.extract_features_batch(qwen_images)
+            qwen_seconds = time.perf_counter() - qwen_start
+            images, teacher_features = collate_feature_items(
+                list(zip(images, teacher_features))
+            )
+            total_seconds = time.perf_counter() - batch_start
+            batch_size = len(records)
+            totals['batches'] += 1
+            totals['images'] += batch_size
+            totals['qwen_seconds'] += qwen_seconds
+            totals['total_seconds'] += total_seconds
+            totals['fetch_seconds'] += fetch_seconds
+            self.last_stats = {
+                "batch_size": batch_size,
+                "fetch_seconds": fetch_seconds,
+                "qwen_seconds": qwen_seconds,
+                "total_seconds": total_seconds,
+                "qwen_images_per_second": batch_size / max(qwen_seconds, 1e-6),
+                "images_per_second": batch_size / max(total_seconds, 1e-6),
+            }
+            yield images, teacher_features
+        elapsed = time.perf_counter() - epoch_start
+        self.epoch_stats = {
+            **totals,
+            'elapsed_seconds': elapsed,
+            'qwen_images_per_second': totals['images'] / max(totals['qwen_seconds'], 1e-6),
+            'images_per_second': totals['images'] / max(elapsed, 1e-6),
+        }
+
+    def get_epoch_stats(self):
+        """Return throughput collected during the most recent iteration."""
+        return dict(self.epoch_stats)
+
+
+def collate_feature_items(batch):
+    """Stack image tensors and align variable-length teacher token lists."""
     images = torch.stack([item[0] for item in batch])
     features = [item[1] for item in batch]
     min_tokens = min(f.shape[0] for f in features)
     aligned_features = torch.stack([f[:min_tokens] for f in features])
     return images, aligned_features
+
+
+def collate_fn(batch):
+    """处理不同长度的特征"""
+    return collate_feature_items(batch)
 
 
 class GANTrainer:
@@ -389,9 +477,19 @@ class GANTrainer:
     def _align_tokens(self, tokens, target_num):
         """对齐 token 数量"""
         b, n, c = tokens.shape
+        if n == target_num:
+            return tokens
         h = w = int(n ** 0.5)
-        tokens = tokens.view(b, h, w, c).permute(0, 3, 1, 2)
         target_h = target_w = int(target_num ** 0.5)
+        if h * h != n or target_h * target_w != target_num:
+            # Qwen can emit a non-square grid when a caller bypasses the
+            # training dataset's square crop. Use a 1-D interpolation fallback
+            # instead of attempting an invalid h*w reshape.
+            return F.interpolate(
+                tokens.transpose(1, 2), size=target_num,
+                mode='linear', align_corners=False,
+            ).transpose(1, 2)
+        tokens = tokens.view(b, h, w, c).permute(0, 3, 1, 2)
         tokens = F.adaptive_avg_pool2d(tokens, (target_h, target_w))
         tokens = tokens.permute(0, 2, 3, 1).view(b, -1, c)
         return tokens
@@ -435,6 +533,22 @@ class GANTrainer:
             "compressed": compressed_payload,
             "payload_level": (payload_tokens, payload_dim),
         }
+
+    @staticmethod
+    def _loader_metrics(dataloader):
+        """Expose dynamic teacher/data-loader throughput in epoch metrics."""
+        get_stats = getattr(dataloader, 'get_epoch_stats', None)
+        if get_stats is None:
+            return {}
+        stats = get_stats()
+        if not stats:
+            return {}
+        return {
+            'qwen_img_s': stats['qwen_images_per_second'],
+            'loader_img_s': stats['images_per_second'],
+            'qwen_seconds': stats['qwen_seconds'],
+            'loader_wait_seconds': stats['fetch_seconds'],
+        }
     
     def train_epoch_warmup(self, dataloader, epoch):
         """Warmup 训练: 只用 MSE Loss"""
@@ -447,8 +561,8 @@ class GANTrainer:
         
         pbar = tqdm(dataloader, desc=f"Warmup Epoch {epoch}")
         for images, teacher_tokens in pbar:
-            images = images.to(self.device)
-            teacher_tokens = teacher_tokens.to(self.device).float()
+            images = images.to(self.device, non_blocking=True)
+            teacher_tokens = teacher_tokens.to(self.device, non_blocking=True).float()
             
             self.opt_G.zero_grad()
             
@@ -500,7 +614,11 @@ class GANTrainer:
             pbar.set_postfix({'loss': f'{loss.item():.4f}', 'cos_sim': f'{cos_sim.item():.4f}'})
         
         n = len(dataloader)
-        return {'loss': total_loss / n, 'cos_sim': total_cos_sim / n}
+        return {
+            'loss': total_loss / n,
+            'cos_sim': total_cos_sim / n,
+            **self._loader_metrics(dataloader),
+        }
     
     def train_epoch_gan(self, dataloader, epoch):
         """GAN 训练: Generator vs Discriminator"""
@@ -516,8 +634,8 @@ class GANTrainer:
         
         pbar = tqdm(dataloader, desc=f"GAN Epoch {epoch}")
         for images, teacher_tokens in pbar:
-            images = images.to(self.device)
-            teacher_tokens = teacher_tokens.to(self.device).float()
+            images = images.to(self.device, non_blocking=True)
+            teacher_tokens = teacher_tokens.to(self.device, non_blocking=True).float()
             
             # 对齐 token 数量
             if teacher_tokens.shape[1] != self.args.target_tokens:
@@ -622,7 +740,8 @@ class GANTrainer:
             'loss_g': total_loss_g / n,
             'loss_d': total_loss_d / n,
             'cos_sim': total_cos_sim / n,
-            'mse': total_mse / n
+            'mse': total_mse / n,
+            **self._loader_metrics(dataloader),
         }
     
     @torch.no_grad()
@@ -637,8 +756,8 @@ class GANTrainer:
         total_std = 0
         
         for images, teacher_tokens in tqdm(dataloader, desc="Validating"):
-            images = images.to(self.device)
-            teacher_tokens = teacher_tokens.to(self.device).float()
+            images = images.to(self.device, non_blocking=True)
+            teacher_tokens = teacher_tokens.to(self.device, non_blocking=True).float()
             
             student_feat = self.student(images)[-1]
             edge_tokens = self.projector(student_feat)
@@ -684,8 +803,8 @@ class GANTrainer:
 
         pbar = tqdm(dataloader, desc=f"Warmup Epoch {epoch}")
         for images, teacher_tokens in pbar:
-            images = images.to(self.device)
-            teacher_tokens = teacher_tokens.to(self.device).float()
+            images = images.to(self.device, non_blocking=True)
+            teacher_tokens = teacher_tokens.to(self.device, non_blocking=True).float()
 
             self.opt_G.zero_grad()
 
@@ -725,10 +844,18 @@ class GANTrainer:
             postfix = {'loss': f'{loss.item():.4f}', 'cos_sim': f'{cos_sim.item():.4f}'}
             if self.args.multilevel_payload:
                 postfix['level'] = format_payload_level(forward_out["payload_level"])
+            loader_stats = getattr(dataloader, 'last_stats', {})
+            if loader_stats:
+                postfix['qimg/s'] = f"{loader_stats['qwen_images_per_second']:.1f}"
+                postfix['batch/s'] = f"{loader_stats['images_per_second']:.1f}"
             pbar.set_postfix(postfix)
 
         n = len(dataloader)
-        return {'loss': total_loss / n, 'cos_sim': total_cos_sim / n}
+        return {
+            'loss': total_loss / n,
+            'cos_sim': total_cos_sim / n,
+            **self._loader_metrics(dataloader),
+        }
 
     def train_epoch_gan(self, dataloader, epoch):
         """GAN training with optional random multi-level payloads."""
@@ -744,8 +871,8 @@ class GANTrainer:
 
         pbar = tqdm(dataloader, desc=f"GAN Epoch {epoch}")
         for images, teacher_tokens in pbar:
-            images = images.to(self.device)
-            teacher_tokens = teacher_tokens.to(self.device).float()
+            images = images.to(self.device, non_blocking=True)
+            teacher_tokens = teacher_tokens.to(self.device, non_blocking=True).float()
 
             if teacher_tokens.shape[1] != self.args.target_tokens:
                 teacher_tokens = self._align_tokens(teacher_tokens, self.args.target_tokens)
@@ -816,6 +943,10 @@ class GANTrainer:
             }
             if self.args.multilevel_payload:
                 postfix['level'] = format_payload_level(forward_out["payload_level"])
+            loader_stats = getattr(dataloader, 'last_stats', {})
+            if loader_stats:
+                postfix['qimg/s'] = f"{loader_stats['qwen_images_per_second']:.1f}"
+                postfix['batch/s'] = f"{loader_stats['images_per_second']:.1f}"
             pbar.set_postfix(postfix)
 
         n = len(dataloader)
@@ -823,7 +954,8 @@ class GANTrainer:
             'loss_g': total_loss_g / n,
             'loss_d': total_loss_d / n,
             'cos_sim': total_cos_sim / n,
-            'mse': total_mse / n
+            'mse': total_mse / n,
+            **self._loader_metrics(dataloader),
         }
 
     @torch.no_grad()
@@ -840,8 +972,8 @@ class GANTrainer:
         }
 
         for images, teacher_tokens in tqdm(dataloader, desc="Validating"):
-            images = images.to(self.device)
-            teacher_tokens = teacher_tokens.to(self.device).float()
+            images = images.to(self.device, non_blocking=True)
+            teacher_tokens = teacher_tokens.to(self.device, non_blocking=True).float()
 
             for level in levels:
                 output_tokens = self._forward_generator(images, level)["output_tokens"]
@@ -915,11 +1047,19 @@ class GANTrainer:
             self.scheduler_G.step()
             
             metrics = {**train_metrics, **val_metrics}
+            throughput = ""
+            if 'qwen_img_s' in metrics:
+                throughput = (
+                    f", qwen_img_s={metrics['qwen_img_s']:.2f}"
+                    f", loader_img_s={metrics['loader_img_s']:.2f}"
+                    f", loader_wait_s={metrics['loader_wait_seconds']:.2f}"
+                )
             
             self.logger.info(
                 f"Epoch {epoch}: "
                 f"loss={metrics['loss']:.4f}, cos_sim={metrics['cos_sim']:.4f}, "
                 f"val_cos_sim={metrics['val_cos_sim']:.4f}, val_std={metrics['val_std']:.3f}"
+                f"{throughput}"
             )
             
             is_best = metrics['val_cos_sim'] > best_cos_sim
@@ -949,12 +1089,19 @@ class GANTrainer:
             self.scheduler_D.step()
             
             metrics = {**train_metrics, **val_metrics}
+            throughput = ""
+            if 'qwen_img_s' in metrics:
+                throughput = (
+                    f", qwen_img_s={metrics['qwen_img_s']:.2f}"
+                    f", loader_img_s={metrics['loader_img_s']:.2f}"
+                    f", loader_wait_s={metrics['loader_wait_seconds']:.2f}"
+                )
             
             self.logger.info(
                 f"Epoch {epoch}: "
                 f"G={metrics['loss_g']:.4f}, D={metrics['loss_d']:.4f}, "
                 f"mse={metrics['mse']:.4f}, val_cos_sim={metrics['val_cos_sim']:.4f}, "
-                f"val_std={metrics['val_std']:.3f}"
+                f"val_std={metrics['val_std']:.3f}{throughput}"
             )
             
             is_best = metrics['val_cos_sim'] > best_cos_sim
@@ -1017,6 +1164,18 @@ def main():
                         help='discriminator learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument(
+        '--dynamic_batch_size', type=int, default=16,
+        help='batch size used by the batched Qwen teacher path (32B-safe default: 16)',
+    )
+    parser.add_argument(
+        '--dynamic_workers', type=int, default=min(4, os.cpu_count() or 1),
+        help='CPU image-loader workers for dynamic mode; Qwen remains in the main process',
+    )
+    parser.add_argument(
+        '--prefetch_factor', type=int, default=2,
+        help='batches prefetched per dynamic worker',
+    )
     
     # GAN 损失权重
     parser.add_argument('--lambda_mse', type=float, default=10.0,
@@ -1041,10 +1200,30 @@ def main():
 
     parser.add_argument('--dynamic', action='store_true',
                         help='enable dynamic mode and compute Qwen features during training')
-    parser.add_argument('--qwen_model', type=str, default='Qwen/Qwen2.5-VL-3B-Instruct',
+    parser.add_argument('--qwen_model', type=str, default='Qwen/Qwen2.5-VL-32B-Instruct',
                         help='Qwen model name or local path for dynamic mode')
     parser.add_argument('--qwen_layer', type=int, default=4,
                         help='Qwen ViT extraction layer')
+    parser.add_argument(
+        '--qwen_local_files_only', action='store_true',
+        help='load Qwen only from the local Hugging Face cache; never contact the network',
+    )
+    parser.add_argument(
+        '--qwen_min_pixels', type=int, default=None,
+        help='Qwen image processor minimum pixels; defaults to image_size squared',
+    )
+    parser.add_argument(
+        '--qwen_max_pixels', type=int, default=None,
+        help='Qwen image processor maximum pixels; defaults to image_size squared',
+    )
+    parser.add_argument(
+        '--qwen_visual_only', dest='qwen_visual_only', action='store_true', default=True,
+        help='retain only Qwen visual tower for feature training (default)',
+    )
+    parser.add_argument(
+        '--keep_qwen_language_model', dest='qwen_visual_only', action='store_false',
+        help='keep the full Qwen language decoder; not needed for visual feature training',
+    )
     
     # 其他
     parser.add_argument('--device', type=str,
@@ -1056,6 +1235,21 @@ def main():
                         help='enable AMP mixed precision training')
     
     args = parser.parse_args()
+    if args.dynamic_batch_size <= 0:
+        parser.error('--dynamic_batch_size must be positive')
+    if args.dynamic_workers < 0:
+        parser.error('--dynamic_workers must be non-negative')
+    if args.prefetch_factor <= 0:
+        parser.error('--prefetch_factor must be positive')
+    qwen_default_pixels = args.image_size * args.image_size
+    if args.qwen_min_pixels is None:
+        args.qwen_min_pixels = qwen_default_pixels
+    if args.qwen_max_pixels is None:
+        args.qwen_max_pixels = qwen_default_pixels
+    if args.qwen_min_pixels <= 0 or args.qwen_max_pixels <= 0:
+        parser.error('--qwen_min_pixels and --qwen_max_pixels must be positive')
+    if args.qwen_min_pixels > args.qwen_max_pixels:
+        parser.error('--qwen_min_pixels cannot exceed --qwen_max_pixels')
     if args.multilevel_payload:
         levels = parse_payload_levels(args.payload_levels)
         max_tokens = max(level[0] for level in levels)
@@ -1069,6 +1263,13 @@ def main():
                 f"--bottleneck_dim must be at least {max_dim} for payload levels {args.payload_levels}"
             )
     set_seed(args.seed)
+    if args.dynamic and args.device.startswith('cuda'):
+        # Dynamic mode is throughput-oriented and always uses fixed 224x224
+        # inputs.  set_seed() enables deterministic cuDNN by default, which
+        # needlessly disables the fastest convolution kernels here.
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')
     
     # 加载数据
     if args.dynamic:
@@ -1079,25 +1280,46 @@ def main():
         extractor = QwenFeatureExtractor(
             model_name=args.qwen_model,
             device=args.device,
-            extract_layer=args.qwen_layer
+            extract_layer=args.qwen_layer,
+            local_files_only=args.qwen_local_files_only,
+            min_pixels=args.qwen_min_pixels,
+            max_pixels=args.qwen_max_pixels,
+            visual_only=args.qwen_visual_only,
         ).load()
         
         train_dataset = DynamicFeatureDataset(
             images_dir=args.data_dir,
-            extractor=extractor,
             split='train',
             image_size=args.image_size
         )
         
         val_dataset = DynamicFeatureDataset(
             images_dir=args.data_dir,
-            extractor=extractor,
             split='val',
             image_size=args.image_size
         )
-        
-        # 动态模式不使用多进程 (Qwen 模型不可 pickle)
-        num_workers = 0
+        dynamic_batch_size = args.dynamic_batch_size
+        loader_kwargs = {
+            'batch_size': dynamic_batch_size,
+            'num_workers': args.dynamic_workers,
+            'pin_memory': True,
+            'collate_fn': dynamic_identity_collate,
+        }
+        if args.dynamic_workers > 0:
+            loader_kwargs['persistent_workers'] = True
+            loader_kwargs['prefetch_factor'] = args.prefetch_factor
+            # Do not fork after the 32B Qwen model has initialized CUDA. The
+            # workers only decode CPU images, so spawn keeps them isolated
+            # from the teacher model and avoids CUDA/fork interactions.
+            loader_kwargs['multiprocessing_context'] = 'spawn'
+        train_raw_loader = DataLoader(
+            train_dataset, shuffle=True, **loader_kwargs
+        )
+        val_raw_loader = DataLoader(
+            val_dataset, shuffle=False, **loader_kwargs
+        )
+        train_loader = DynamicQwenBatchLoader(train_raw_loader, extractor)
+        val_loader = DynamicQwenBatchLoader(val_raw_loader, extractor)
     else:
         # 静态模式: 从预计算文件加载
         if not args.features_dir:
@@ -1118,16 +1340,16 @@ def main():
         )
         
         num_workers = args.num_workers
-    
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True, collate_fn=collate_fn
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True, collate_fn=collate_fn
-    )
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=True, collate_fn=collate_fn
+        )
+
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=True, collate_fn=collate_fn
+        )
     
     # 创建训练器
     trainer = GANTrainer(args)

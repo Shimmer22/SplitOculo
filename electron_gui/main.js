@@ -257,6 +257,10 @@ ipcMain.handle('run-edge-inference', async (event, options) => {
       '--timeout', options.timeout.toString()
     ];
 
+    if (options.cloudCheckpoint) {
+      args.push('--cloud_checkpoint', options.cloudCheckpoint);
+    }
+
     if (options.prompt) {
       args.push('--prompt', options.prompt);
     }
@@ -342,6 +346,9 @@ ipcMain.handle('run-demo-inference', async (event, options) => {
       '--codec_gop_frames', String(options.codecGopFrames || 4),
       '--projects', (options.projects || []).join(','),
     ];
+    if (options.cloudCheckpoint) {
+      args.push('--cloud_checkpoint', options.cloudCheckpoint);
+    }
     if (options.edgeCheckpoint) {
       args.push('--edge_checkpoint', resolveCheckpoint(options.edgeCheckpoint, 'edge'));
     }
