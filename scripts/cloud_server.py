@@ -54,6 +54,14 @@ import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from flask import Flask, Response, request, jsonify
+
+# Transformers 5.x imports SciPy/Scikit-learn while initializing
+# GenerationMixin. Keep the cloud entry point compatible with the NumPy 1.x
+# deployment image before any Transformers import happens.
+from core.runtime_compat import patch_numpy_legacy_aliases
+
+patch_numpy_legacy_aliases()
+
 from transformers import TextIteratorStreamer
 
 from models.cloud_upsampler import CloudUpsampler, TransformerUpsampler

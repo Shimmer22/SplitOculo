@@ -2,6 +2,11 @@ import importlib
 import platform
 import sys
 
+from core.runtime_compat import patch_numpy_legacy_aliases
+
+
+patch_numpy_legacy_aliases()
+
 PACKAGES = [
     ("torch", "torch"),
     ("torchvision", "torchvision"),

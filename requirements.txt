@@ -7,6 +7,11 @@ pandas
 # The current PyTorch/OpenCV stack in the deployment image is built against
 # NumPy 1.x; NumPy 2.x makes torch.from_numpy unavailable at runtime.
 numpy<2
+# Transformers 5.x imports sklearn.metrics from its generation module. Keep
+# the numerical stack on the NumPy-1.x-compatible line used by the deployment
+# image; newer SciPy releases require NumPy 2.x.
+scipy<1.16
+scikit-learn>=1.5,<1.6
 matplotlib
 tqdm
 

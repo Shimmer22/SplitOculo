@@ -19,30 +19,10 @@ import torch.nn.functional as F
 from PIL import Image
 
 
-def _patch_numpy_legacy_aliases():
-    """Keep old SciPy/sklearn imports usable with NumPy 1.26.
-
-    The container's PyTorch/OpenCV wheels require NumPy 1.x, while the
-    installed SciPy stack still references aliases removed in NumPy 1.24.
-    Adding these aliases is local, reversible compatibility glue and avoids
-    importing a second incompatible numerical stack just for Qwen loading.
-    """
-    aliases = {
-        "bool": np.bool_,
-        "int": int,
-        "float": float,
-        "complex": complex,
-        "object": object,
-        "str": str,
-        "long": np.int64,
-        "ulong": np.uint64,
-    }
-    for name, value in aliases.items():
-        if name not in np.__dict__:
-            setattr(np, name, value)
+from core.runtime_compat import patch_numpy_legacy_aliases
 
 
-_patch_numpy_legacy_aliases()
+patch_numpy_legacy_aliases()
 
 
 class QwenFeatureExtractor:
