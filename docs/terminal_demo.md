@@ -56,8 +56,20 @@ E:\anaconda\envs\cnn_vit\python.exe scripts\terminal_demo.py `
   --projects baseline,so,temporal,codec `
   --max-frames 4 `
   --sample-fps 2 `
+  --rounds 3 `
+  --round-step-seconds 2 `
   --offline
 ```
+
+`--rounds` 控制总推理轮数（默认 `1`），`--round-step-seconds` 同时控制相邻窗口起点的
+滑动量和采样周期（默认 `2` 秒）。例如 `3` 轮、步长 `2` 秒时，窗口依次从视频的
+`0s`、`2s`、`4s` 开始。加上 `--interrupt-on-next-round` 后，若当前轮到下一采样时刻
+仍未完成，客户端会中断当前轮并开始下一轮；关闭时会等待当前轮完成，因此推理耗时大于
+步长时会逐轮落后。每张结果卡会显示轮数、总输入帧数、总请求负载及相对速度；相对速度
+按“滑动步长 / 本轮方案耗时”计算，低于 `1×` 表示无法实时跟上窗口推进。
+多个项目按“项目优先”执行：先完成 Baseline 的全部轮次，再完成下一个项目的全部轮次。
+每个项目只显示一张动态汇总卡；已完成轮数、输入帧数和请求负载逐轮累计，端侧编码、模拟
+时延、TTFT 与相对速度显示已完成轮次的平均值。卡片下半部分按窗口起点逐行保留每轮回答。
 
 首次检查建议先使用 `--projects baseline` 和单张图片，再逐步加入端云、时序和
 codec 方案。选择 `so` 时需要 edge checkpoint；选择 `temporal` 或 `codec` 时还

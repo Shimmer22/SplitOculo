@@ -55,7 +55,7 @@ def test_demo_client_forwards_delta_and_returns_result():
     assert result == {"response": "你好"}
 
 
-def test_terminal_types_text_and_publishes_each_finished_card_immediately():
+def test_terminal_types_text_and_publishes_aggregated_card_immediately():
     class TtyBuffer(io.StringIO):
         def isatty(self):
             return True
@@ -67,7 +67,6 @@ def test_terminal_types_text_and_publishes_each_finished_card_immediately():
                 'DEMO_STREAM_DELTA={"label":"基线","text":"你"}\n',
                 'DEMO_STREAM_DELTA={"label":"基线","text":"好"}\n',
                 'DEMO_RESULT_ITEM={"label":"基线","response":"你好","edge_encode_ms":1,"bandwidth_delay_ms":2,"ttft_without_network_ms":3}\n',
-                'DEMO_STREAM_START={"label":"逐帧"}\n',
             ]
         )
 
@@ -82,9 +81,14 @@ def test_terminal_types_text_and_publishes_each_finished_card_immediately():
         mock.patch.object(terminal_demo, "_clear_status"),
         mock.patch.object(terminal_demo.sys, "stdout", output),
     ):
-        assert terminal_demo.run_demo(SimpleNamespace(), ["baseline", "so"]) == 0
+        aggregates = {}
+        assert terminal_demo.run_demo(
+            SimpleNamespace(round_step_seconds=2.0),
+            ["baseline"],
+            aggregate_results=aggregates,
+        ) == 0
 
     rendered = output.getvalue()
     assert "回答：你好" in rendered
-    next_start = rendered.index("正在生成：逐帧")
-    assert rendered[:next_start].count("基线") >= 2
+    assert "第 1 轮（0s）: 你好" in rendered
+    assert aggregates["baseline"]["completed_rounds"] == 1

@@ -34,3 +34,23 @@ def test_best_effort_sampling_uses_positive_stream_origin():
     assert [
         record["source_index"] for record in records if record["selected"]
     ] == [0, 11, 23, 35]
+
+
+def test_best_effort_sampling_honors_sliding_window_start():
+    records = [
+        {
+            "time_seconds": float(index),
+            "pict_type": "I" if index == 0 else "P",
+            "source_index": index,
+            "selected": False,
+        }
+        for index in range(5)
+    ]
+
+    _select_best_effort_ip(
+        records, target_fps=1.0, target_count=2, start_time=2.0
+    )
+
+    assert [
+        record["source_index"] for record in records if record["selected"]
+    ] == [2, 3]

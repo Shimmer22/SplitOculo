@@ -109,10 +109,13 @@ def _raw_frames(path: Path, width: int, height: int, pixel_format: str):
 
 
 def _read_input(path: Path, args, use_decoder_mvs: bool):
+    start_time = max(0.0, float(args.start_time))
     if path.is_dir():
         images = sorted(p for p in path.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
         if not images:
             raise ValueError(f"No image frames found in directory: {path}")
+        start_index = int(round(start_time * float(args.sample_fps or 1.0)))
+        images = images[start_index:]
         frames = [Image.open(item).convert("RGB") for item in images]
         if args.max_frames:
             frames = frames[: args.max_frames]
@@ -123,6 +126,8 @@ def _read_input(path: Path, args, use_decoder_mvs: bool):
 
     if path.suffix.lower() in RAW_EXTENSIONS:
         frames = _raw_frames(path, args.raw_width, args.raw_height, args.raw_format)
+        start_index = int(round(start_time * float(args.raw_fps)))
+        frames = frames[start_index:]
         if args.max_frames:
             frames = frames[: args.max_frames]
         return frames, args.raw_fps, "raw_frames", None
@@ -133,11 +138,15 @@ def _read_input(path: Path, args, use_decoder_mvs: bool):
             max_frames=args.max_frames,
             sample_fps=args.sample_fps,
             selection_policy=args.codec_selection_policy,
+            start_time=start_time,
         )
         return [record["image"] for record in records if record["selected"]], native_fps, reader, records
 
     frames, native_fps, reader = read_video_frames(
-        path, max_frames=args.max_frames, sample_fps=args.sample_fps
+        path,
+        max_frames=args.max_frames,
+        sample_fps=args.sample_fps,
+        start_time=start_time,
     )
     return frames, native_fps, reader, None
 
@@ -638,6 +647,7 @@ def main():
     parser.add_argument("--spatial_level", default="49x64")
     parser.add_argument("--max_frames", type=int, default=8)
     parser.add_argument("--sample_fps", type=float, default=2.0)
+    parser.add_argument("--start_time", type=float, default=0.0)
     parser.add_argument("--codec_flow_impl", choices=("feature_grid", "feature_grid_center", "dense"), default="feature_grid")
     parser.add_argument(
         "--codec_selection_policy",

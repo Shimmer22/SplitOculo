@@ -12,10 +12,12 @@ import argparse
 import json
 import os
 from pathlib import Path
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any
 import unicodedata
@@ -54,6 +56,9 @@ CONFIG_FIELDS = (
     "spatial_level",
     "max_frames",
     "sample_fps",
+    "rounds",
+    "round_step_seconds",
+    "interrupt_on_next_round",
     "codec_flow_impl",
     "codec_selection_policy",
     "codec_reference_mode",
@@ -120,6 +125,9 @@ def default_config() -> dict[str, Any]:
         "spatial_level": "49x64",
         "max_frames": 8,
         "sample_fps": 2.0,
+        "rounds": 1,
+        "round_step_seconds": 2.0,
+        "interrupt_on_next_round": False,
         "codec_flow_impl": "feature_grid",
         "codec_selection_policy": "best_effort_ip",
         "codec_reference_mode": "recursive",
@@ -190,6 +198,19 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
     parser.add_argument("--spatial-level", default=defaults["spatial_level"])
     parser.add_argument("--max-frames", type=int, default=defaults["max_frames"])
     parser.add_argument("--sample-fps", type=float, default=defaults["sample_fps"])
+    parser.add_argument("--rounds", type=int, default=defaults["rounds"], help="Total sliding-window inference rounds")
+    parser.add_argument(
+        "--round-step-seconds",
+        type=float,
+        default=defaults["round_step_seconds"],
+        help="Window start-time increment and round cadence in seconds",
+    )
+    parser.add_argument(
+        "--interrupt-on-next-round",
+        action=argparse.BooleanOptionalAction,
+        default=defaults["interrupt_on_next_round"],
+        help="Interrupt an unfinished round when the next sampling time arrives",
+    )
     parser.add_argument(
         "--codec-flow-impl",
         choices=("feature_grid", "feature_grid_center", "dense"),
@@ -355,6 +376,9 @@ def _settings_menu(args: argparse.Namespace) -> None:
         options = [
             f"最大帧数                 {args.max_frames}",
             f"采样 FPS                 {args.sample_fps}",
+            f"推理轮数                 {args.rounds}",
+            f"每轮窗口滑动             {args.round_step_seconds:g} 秒",
+            f"到点中断上一轮           {'是' if args.interrupt_on_next_round else '否'}",
             f"网络时延模拟              {_network_label(args.bandwidth_kb_s)}",
             f"离线模型                  {'是' if args.offline else '否'}",
             f"设备                      {args.device}",
@@ -362,7 +386,7 @@ def _settings_menu(args: argparse.Namespace) -> None:
             "返回",
         ]
         choice = _select("运行设置", options, cursor)
-        if choice is None or choice == 6:
+        if choice is None or choice == 9:
             return
         cursor = choice
         if choice == 0:
@@ -370,12 +394,20 @@ def _settings_menu(args: argparse.Namespace) -> None:
         elif choice == 1:
             args.sample_fps = _input_value("采样 FPS", args.sample_fps, float)
         elif choice == 2:
-            _network_menu(args)
+            args.rounds = _input_value("推理轮数", args.rounds, int)
         elif choice == 3:
-            args.offline = not args.offline
+            args.round_step_seconds = _input_value(
+                "每轮窗口滑动秒数", args.round_step_seconds, float
+            )
         elif choice == 4:
-            args.device = ["cuda", "cpu"][_select("选择设备", ["CUDA", "CPU"]) or 0]
+            args.interrupt_on_next_round = not args.interrupt_on_next_round
         elif choice == 5:
+            _network_menu(args)
+        elif choice == 6:
+            args.offline = not args.offline
+        elif choice == 7:
+            args.device = ["cuda", "cpu"][_select("选择设备", ["CUDA", "CPU"]) or 0]
+        elif choice == 8:
             args.port = _input_value("localhost 端口", args.port, int)
 
 
@@ -426,7 +458,7 @@ def interactive_menu(args: argparse.Namespace) -> bool:
             f"端侧 checkpoint           {_short(args.edge_checkpoint)}",
             f"时序 checkpoint           {_short(args.temporal_pair_checkpoint)}",
             f"Prompt                    {_short(args.prompt)}",
-            f"运行设置                  {args.max_frames} 帧 @ {args.sample_fps} FPS",
+            f"运行设置                  {args.max_frames} 帧 @ {args.sample_fps} FPS · {args.rounds} 轮/{args.round_step_seconds:g}s",
             "退出",
         ]
         choice = _select("SplitOculo 终端 Demo", options, cursor)
@@ -505,6 +537,10 @@ def validate_args(args: argparse.Namespace) -> list[str]:
         raise ValueError("--baseline-jpeg-quality must be in [1, 100]")
     if args.max_frames <= 0 or args.sample_fps <= 0:
         raise ValueError("--max-frames and --sample-fps must be positive")
+    if args.rounds <= 0:
+        raise ValueError("--rounds must be positive")
+    if args.round_step_seconds <= 0:
+        raise ValueError("--round-step-seconds must be positive")
     if args.port <= 0 or args.port > 65535:
         raise ValueError("--port must be in [1, 65535]")
     return projects
@@ -582,7 +618,9 @@ def build_cloud_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
-def build_demo_command(args: argparse.Namespace, projects: list[str]) -> list[str]:
+def build_demo_command(
+    args: argparse.Namespace, projects: list[str], start_time: float = 0.0
+) -> list[str]:
     command = [
         sys.executable,
         str(ROOT / "scripts" / "demo_client.py"),
@@ -606,6 +644,8 @@ def build_demo_command(args: argparse.Namespace, projects: list[str]) -> list[st
         str(args.max_frames),
         "--sample_fps",
         str(args.sample_fps),
+        "--start_time",
+        str(start_time),
         "--codec_flow_impl",
         args.codec_flow_impl,
         "--codec_selection_policy",
@@ -787,18 +827,111 @@ def _wrap_cells(value: Any, width: int) -> list[str]:
     return lines or [" " * width]
 
 
+AVERAGED_RESULT_FIELDS = (
+    "edge_encode_ms",
+    "upload_delay_ms",
+    "ttft_without_network_ms",
+    "relative_speed",
+)
+
+
+def update_aggregate_result(
+    aggregates: dict[str, dict[str, Any]],
+    project: str,
+    row: dict[str, Any],
+    round_index: int,
+    total_rounds: int,
+    start_time: float,
+) -> dict[str, Any]:
+    aggregate = aggregates.setdefault(
+        project,
+        {
+            "label": row.get("label") or project,
+            "completed_rounds": 0,
+            "rounds": total_rounds,
+            "frames": 0,
+            "request_bytes": 0,
+            "round_outputs": [],
+            "_metric_totals": {},
+            "_metric_counts": {},
+        },
+    )
+    aggregate["label"] = row.get("label") or aggregate["label"]
+    aggregate["completed_rounds"] += 1
+    aggregate["rounds"] = total_rounds
+    aggregate["frames"] += int(row.get("frames") or 0)
+    aggregate["request_bytes"] += int(
+        row.get("request_bytes", row.get("payload_bytes")) or 0
+    )
+    for field in AVERAGED_RESULT_FIELDS:
+        value = row.get(field)
+        if value is None:
+            continue
+        totals = aggregate["_metric_totals"]
+        counts = aggregate["_metric_counts"]
+        totals[field] = float(totals.get(field, 0.0)) + float(value)
+        counts[field] = int(counts.get(field, 0)) + 1
+        aggregate[field] = totals[field] / counts[field]
+    aggregate["round_outputs"].append(
+        {
+            "round": round_index,
+            "window_start_seconds": start_time,
+            "response": row.get("response"),
+            "error": row.get("error"),
+            "interrupted": bool(row.get("interrupted")),
+        }
+    )
+    return aggregate
+
+
 def _card_body(row: dict[str, Any], inner_width: int) -> tuple[list[str], list[str]]:
-    label = str(row.get("label") or "Result")
+    aggregate_mode = "round_outputs" in row
+    label = str(row.get("round_label") or row.get("label") or "Result")
     edge = _milliseconds(row.get("edge_encode_ms"))
     simulated = _milliseconds(row.get("upload_delay_ms"))
     ttft = _milliseconds(row.get("ttft_without_network_ms"))
+    frames = row.get("frames")
+    frame_text = "-" if frames is None else str(frames)
+    payload = _kilobytes(row.get("request_bytes", row.get("payload_bytes")))
+    relative_speed = row.get("relative_speed")
+    speed_text = "-" if relative_speed is None else f"{float(relative_speed):.2f}×"
     header = [
         _fit_cell(label, inner_width, "center"),
-        _fit_cell(f"端侧编码: {edge}", inner_width, "center"),
-        _fit_cell(f"模拟时延: {simulated}", inner_width, "center"),
-        _fit_cell(f"TTFT: {ttft}", inner_width, "center"),
     ]
-    if row.get("error"):
+    if aggregate_mode:
+        header.append(
+            _fit_cell(
+                f"已完成轮次: {row.get('completed_rounds', 0)}/{row.get('rounds', 0)}",
+                inner_width,
+                "center",
+            )
+        )
+    header.extend([
+        _fit_cell(f"总输入帧数: {frame_text}", inner_width, "center"),
+        _fit_cell(f"总负载大小: {payload}", inner_width, "center"),
+        _fit_cell(f"{'平均' if aggregate_mode else ''}相对速度: {speed_text}", inner_width, "center"),
+        _fit_cell(f"{'平均' if aggregate_mode else ''}端侧编码: {edge}", inner_width, "center"),
+        _fit_cell(f"{'平均' if aggregate_mode else ''}模拟时延: {simulated}", inner_width, "center"),
+        _fit_cell(f"平均 TTFT: {ttft}" if aggregate_mode else f"TTFT: {ttft}", inner_width, "center"),
+    ])
+    if aggregate_mode:
+        response = []
+        for output in row.get("round_outputs") or []:
+            prefix = (
+                f"第 {output['round']} 轮"
+                f"（{float(output['window_start_seconds']):g}s）: "
+            )
+            if output.get("interrupted"):
+                value = prefix + "已到点中断"
+            elif output.get("error"):
+                value = prefix + f"失败：{output['error']}"
+            else:
+                value = prefix + str(output.get("response") or "（无响应）")
+            response.extend(_wrap_cells(value, inner_width))
+        completed = int(row.get("completed_rounds") or 0)
+        total = int(row.get("rounds") or 0)
+        footer = "已完成" if completed >= total else "进行中"
+    elif row.get("error"):
         response = _wrap_cells(f"失败：{row['error']}", inner_width)
         footer = "失败"
     else:
@@ -849,9 +982,21 @@ def render_result(row: dict[str, Any]) -> str:
     return render_comparison([row], terminal_width=88)
 
 
-def run_demo(args: argparse.Namespace, projects: list[str]) -> int:
+def run_demo(
+    args: argparse.Namespace,
+    projects: list[str],
+    round_index: int = 1,
+    total_rounds: int = 1,
+    start_time: float = 0.0,
+    deadline: float | None = None,
+    aggregate_results: dict[str, dict[str, Any]] | None = None,
+) -> int:
+    if len(projects) != 1:
+        raise ValueError("run_demo expects exactly one project in multi-round mode")
+    project = projects[0]
+    aggregates = aggregate_results if aggregate_results is not None else {}
     process = subprocess.Popen(
-        build_demo_command(args, projects),
+        build_demo_command(args, projects, start_time=start_time),
         cwd=ROOT,
         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         stdout=subprocess.PIPE,
@@ -862,11 +1007,57 @@ def run_demo(args: argparse.Namespace, projects: list[str]) -> int:
         bufsize=1,
     )
     final_result = None
-    results: list[dict[str, Any]] = []
+    received_result = False
     live_terminal = sys.stdout.isatty()
     stream_active = False
+    round_name = f"第 {round_index}/{total_rounds} 轮"
     assert process.stdout is not None
-    for raw_line in process.stdout:
+    output_queue: queue.Queue[str | None] = queue.Queue()
+
+    def _read_output() -> None:
+        try:
+            for raw_line in process.stdout:
+                output_queue.put(raw_line)
+        finally:
+            output_queue.put(None)
+
+    reader = threading.Thread(target=_read_output, daemon=True)
+    reader.start()
+    while True:
+        if (
+            deadline is not None
+            and time.monotonic() >= deadline
+            and process.poll() is None
+        ):
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            _clear_status()
+            update_aggregate_result(
+                aggregates,
+                project,
+                {"label": aggregates.get(project, {}).get("label", project), "interrupted": True},
+                round_index,
+                total_rounds,
+                start_time,
+            )
+            if live_terminal:
+                _clear_screen()
+            print(render_comparison(list(aggregates.values())), flush=True)
+            print(f"{round_name}到达下一轮采样时刻，已中断。", file=sys.stderr, flush=True)
+            return 124
+        wait_seconds = 0.2
+        if deadline is not None:
+            wait_seconds = max(0.01, min(wait_seconds, deadline - time.monotonic()))
+        try:
+            raw_line = output_queue.get(timeout=wait_seconds)
+        except queue.Empty:
+            continue
+        if raw_line is None:
+            break
         line = raw_line.rstrip("\r\n")
         if line.startswith(STREAM_START_PREFIX):
             try:
@@ -878,13 +1069,13 @@ def run_demo(args: argparse.Namespace, projects: list[str]) -> int:
             stream_active = True
             if live_terminal:
                 _clear_screen()
-                if results:
-                    print(render_comparison(results))
+                if aggregates:
+                    print(render_comparison(list(aggregates.values())))
                     print()
-                print(f"正在生成：{label}\n")
-                print("回答：", end="", flush=True)
+                print(f"正在生成：{round_name} · {label}\n")
+                print(f"{round_name}回答：", end="", flush=True)
             else:
-                _status(f"正在生成 {label}...")
+                _status(f"{round_name}正在生成 {label}...")
         elif line.startswith(STREAM_DELTA_PREFIX):
             try:
                 event = json.loads(line[len(STREAM_DELTA_PREFIX) :])
@@ -896,13 +1087,26 @@ def run_demo(args: argparse.Namespace, projects: list[str]) -> int:
         elif line.startswith(RESULT_ITEM_PREFIX):
             try:
                 row = json.loads(line[len(RESULT_ITEM_PREFIX) :])
-                results.append(row)
+                full_response_ms = row.get("full_response_ms")
+                if full_response_ms is not None and float(full_response_ms) > 0:
+                    row["relative_speed"] = (
+                        args.round_step_seconds * 1000.0 / float(full_response_ms)
+                    )
+                update_aggregate_result(
+                    aggregates,
+                    project,
+                    row,
+                    round_index,
+                    total_rounds,
+                    start_time,
+                )
+                received_result = True
                 if stream_active and live_terminal:
                     print()
                     _clear_screen()
-                    print(render_comparison(results), flush=True)
+                    print(render_comparison(list(aggregates.values())), flush=True)
                 else:
-                    _status(f"{row.get('label') or '项目'} 已完成")
+                    _status(f"{round_name} · {row.get('label') or '项目'} 已完成")
                 stream_active = False
             except json.JSONDecodeError:
                 _status("客户端返回了无效结果事件")
@@ -915,10 +1119,16 @@ def run_demo(args: argparse.Namespace, projects: list[str]) -> int:
             _status(line)
     returncode = process.wait()
     _clear_status()
-    if not results and final_result is not None:
-        results = list(final_result.get("results") or [])
-    if results and not live_terminal:
-        print(render_comparison(results), flush=True)
+    if not received_result and final_result is not None:
+        fallback_rows = list(final_result.get("results") or [])
+        if fallback_rows:
+            row = fallback_rows[0]
+            update_aggregate_result(
+                aggregates, project, row, round_index, total_rounds, start_time
+            )
+            received_result = True
+    if received_result and not live_terminal:
+        print(render_comparison(list(aggregates.values())), flush=True)
     if returncode != 0:
         print(f"Demo client exited with code {returncode}", file=sys.stderr)
     return returncode
@@ -1006,7 +1216,41 @@ def execute(
             f"target={health.get('checkpoint_target_tokens')}x"
             f"{health.get('checkpoint_hidden_size')}"
         )
-        return run_demo(args, projects)
+        aggregate_results: dict[str, dict[str, Any]] = {}
+        last_returncode = 0
+        for project in projects:
+            schedule_started = time.monotonic()
+            for round_index in range(1, args.rounds + 1):
+                scheduled_at = schedule_started + (round_index - 1) * args.round_step_seconds
+                remaining = scheduled_at - time.monotonic()
+                if remaining > 0:
+                    _status(
+                        f"{project} · 等待第 {round_index}/{args.rounds} 轮采样时刻..."
+                    )
+                    time.sleep(remaining)
+                else:
+                    lag = -remaining
+                    if round_index > 1 and lag >= 0.01:
+                        _status(
+                            f"{project} · 第 {round_index}/{args.rounds} 轮"
+                            f"已落后采样 {lag:.2f} 秒"
+                        )
+                window_start = (round_index - 1) * args.round_step_seconds
+                deadline = None
+                if args.interrupt_on_next_round and round_index < args.rounds:
+                    deadline = scheduled_at + args.round_step_seconds
+                last_returncode = run_demo(
+                    args,
+                    [project],
+                    round_index=round_index,
+                    total_rounds=args.rounds,
+                    start_time=window_start,
+                    deadline=deadline,
+                    aggregate_results=aggregate_results,
+                )
+                if last_returncode not in {0, 124}:
+                    return last_returncode
+        return 0 if last_returncode == 124 else last_returncode
     except KeyboardInterrupt:
         _clear_status()
         print("已中断。", file=sys.stderr)

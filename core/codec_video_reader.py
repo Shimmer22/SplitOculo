@@ -46,7 +46,7 @@ def _picture_type(frame):
     }.get(value, f"UNKNOWN_{value}")
 
 
-def _select_best_effort_ip(records, target_fps, target_count):
+def _select_best_effort_ip(records, target_fps, target_count, start_time=0.0):
     """Select the latest causal I/P frame at each output deadline."""
     if not target_fps or target_fps <= 0 or not records:
         return
@@ -68,7 +68,7 @@ def _select_best_effort_ip(records, target_fps, target_count):
         0.0,
     )
     for output_index in range(target_count):
-        deadline = stream_origin + output_index / target_fps
+        deadline = stream_origin + float(start_time) + output_index / target_fps
         while cursor < len(records):
             record = records[cursor]
             timestamp = record["time_seconds"]
@@ -93,6 +93,7 @@ def read_video_records_with_mvs(
     max_frames=None,
     sample_fps=None,
     selection_policy="fixed",
+    start_time=0.0,
 ):
     """Decode through the last sampled frame and retain AVMotionVector arrays.
 
@@ -133,7 +134,13 @@ def read_video_records_with_mvs(
         options["flags2"] = "+export_mvs"
         stream.codec_context.options = options
 
-    selected_indices = _sample_indices(total_frames, native_fps, sample_fps, max_frames)
+    start_frame = max(0, int(round(float(start_time) * native_fps))) if native_fps > 0 else 0
+    selected_indices = [
+        start_frame + index
+        for index in _sample_indices(
+            max(0, total_frames - start_frame), native_fps, sample_fps, max_frames
+        )
+    ]
     if not selected_indices:
         container.close()
         raise RuntimeError(f"No sample indices selected from {video_path}")
@@ -156,7 +163,9 @@ def read_video_records_with_mvs(
     container.close()
 
     if selection_policy == "best_effort_ip":
-        _select_best_effort_ip(records, sample_fps, len(selected_indices))
+        _select_best_effort_ip(
+            records, sample_fps, len(selected_indices), start_time=start_time
+        )
         if not any(record["selected"] for record in records):
             raise RuntimeError(f"No causal I/P frames selected from {video_path}")
         reader = "pyav_export_mvs_best_effort_ip"

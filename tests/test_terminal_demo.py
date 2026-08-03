@@ -31,6 +31,9 @@ def _args(tmp_path: Path, **overrides):
         "spatial_level": "49x64",
         "max_frames": 4,
         "sample_fps": 2.0,
+        "rounds": 1,
+        "round_step_seconds": 2.0,
+        "interrupt_on_next_round": False,
         "codec_flow_impl": "feature_grid",
         "codec_selection_policy": "best_effort_ip",
         "codec_reference_mode": "recursive",
@@ -100,6 +103,13 @@ def test_commands_use_localhost_and_current_python(tmp_path):
     assert "--offline" in cloud
     assert "http://127.0.0.1:8080" in demo
     assert demo[demo.index("--projects") + 1] == "baseline,so,temporal,codec"
+    assert demo[demo.index("--start_time") + 1] == "0.0"
+
+
+def test_demo_command_sets_sliding_window_start(tmp_path):
+    args = _args(tmp_path)
+    demo = terminal_demo.build_demo_command(args, ["baseline"], start_time=4.5)
+    assert demo[demo.index("--start_time") + 1] == "4.5"
 
 
 def test_saved_config_round_trip_excludes_password(tmp_path):
@@ -122,6 +132,8 @@ def test_parser_uses_persisted_defaults():
     assert args.input == "/data/demo.mp4"
     assert args.max_frames == 12
     assert args.offline is False
+    assert args.rounds == 1
+    assert args.round_step_seconds == 2.0
 
 
 def test_arrow_menu_moves_selection():
@@ -184,6 +196,8 @@ def test_render_result_contains_core_and_codec_metrics():
             "request_bytes": 3072,
             "frames": 4,
             "sample_fps": 2,
+            "round_label": "第 1/3 轮 · Codec",
+            "relative_speed": 1.25,
             "reader": "pyav",
             "feature_shape": [2, 49, 64],
             "temporal_redundancy_acceleration": True,
@@ -197,6 +211,54 @@ def test_render_result_contains_core_and_codec_metrics():
     assert "模拟时延: 3.0 ms" in rendered
     assert "TTFT: 38.0 ms" in rendered
     assert "Cloud process" not in rendered
+    assert "第 1/3 轮" in rendered
+    assert "总输入帧数: 4" in rendered
+    assert "总负载大小: 3.00 KB" in rendered
+    assert "相对速度: 1.25×" in rendered
+
+
+def test_aggregate_result_sums_counts_and_averages_metrics():
+    aggregates = {}
+    terminal_demo.update_aggregate_result(
+        aggregates,
+        "baseline",
+        {
+            "label": "Baseline",
+            "response": "first",
+            "frames": 2,
+            "request_bytes": 1024,
+            "edge_encode_ms": 10,
+            "relative_speed": 0.5,
+        },
+        round_index=1,
+        total_rounds=2,
+        start_time=0.0,
+    )
+    aggregate = terminal_demo.update_aggregate_result(
+        aggregates,
+        "baseline",
+        {
+            "label": "Baseline",
+            "response": "second",
+            "frames": 3,
+            "request_bytes": 2048,
+            "edge_encode_ms": 20,
+            "relative_speed": 1.5,
+        },
+        round_index=2,
+        total_rounds=2,
+        start_time=2.0,
+    )
+
+    assert aggregate["completed_rounds"] == 2
+    assert aggregate["frames"] == 5
+    assert aggregate["request_bytes"] == 3072
+    assert aggregate["edge_encode_ms"] == 15
+    assert aggregate["relative_speed"] == 1
+    rendered = terminal_demo.render_result(aggregate)
+    assert "已完成轮次: 2/2" in rendered
+    assert "第 1 轮（0s）: first" in rendered
+    assert "第 2 轮（2s）: second" in rendered
 
 
 def test_comparison_renders_results_side_by_side():

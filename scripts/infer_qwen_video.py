@@ -47,18 +47,24 @@ def _fps_indices(total_frames, native_fps, sample_fps, max_frames):
     return indices
 
 
-def _read_video_torchvision(video_path, max_frames=None, sample_fps=None):
+def _read_video_torchvision(video_path, max_frames=None, sample_fps=None, start_time=0.0):
     from torchvision.io import read_video
 
     video, _, info = read_video(str(video_path), pts_unit="sec", output_format="THWC")
     total_frames = int(video.shape[0])
     native_fps = float(info.get("video_fps", 0.0) or 0.0)
-    indices = _fps_indices(total_frames, native_fps, sample_fps, max_frames)
+    start_frame = max(0, int(round(float(start_time) * native_fps))) if native_fps > 0 else 0
+    indices = [
+        start_frame + index
+        for index in _fps_indices(
+            max(0, total_frames - start_frame), native_fps, sample_fps, max_frames
+        )
+    ]
     frames = [Image.fromarray(video[i].numpy()).convert("RGB") for i in indices]
     return frames, native_fps
 
 
-def _read_video_cv2(video_path, max_frames=None, sample_fps=None):
+def _read_video_cv2(video_path, max_frames=None, sample_fps=None, start_time=0.0):
     import cv2
 
     cap = cv2.VideoCapture(str(video_path))
@@ -67,7 +73,13 @@ def _read_video_cv2(video_path, max_frames=None, sample_fps=None):
 
     native_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    indices = set(_fps_indices(total_frames, native_fps, sample_fps, max_frames))
+    start_frame = max(0, int(round(float(start_time) * native_fps))) if native_fps > 0 else 0
+    indices = {
+        start_frame + index
+        for index in _fps_indices(
+            max(0, total_frames - start_frame), native_fps, sample_fps, max_frames
+        )
+    }
     last_index = max(indices) if indices else -1
     frames = []
     frame_idx = 0
@@ -85,7 +97,7 @@ def _read_video_cv2(video_path, max_frames=None, sample_fps=None):
     return frames, native_fps
 
 
-def read_video_frames(video_path, max_frames=None, sample_fps=None):
+def read_video_frames(video_path, max_frames=None, sample_fps=None, start_time=0.0):
     video_path = Path(video_path)
     if not video_path.exists():
         raise FileNotFoundError(video_path)
@@ -99,6 +111,8 @@ def read_video_frames(video_path, max_frames=None, sample_fps=None):
             p for p in video_path.iterdir()
             if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
         )
+        start_index = max(0, int(round(float(start_time) * float(sample_fps or 1.0))))
+        image_paths = image_paths[start_index:]
         if max_frames is not None:
             image_paths = image_paths[:max_frames]
         frames = [Image.open(p).convert("RGB") for p in image_paths]
@@ -110,7 +124,12 @@ def read_video_frames(video_path, max_frames=None, sample_fps=None):
     readers = (_read_video_cv2, _read_video_torchvision) if sample_fps else (_read_video_torchvision, _read_video_cv2)
     for reader in readers:
         try:
-            frames, native_fps = reader(video_path, max_frames=max_frames, sample_fps=sample_fps)
+            frames, native_fps = reader(
+                video_path,
+                max_frames=max_frames,
+                sample_fps=sample_fps,
+                start_time=start_time,
+            )
             if frames:
                 return frames, native_fps, reader.__name__.replace("_read_video_", "")
             errors.append(f"{reader.__name__}: decoded zero frames")
