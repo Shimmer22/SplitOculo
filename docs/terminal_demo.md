@@ -70,6 +70,8 @@ E:\anaconda\envs\cnn_vit\python.exe scripts\terminal_demo.py `
 多个项目按“项目优先”执行：先完成 Baseline 的全部轮次，再完成下一个项目的全部轮次。
 每个项目只显示一张动态汇总卡；已完成轮数、输入帧数和请求负载逐轮累计，端侧编码、模拟
 时延、TTFT 与相对速度显示已完成轮次的平均值。卡片下半部分按窗口起点逐行保留每轮回答。
+默认模式下所有项目和轮次共用一个客户端进程，Edge 与 Temporal 模型只加载一次；开启
+`--interrupt-on-next-round` 时，为了能够安全地硬中断正在运行的轮次，会回退为逐轮客户端。
 
 首次检查建议先使用 `--projects baseline` 和单张图片，再逐步加入端云、时序和
 codec 方案。选择 `so` 时需要 edge checkpoint；选择 `temporal` 或 `codec` 时还

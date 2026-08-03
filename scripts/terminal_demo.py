@@ -619,7 +619,10 @@ def build_cloud_command(args: argparse.Namespace) -> list[str]:
 
 
 def build_demo_command(
-    args: argparse.Namespace, projects: list[str], start_time: float = 0.0
+    args: argparse.Namespace,
+    projects: list[str],
+    start_time: float = 0.0,
+    client_rounds: int = 1,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -646,6 +649,10 @@ def build_demo_command(
         str(args.sample_fps),
         "--start_time",
         str(start_time),
+        "--rounds",
+        str(client_rounds),
+        "--round_step_seconds",
+        str(args.round_step_seconds),
         "--codec_flow_impl",
         args.codec_flow_impl,
         "--codec_selection_policy",
@@ -990,13 +997,19 @@ def run_demo(
     start_time: float = 0.0,
     deadline: float | None = None,
     aggregate_results: dict[str, dict[str, Any]] | None = None,
+    client_rounds: int = 1,
 ) -> int:
-    if len(projects) != 1:
-        raise ValueError("run_demo expects exactly one project in multi-round mode")
+    if not projects:
+        raise ValueError("run_demo requires at least one project")
     project = projects[0]
     aggregates = aggregate_results if aggregate_results is not None else {}
     process = subprocess.Popen(
-        build_demo_command(args, projects, start_time=start_time),
+        build_demo_command(
+            args,
+            projects,
+            start_time=start_time,
+            client_rounds=client_rounds,
+        ),
         cwd=ROOT,
         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         stdout=subprocess.PIPE,
@@ -1010,7 +1023,11 @@ def run_demo(
     received_result = False
     live_terminal = sys.stdout.isatty()
     stream_active = False
-    round_name = f"第 {round_index}/{total_rounds} 轮"
+    current_round_index = round_index
+    current_total_rounds = total_rounds
+    current_start_time = start_time
+    current_project = project
+    round_name = f"第 {current_round_index}/{current_total_rounds} 轮"
     assert process.stdout is not None
     output_queue: queue.Queue[str | None] = queue.Queue()
 
@@ -1062,7 +1079,16 @@ def run_demo(
         if line.startswith(STREAM_START_PREFIX):
             try:
                 event = json.loads(line[len(STREAM_START_PREFIX) :])
+                current_project = str(event.get("project") or current_project)
                 label = str(event.get("label") or "项目")
+                current_round_index = int(event.get("round") or round_index)
+                current_total_rounds = int(event.get("rounds") or total_rounds)
+                current_start_time = float(
+                    event.get("window_start_seconds", start_time)
+                )
+                round_name = (
+                    f"第 {current_round_index}/{current_total_rounds} 轮"
+                )
             except json.JSONDecodeError:
                 label = "项目"
             _clear_status()
@@ -1087,6 +1113,13 @@ def run_demo(
         elif line.startswith(RESULT_ITEM_PREFIX):
             try:
                 row = json.loads(line[len(RESULT_ITEM_PREFIX) :])
+                row_project = str(row.get("project") or current_project)
+                row_round = int(row.get("round") or current_round_index)
+                row_rounds = int(row.get("rounds") or current_total_rounds)
+                row_start_time = float(
+                    row.get("window_start_seconds", current_start_time)
+                )
+                round_name = f"第 {row_round}/{row_rounds} 轮"
                 full_response_ms = row.get("full_response_ms")
                 if full_response_ms is not None and float(full_response_ms) > 0:
                     row["relative_speed"] = (
@@ -1094,11 +1127,11 @@ def run_demo(
                     )
                 update_aggregate_result(
                     aggregates,
-                    project,
+                    row_project,
                     row,
-                    round_index,
-                    total_rounds,
-                    start_time,
+                    row_round,
+                    row_rounds,
+                    row_start_time,
                 )
                 received_result = True
                 if stream_active and live_terminal:
@@ -1121,10 +1154,15 @@ def run_demo(
     _clear_status()
     if not received_result and final_result is not None:
         fallback_rows = list(final_result.get("results") or [])
-        if fallback_rows:
-            row = fallback_rows[0]
+        for row in fallback_rows:
+            row_project = str(row.get("project") or project)
             update_aggregate_result(
-                aggregates, project, row, round_index, total_rounds, start_time
+                aggregates,
+                row_project,
+                row,
+                int(row.get("round") or round_index),
+                int(row.get("rounds") or total_rounds),
+                float(row.get("window_start_seconds", start_time)),
             )
             received_result = True
     if received_result and not live_terminal:
@@ -1217,8 +1255,21 @@ def execute(
             f"{health.get('checkpoint_hidden_size')}"
         )
         aggregate_results: dict[str, dict[str, Any]] = {}
+        if not args.interrupt_on_next_round:
+            return run_demo(
+                args,
+                projects,
+                round_index=1,
+                total_rounds=args.rounds,
+                start_time=0.0,
+                aggregate_results=aggregate_results,
+                client_rounds=args.rounds,
+            )
+
         last_returncode = 0
         for project in projects:
+            # Hard interruption terminates the client process, so this mode
+            # intentionally keeps the isolated per-round fallback.
             schedule_started = time.monotonic()
             for round_index in range(1, args.rounds + 1):
                 scheduled_at = schedule_started + (round_index - 1) * args.round_step_seconds

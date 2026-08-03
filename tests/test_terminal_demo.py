@@ -108,8 +108,12 @@ def test_commands_use_localhost_and_current_python(tmp_path):
 
 def test_demo_command_sets_sliding_window_start(tmp_path):
     args = _args(tmp_path)
-    demo = terminal_demo.build_demo_command(args, ["baseline"], start_time=4.5)
+    demo = terminal_demo.build_demo_command(
+        args, ["baseline"], start_time=4.5, client_rounds=3
+    )
     assert demo[demo.index("--start_time") + 1] == "4.5"
+    assert demo[demo.index("--rounds") + 1] == "3"
+    assert demo[demo.index("--round_step_seconds") + 1] == "2.0"
 
 
 def test_saved_config_round_trip_excludes_password(tmp_path):
@@ -326,3 +330,20 @@ def test_interactive_session_keeps_owned_cloud_running(tmp_path):
         assert terminal_demo.execute(args, ["baseline"], cloud_session=session) == 0
     start.assert_not_called()
     assert process.terminated is False
+
+
+def test_execute_uses_one_persistent_client_for_all_projects(tmp_path):
+    args = _args(tmp_path, projects="baseline,so", rounds=3)
+    health = _health(args)
+    session = {"process": None, "log_path": None, "log_handle": None}
+    with (
+        mock.patch.object(terminal_demo, "fetch_health", return_value=health),
+        mock.patch.object(terminal_demo, "run_demo", return_value=0) as run,
+    ):
+        assert terminal_demo.execute(
+            args, ["baseline", "so"], cloud_session=session
+        ) == 0
+
+    run.assert_called_once()
+    assert run.call_args.args[1] == ["baseline", "so"]
+    assert run.call_args.kwargs["client_rounds"] == 3

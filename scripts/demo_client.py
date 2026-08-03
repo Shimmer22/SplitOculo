@@ -648,6 +648,8 @@ def main():
     parser.add_argument("--max_frames", type=int, default=8)
     parser.add_argument("--sample_fps", type=float, default=2.0)
     parser.add_argument("--start_time", type=float, default=0.0)
+    parser.add_argument("--rounds", type=int, default=1)
+    parser.add_argument("--round_step_seconds", type=float, default=2.0)
     parser.add_argument("--codec_flow_impl", choices=("feature_grid", "feature_grid_center", "dense"), default="feature_grid")
     parser.add_argument(
         "--codec_selection_policy",
@@ -672,7 +674,12 @@ def main():
         raise ValueError("--baseline_jpeg_quality must be in [1, 100]")
     if args.baseline_input_size <= 0:
         raise ValueError("--baseline_input_size must be positive")
+    if args.rounds <= 0 or args.round_step_seconds <= 0:
+        raise ValueError("--rounds and --round_step_seconds must be positive")
     path = Path(args.input)
+    project_names = [
+        item.strip().lower() for item in args.projects.split(",") if item.strip()
+    ]
     project_specs = _variant_specs(args)
     if args.cloud_checkpoint and any(not spec[4] for spec in project_specs):
         try:
@@ -696,7 +703,9 @@ def main():
     temporal_metadata = None
     load_ms = 0.0
     results = []
-    for label, spatial_acc, codec_acc, temporal_acc, pure_qwen in project_specs:
+    initial_start_time = float(args.start_time)
+    for project, spec in zip(project_names, project_specs):
+        label, spatial_acc, codec_acc, temporal_acc, pure_qwen = spec
         try:
             if not pure_qwen and encoder is None:
                 if not args.edge_checkpoint:
@@ -723,42 +732,96 @@ def main():
                 )
                 temporal_fusion.eval()
                 load_ms += (time.perf_counter() - load_started) * 1000
-            if args.stream:
-                print(
-                    "DEMO_STREAM_START="
-                    + json.dumps({"label": label}, ensure_ascii=False),
-                    flush=True,
+            schedule_started = time.monotonic()
+            for round_index in range(1, args.rounds + 1):
+                scheduled_at = (
+                    schedule_started + (round_index - 1) * args.round_step_seconds
                 )
+                remaining = scheduled_at - time.monotonic()
+                if remaining > 0:
+                    time.sleep(remaining)
+                elif round_index > 1 and -remaining >= 0.01:
+                    print(
+                        f"{label} · 第 {round_index}/{args.rounds} 轮"
+                        f"已落后采样 {-remaining:.2f} 秒",
+                        flush=True,
+                    )
+                window_start = (
+                    initial_start_time
+                    + (round_index - 1) * args.round_step_seconds
+                )
+                args.start_time = window_start
+                event_context = {
+                    "project": project,
+                    "label": label,
+                    "round": round_index,
+                    "rounds": args.rounds,
+                    "window_start_seconds": window_start,
+                }
+                try:
+                    if args.stream:
+                        print(
+                            "DEMO_STREAM_START="
+                            + json.dumps(event_context, ensure_ascii=False),
+                            flush=True,
+                        )
 
-            def _emit_text(text):
-                print(
-                    "DEMO_STREAM_DELTA="
-                    + json.dumps({"label": label, "text": text}, ensure_ascii=False),
-                    flush=True,
-                )
+                    def _emit_text(text):
+                        print(
+                            "DEMO_STREAM_DELTA="
+                            + json.dumps(
+                                {**event_context, "text": text},
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
 
-            row = _run_variant(
-                encoder,
-                temporal_fusion,
-                path,
-                args,
-                label,
-                spatial_acc,
-                codec_acc,
-                temporal_acc,
-                pure_qwen,
-                on_text=_emit_text if args.stream else None,
-            )
-            if temporal_acc:
-                row["temporal_checkpoint"] = args.temporal_pair_checkpoint
-                row["temporal_patch_size"] = int(
-                    temporal_metadata.get("temporal_patch_size", 2)
-                )
-            results.append(row)
-            print("DEMO_RESULT_ITEM=" + json.dumps(row, ensure_ascii=False), flush=True)
+                    row = _run_variant(
+                        encoder,
+                        temporal_fusion,
+                        path,
+                        args,
+                        label,
+                        spatial_acc,
+                        codec_acc,
+                        temporal_acc,
+                        pure_qwen,
+                        on_text=_emit_text if args.stream else None,
+                    )
+                    if temporal_acc:
+                        row["temporal_checkpoint"] = args.temporal_pair_checkpoint
+                        row["temporal_patch_size"] = int(
+                            temporal_metadata.get("temporal_patch_size", 2)
+                        )
+                    row.update(event_context)
+                    results.append(row)
+                    print(
+                        "DEMO_RESULT_ITEM="
+                        + json.dumps(row, ensure_ascii=False),
+                        flush=True,
+                    )
+                except Exception as exc:
+                    row = {
+                        **event_context,
+                        "pure_qwen": bool(pure_qwen),
+                        "spatial_acceleration": bool(spatial_acc),
+                        "temporal_redundancy_acceleration": bool(codec_acc),
+                        "temporal_pair_fusion": bool(temporal_acc),
+                        "error": str(exc),
+                    }
+                    results.append(row)
+                    print(
+                        "DEMO_RESULT_ITEM="
+                        + json.dumps(row, ensure_ascii=False),
+                        flush=True,
+                    )
         except Exception as exc:
             row = {
+                "project": project,
                 "label": label,
+                "round": 1,
+                "rounds": args.rounds,
+                "window_start_seconds": initial_start_time,
                 "pure_qwen": bool(pure_qwen),
                 "spatial_acceleration": bool(spatial_acc),
                 "temporal_redundancy_acceleration": bool(codec_acc),
