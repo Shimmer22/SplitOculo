@@ -64,6 +64,9 @@ sampled_frames_*/
 *.avi
 *.AVI
 
+# Versioned SSH demo samples
+!demo/*.mp4
+
 # Data - whitelist mode (ignore all except .py files)
 data/*
 !data/__init__.py

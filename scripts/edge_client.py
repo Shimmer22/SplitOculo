@@ -39,7 +39,14 @@ from models.bottleneck import DimensionBottleneck
 from models.multilevel import parse_payload_levels, resize_tokens, truncate_dim
 
 
-def load_cloud_checkpoint(server, checkpoint_path, timeout=300, force_reload=False):
+def load_cloud_checkpoint(
+    server,
+    checkpoint_path,
+    timeout=300,
+    force_reload=False,
+    username=None,
+    password=None,
+):
     """Ask the cloud server to load a checkpoint visible on the cloud host."""
     response = requests.post(
         f"{server.rstrip('/')}/load_checkpoint",
@@ -48,10 +55,27 @@ def load_cloud_checkpoint(server, checkpoint_path, timeout=300, force_reload=Fal
             'force_reload': bool(force_reload),
         },
         headers={'Content-Type': 'application/json'},
+        auth=(username, password or '') if username else None,
         timeout=timeout,
     )
-    response.raise_for_status()
+    raise_for_cloud_error(response)
     return response.json()
+
+
+def raise_for_cloud_error(response):
+    if response.ok:
+        return
+    message = ""
+    try:
+        message = str((response.json() or {}).get("error", "")).strip()
+    except (ValueError, TypeError):
+        pass
+    if not message:
+        message = response.reason or "cloud request failed"
+    raise requests.HTTPError(
+        f"Cloud HTTP {response.status_code}: {message}",
+        response=response,
+    )
 
 
 class EdgeProjector(nn.Module):
@@ -357,6 +381,8 @@ def main():
         default=None,
         help='Optional checkpoint path/URL visible to the cloud server; load it before inference',
     )
+    parser.add_argument('--username', default=None)
+    parser.add_argument('--password', default=None)
     parser.add_argument('--prompt', type=str, default='Describe this image.',
                         help='Prompt for the model')
     parser.add_argument('--device', type=str,
@@ -398,6 +424,8 @@ def main():
                 args.server,
                 args.cloud_checkpoint,
                 timeout=args.timeout,
+                username=args.username,
+                password=args.password,
             )
             print(
                 "   Cloud checkpoint ready: "
@@ -407,38 +435,39 @@ def main():
             f"{args.server.rstrip('/')}/infer",
             json=payload,
             headers={'Content-Type': 'application/json'},
+            auth=(args.username, args.password) if args.username else None,
             timeout=args.timeout
         )
         network_time = time.time() - start_time
+        raise_for_cloud_error(response)
         
-        if response.status_code == 200:
-            result = response.json()
-            print(f"   Network round-trip: {network_time*1000:.2f} ms")
-            print(f"   Cloud inference: {result.get('latency_ms', 0):.2f} ms")
+        result = response.json()
+        print(f"   Network round-trip: {network_time*1000:.2f} ms")
+        print(f"   Cloud inference: {result.get('latency_ms', 0):.2f} ms")
             
-            print("\nResponse:")
-            print("-" * 40)
-            print(result['response'])
-            print("-" * 40)
+        print("\nResponse:")
+        print("-" * 40)
+        print(result['response'])
+        print("-" * 40)
             
-            # 总结
-            total_time = network_time * 1000
-            print("\nSummary:")
-            print(f"   Edge encode: {stats['encode_time_ms']:.2f} ms")
-            print(f"   Transmission: {stats['payload_bytes']/1024:.2f} KB")
-            print(f"   Total latency: {total_time:.2f} ms")
-        else:
-            print(f"Error: {response.status_code}")
-            print(response.text)
+        # 总结
+        total_time = network_time * 1000
+        print("\nSummary:")
+        print(f"   Edge encode: {stats['encode_time_ms']:.2f} ms")
+        print(f"   Transmission: {stats['payload_bytes']/1024:.2f} KB")
+        print(f"   Total latency: {total_time:.2f} ms")
     
     except requests.exceptions.ConnectionError:
         print(f"Cannot connect to server at {args.server}")
         print("   Make sure the cloud server is running.")
+        return 1
     except Exception as e:
         print(f"Error: {e}")
+        return 1
     
     print("\n" + "=" * 60)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

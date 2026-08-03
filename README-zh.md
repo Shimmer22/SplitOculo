@@ -189,6 +189,13 @@ python scripts/split_checkpoint.py \
 
 ### 6. 运行边云推理
 
+如果通过 SSH 在同一台服务器上展示完整对比 Demo，可直接使用
+[`scripts/terminal_demo.py`](./scripts/terminal_demo.py)。它自动管理 localhost
+云端进程；无参数启动即进入方向键菜单，配置自动保存，并输出 baseline、逐帧、
+时序与 codec 的响应和性能数据。回答会逐字显示，每个方案完成后立即加入横排
+结果栏。详见
+[`docs/terminal_demo.md`](./docs/terminal_demo.md)。
+
 云端：
 
 ```bash

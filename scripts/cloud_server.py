@@ -17,6 +17,11 @@ API:
         Request: {"frames": [base64 JPEG, ...], "prompt": str}
         Response: native full-Qwen video inference and timing metrics
 
+    POST /infer_stream, POST /infer_qwen_stream
+        Same requests as /infer and /infer_qwen. The response is NDJSON:
+        zero or more {"type": "delta", "text": "..."} events followed by
+        one {"type": "result", "result": {...}} event.
+
     POST /load_checkpoint (alias: /load_ckpt)
         Request: {"checkpoint_path": "/path/on/the/cloud"}
         The path is resolved on the cloud server. An absolute http(s) URL is
@@ -32,6 +37,7 @@ import base64
 from io import BytesIO
 import time
 import json
+import queue
 import threading
 import gc
 import os
@@ -47,7 +53,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
-from flask import Flask, request, jsonify
+from flask import Flask, Response, request, jsonify
 from transformers import TextIteratorStreamer
 
 from models.cloud_upsampler import CloudUpsampler, TransformerUpsampler
@@ -629,7 +635,13 @@ class CloudInferenceEngine:
         )
 
     @torch.no_grad()
-    def infer_payload_with_timing(self, compressed_features, prompt="Describe this image.", max_new_tokens=256):
+    def infer_payload_with_timing(
+        self,
+        compressed_features,
+        prompt="Describe this image.",
+        max_new_tokens=256,
+        on_text=None,
+    ):
         """Timed image path with TTFT measured at the first streamed token."""
         self._synchronize()
         reconstruct_start = time.perf_counter()
@@ -649,6 +661,7 @@ class CloudInferenceEngine:
             prompt=prompt,
             modality="image",
             max_new_tokens=max_new_tokens,
+            on_text=on_text,
         )
         return answer, {
             **generation_metrics,
@@ -777,7 +790,14 @@ class CloudInferenceEngine:
         return response
 
     @torch.no_grad()
-    def generate_from_visual_tokens_with_timing(self, visual_tokens, prompt, modality="image", max_new_tokens=256):
+    def generate_from_visual_tokens_with_timing(
+        self,
+        visual_tokens,
+        prompt,
+        modality="image",
+        max_new_tokens=256,
+        on_text=None,
+    ):
         """Inject visual tokens and stream text to measure first-token latency and TPS."""
         if self.qwen_model is None:
             model_path = getattr(self, 'qwen_path', "Qwen/Qwen2.5-VL-3B-Instruct")
@@ -859,6 +879,8 @@ class CloudInferenceEngine:
             if chunk and first_token_seconds is None:
                 first_token_seconds = time.perf_counter() - generation_start
             chunks.append(chunk)
+            if chunk and on_text is not None:
+                on_text(chunk)
 
         thread.join()
         generation_seconds = time.perf_counter() - generation_start
@@ -921,7 +943,14 @@ class CloudInferenceEngine:
         )
 
     @torch.no_grad()
-    def infer_video_from_frame_features_with_timing(self, compressed_frame_features, prompt="Describe this video.", max_new_tokens=256, multilevel_payload=False):
+    def infer_video_from_frame_features_with_timing(
+        self,
+        compressed_frame_features,
+        prompt="Describe this video.",
+        max_new_tokens=256,
+        multilevel_payload=False,
+        on_text=None,
+    ):
         """Timed SplitOculo video path with reconstruction, visual tail, and generation metrics."""
         if compressed_frame_features.dim() == 4:
             compressed_frame_features = compressed_frame_features.squeeze(1)
@@ -969,6 +998,7 @@ class CloudInferenceEngine:
             prompt=prompt,
             modality="video",
             max_new_tokens=max_new_tokens,
+            on_text=on_text,
         )
         metrics = {
             **generation_metrics,
@@ -999,6 +1029,7 @@ class CloudInferenceEngine:
         max_new_tokens=256,
         video_pixel_budget=224 * 224,
         video_fps=2.0,
+        on_text=None,
     ):
         """Run the complete native Qwen vision encoder and language model."""
         if not frames:
@@ -1102,6 +1133,8 @@ class CloudInferenceEngine:
             if chunk and first_token_seconds is None:
                 first_token_seconds = time.perf_counter() - generation_start
             chunks.append(chunk)
+            if chunk and on_text is not None:
+                on_text(chunk)
         thread.join()
         generation_seconds = time.perf_counter() - generation_start
         if "error" in error_holder:
@@ -1521,117 +1554,172 @@ def load_checkpoint():
         return jsonify({'error': str(exc)}), 500
 
 
+def _infer_payload_data(data, on_text=None):
+    """Run a SplitOculo request and return the normal response dictionary."""
+    start_time = time.perf_counter()
+    features_b64 = data['features']
+    scale = data['scale']
+    zero_point = data['zero_point']
+    prompt = data.get('prompt', 'Describe this image.')
+    modality = data.get('modality', 'image')
+    decode_start = time.perf_counter()
+
+    features = engine.decode_features(
+        features_b64,
+        scale,
+        zero_point,
+        payload_tokens=data.get('payload_tokens'),
+        payload_dim=data.get('payload_dim'),
+        feature_shape=data.get('feature_shape'),
+    )
+
+    cloud_decode_ms = (time.perf_counter() - decode_start) * 1000
+    infer_start = time.perf_counter()
+    if modality == 'video':
+        multilevel_payload = engine.is_multilevel_payload(
+            features,
+            declared=bool(
+                data.get('payload_tokens') is not None
+                or data.get('payload_dim') is not None
+            ),
+        )
+        response, inference_metrics = engine.infer_video_from_frame_features_with_timing(
+            features,
+            prompt=prompt,
+            max_new_tokens=int(data.get('max_new_tokens', 256)),
+            multilevel_payload=multilevel_payload,
+            on_text=on_text,
+        )
+    else:
+        response, inference_metrics = engine.infer_payload_with_timing(
+            features,
+            prompt,
+            max_new_tokens=int(data.get('max_new_tokens', 256)),
+            on_text=on_text,
+        )
+    cloud_inference_ms = (time.perf_counter() - infer_start) * 1000
+    cloud_process_ms = (time.perf_counter() - start_time) * 1000
+    return {
+        'response': response,
+        'latency_ms': cloud_process_ms,
+        'cloud_process_ms': cloud_process_ms,
+        'cloud_decode_ms': cloud_decode_ms,
+        'cloud_inference_ms': cloud_inference_ms,
+        'cloud_ttft_ms': float(inference_metrics.get('ttft_seconds', 0.0)) * 1000,
+        'inference_metrics': inference_metrics,
+        'modality': modality,
+    }
+
+
+def _infer_qwen_data(data, on_text=None):
+    """Run a native-Qwen request and return the normal response dictionary."""
+    start_time = time.perf_counter()
+    encoded_frames = data.get("frames") or []
+    if not isinstance(encoded_frames, list) or not encoded_frames:
+        raise ValueError('frames must be a non-empty list')
+
+    decode_start = time.perf_counter()
+    frames = []
+    for encoded in encoded_frames:
+        image_bytes = base64.b64decode(encoded, validate=True)
+        with Image.open(BytesIO(image_bytes)) as image:
+            frames.append(image.convert("RGB").copy())
+    cloud_decode_ms = (time.perf_counter() - decode_start) * 1000
+
+    inference_start = time.perf_counter()
+    response, inference_metrics = engine.infer_qwen_frames_with_timing(
+        frames,
+        prompt=data.get("prompt", "Describe this video."),
+        max_new_tokens=int(data.get("max_new_tokens", 256)),
+        video_pixel_budget=int(data.get("video_pixel_budget", 224 * 224)),
+        video_fps=float(data.get("video_fps", 2.0)),
+        on_text=on_text,
+    )
+    cloud_inference_ms = (time.perf_counter() - inference_start) * 1000
+    cloud_process_ms = (time.perf_counter() - start_time) * 1000
+    return {
+        'response': response,
+        'latency_ms': cloud_process_ms,
+        'cloud_process_ms': cloud_process_ms,
+        'cloud_decode_ms': cloud_decode_ms,
+        'cloud_inference_ms': cloud_inference_ms,
+        'cloud_ttft_ms': float(inference_metrics.get('ttft_seconds', 0.0)) * 1000,
+        'inference_metrics': inference_metrics,
+        'modality': inference_metrics.get('modality', 'video'),
+        'pure_qwen': True,
+    }
+
+
+def _ndjson_response(task):
+    """Run an inference task in a worker and emit delta/result NDJSON events."""
+    events = queue.Queue()
+    finished = object()
+
+    def emit_text(chunk):
+        for character in chunk:
+            events.put({'type': 'delta', 'text': character})
+
+    def worker():
+        try:
+            with _engine_lock:
+                result = task(emit_text)
+            events.put({'type': 'result', 'result': result})
+        except Exception as exc:
+            events.put({'type': 'error', 'error': str(exc)})
+        finally:
+            events.put(finished)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def generate():
+        while True:
+            event = events.get()
+            if event is finished:
+                break
+            yield json.dumps(event, ensure_ascii=False) + "\n"
+
+    return Response(
+        generate(),
+        mimetype='application/x-ndjson',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+        },
+    )
+
+
 @app.route('/infer', methods=['POST'])
 @_engine_access
 def infer():
     """推理端点"""
-    start_time = time.perf_counter()
-    
     try:
-        data = request.json
-        features_b64 = data['features']
-        scale = data['scale']
-        zero_point = data['zero_point']
-        prompt = data.get('prompt', 'Describe this image.')
-        modality = data.get('modality', 'image')
-        decode_start = time.perf_counter()
-        
-        # 反序列化特征
-        features = engine.decode_features(
-            features_b64,
-            scale,
-            zero_point,
-            payload_tokens=data.get('payload_tokens'),
-            payload_dim=data.get('payload_dim'),
-            feature_shape=data.get('feature_shape'),
-        )
-        
-        # 推理
-        cloud_decode_ms = (time.perf_counter() - decode_start) * 1000
-        infer_start = time.perf_counter()
-        if modality == 'video':
-            multilevel_payload = engine.is_multilevel_payload(
-                features,
-                declared=bool(
-                    data.get('payload_tokens') is not None
-                    or data.get('payload_dim') is not None
-                ),
-            )
-            response, inference_metrics = engine.infer_video_from_frame_features_with_timing(
-                features,
-                prompt=prompt,
-                max_new_tokens=int(data.get('max_new_tokens', 256)),
-                multilevel_payload=multilevel_payload,
-            )
-        else:
-            response, inference_metrics = engine.infer_payload_with_timing(
-                features,
-                prompt,
-                max_new_tokens=int(data.get('max_new_tokens', 256)),
-            )
-        cloud_inference_ms = (time.perf_counter() - infer_start) * 1000
-        
-        cloud_process_ms = (time.perf_counter() - start_time) * 1000
-        
-        return jsonify({
-            'response': response,
-            'latency_ms': cloud_process_ms,
-            'cloud_process_ms': cloud_process_ms,
-            'cloud_decode_ms': cloud_decode_ms,
-            'cloud_inference_ms': cloud_inference_ms,
-            'cloud_ttft_ms': float(inference_metrics.get('ttft_seconds', 0.0)) * 1000,
-            'inference_metrics': inference_metrics,
-            'modality': modality,
-        })
-    
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify(_infer_payload_data(request.get_json() or {}))
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/infer_stream', methods=['POST'])
+def infer_stream():
+    data = request.get_json(silent=True) or {}
+    return _ndjson_response(lambda on_text: _infer_payload_data(data, on_text))
 
 
 @app.route('/infer_qwen', methods=['POST'])
 @_engine_access
 def infer_qwen():
     """Run native Qwen on uploaded JPEG RGB frames."""
-    start_time = time.perf_counter()
     try:
-        data = request.json or {}
-        encoded_frames = data.get("frames") or []
-        if not isinstance(encoded_frames, list) or not encoded_frames:
-            return jsonify({'error': 'frames must be a non-empty list'}), 400
-
-        decode_start = time.perf_counter()
-        frames = []
-        for encoded in encoded_frames:
-            image_bytes = base64.b64decode(encoded, validate=True)
-            with Image.open(BytesIO(image_bytes)) as image:
-                frames.append(image.convert("RGB").copy())
-        cloud_decode_ms = (time.perf_counter() - decode_start) * 1000
-
-        inference_start = time.perf_counter()
-        response, inference_metrics = engine.infer_qwen_frames_with_timing(
-            frames,
-            prompt=data.get("prompt", "Describe this video."),
-            max_new_tokens=int(data.get("max_new_tokens", 256)),
-            video_pixel_budget=int(data.get("video_pixel_budget", 224 * 224)),
-            video_fps=float(data.get("video_fps", 2.0)),
-        )
-        cloud_inference_ms = (time.perf_counter() - inference_start) * 1000
-        cloud_process_ms = (time.perf_counter() - start_time) * 1000
-        return jsonify({
-            'response': response,
-            'latency_ms': cloud_process_ms,
-            'cloud_process_ms': cloud_process_ms,
-            'cloud_decode_ms': cloud_decode_ms,
-            'cloud_inference_ms': cloud_inference_ms,
-            'cloud_ttft_ms': (
-                float(inference_metrics.get('ttft_seconds', 0.0)) * 1000
-            ),
-            'inference_metrics': inference_metrics,
-            'modality': inference_metrics.get('modality', 'video'),
-            'pure_qwen': True,
-        })
+        return jsonify(_infer_qwen_data(request.get_json(silent=True) or {}))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/infer_qwen_stream', methods=['POST'])
+def infer_qwen_stream():
+    data = request.get_json(silent=True) or {}
+    return _ndjson_response(lambda on_text: _infer_qwen_data(data, on_text))
 
 
 def main():

@@ -37,6 +37,53 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".
 RAW_EXTENSIONS = {".raw", ".rgb", ".bgr", ".yuv"}
 
 
+def _raise_for_cloud_error(response):
+    """Turn a cloud HTTP failure into a useful demo error."""
+    if response.ok:
+        return
+    message = ""
+    try:
+        message = str((response.json() or {}).get("error", "")).strip()
+    except (ValueError, TypeError):
+        pass
+    if not message:
+        message = response.reason or "cloud request failed"
+    raise requests.HTTPError(
+        f"Cloud HTTP {response.status_code}: {message}",
+        response=response,
+    )
+
+
+def _post_cloud_stream(url, payload, args, on_text):
+    response = requests.post(
+        url,
+        json=payload,
+        headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"},
+        auth=(args.username, args.password) if args.username else None,
+        timeout=args.timeout,
+        stream=True,
+    )
+    _raise_for_cloud_error(response)
+    response.encoding = "utf-8"
+    result = None
+    for line in response.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        event = json.loads(line)
+        event_type = event.get("type")
+        if event_type == "delta":
+            text = str(event.get("text") or "")
+            if text:
+                on_text(text)
+        elif event_type == "result":
+            result = event.get("result")
+        elif event_type == "error":
+            raise RuntimeError(str(event.get("error") or "cloud streaming failed"))
+    if not isinstance(result, dict):
+        raise RuntimeError("cloud stream ended without a result event")
+    return result
+
+
 def _raw_frames(path: Path, width: int, height: int, pixel_format: str):
     if width <= 0 or height <= 0:
         raise ValueError("Raw frame width and height must be positive")
@@ -298,7 +345,7 @@ def _jpeg_frames_payload(
     }, binary_bytes
 
 
-def _run_pure_qwen(path, args, label):
+def _run_pure_qwen(path, args, label, on_text=None):
     started = time.perf_counter()
     read_start = time.perf_counter()
     frames, native_fps, reader, _ = _read_input(path, args, False)
@@ -322,15 +369,25 @@ def _run_pure_qwen(path, args, label):
         time.sleep(bandwidth_delay_ms / 1000)
 
     request_started = time.perf_counter()
-    response = requests.post(
-        f"{args.server.rstrip('/')}/infer_qwen",
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=args.timeout,
-    )
+    if on_text is not None:
+        cloud = _post_cloud_stream(
+            f"{args.server.rstrip('/')}/infer_qwen_stream",
+            payload,
+            args,
+            on_text,
+        )
+        response = None
+    else:
+        response = requests.post(
+            f"{args.server.rstrip('/')}/infer_qwen",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            auth=(args.username, args.password) if args.username else None,
+            timeout=args.timeout,
+        )
+        _raise_for_cloud_error(response)
+        cloud = response.json()
     http_roundtrip_ms = (time.perf_counter() - request_started) * 1000
-    response.raise_for_status()
-    cloud = response.json()
     cloud_process_ms = cloud.get("cloud_process_ms", cloud.get("latency_ms", 0.0))
     inference_metrics = cloud.get("inference_metrics", {})
     cloud_ttft_ms = cloud.get(
@@ -382,6 +439,12 @@ def _run_pure_qwen(path, args, label):
             + cloud.get("cloud_decode_ms", 0.0)
             + cloud_ttft_ms
         ),
+        "ttft_without_network_ms": (
+            decode_ms
+            + encode_ms
+            + cloud.get("cloud_decode_ms", 0.0)
+            + cloud_ttft_ms
+        ),
         "full_response_ms": (time.perf_counter() - started) * 1000,
     }
 
@@ -396,9 +459,10 @@ def _run_variant(
     codec_acc,
     temporal_acc,
     pure_qwen,
+    on_text=None,
 ):
     if pure_qwen:
-        return _run_pure_qwen(path, args, label)
+        return _run_pure_qwen(path, args, label, on_text=on_text)
     if encoder is None:
         raise ValueError("SplitOculo projects require --edge_checkpoint")
 
@@ -420,15 +484,25 @@ def _run_variant(
         time.sleep(bandwidth_delay_ms / 1000)
 
     request_started = time.perf_counter()
-    response = requests.post(
-        f"{args.server.rstrip('/')}/infer",
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=args.timeout,
-    )
+    if on_text is not None:
+        cloud = _post_cloud_stream(
+            f"{args.server.rstrip('/')}/infer_stream",
+            payload,
+            args,
+            on_text,
+        )
+        response = None
+    else:
+        response = requests.post(
+            f"{args.server.rstrip('/')}/infer",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            auth=(args.username, args.password) if args.username else None,
+            timeout=args.timeout,
+        )
+        _raise_for_cloud_error(response)
+        cloud = response.json()
     http_roundtrip_ms = (time.perf_counter() - request_started) * 1000
-    response.raise_for_status()
-    cloud = response.json()
     full_response_ms = (time.perf_counter() - started) * 1000
     cloud_process_ms = cloud.get("cloud_process_ms", cloud.get("latency_ms", 0.0))
     cloud_ttft_ms = cloud.get("cloud_ttft_ms", float(cloud.get("inference_metrics", {}).get("ttft_seconds", 0.0)) * 1000)
@@ -531,6 +605,9 @@ def _run_variant(
             else None
         ),
         "end_to_end_ttft_ms": end_to_end_ttft_ms,
+        "ttft_without_network_ms": (
+            end_to_end_ttft_ms - network_overhead_ms - bandwidth_delay_ms
+        ),
         "full_response_ms": full_response_ms,
     }
 
@@ -546,6 +623,9 @@ def main():
     )
     parser.add_argument("--temporal_pair_checkpoint", default=None)
     parser.add_argument("--server", default="http://localhost:8080")
+    parser.add_argument("--username", default=None)
+    parser.add_argument("--password", default=None)
+    parser.add_argument("--stream", action="store_true")
     parser.add_argument("--prompt", default="Describe this image.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--timeout", type=int, default=300)
@@ -590,6 +670,8 @@ def main():
                 args.server,
                 args.cloud_checkpoint,
                 timeout=args.timeout,
+                username=args.username,
+                password=args.password,
             )
             print(
                 "Cloud checkpoint ready: "
@@ -631,6 +713,20 @@ def main():
                 )
                 temporal_fusion.eval()
                 load_ms += (time.perf_counter() - load_started) * 1000
+            if args.stream:
+                print(
+                    "DEMO_STREAM_START="
+                    + json.dumps({"label": label}, ensure_ascii=False),
+                    flush=True,
+                )
+
+            def _emit_text(text):
+                print(
+                    "DEMO_STREAM_DELTA="
+                    + json.dumps({"label": label, "text": text}, ensure_ascii=False),
+                    flush=True,
+                )
+
             row = _run_variant(
                 encoder,
                 temporal_fusion,
@@ -641,6 +737,7 @@ def main():
                 codec_acc,
                 temporal_acc,
                 pure_qwen,
+                on_text=_emit_text if args.stream else None,
             )
             if temporal_acc:
                 row["temporal_checkpoint"] = args.temporal_pair_checkpoint
