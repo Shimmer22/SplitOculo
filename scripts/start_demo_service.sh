@@ -3,9 +3,12 @@
 # Start/stop/status helper for the SplitOculo remote demo.
 #
 # Usage:
-#   ./scripts/start_demo_service.sh              # start
+#   ./scripts/start_demo_service.sh              # start cloud, ngrok, and watchdog
 #   ./scripts/start_demo_service.sh status
 #   ./scripts/start_demo_service.sh stop
+#
+# The default start command is safe to run again: ready cloud/ngrok processes
+# are reused and an existing watchdog is not duplicated.
 #
 # The cloud server and ngrok must run in the same container/host for the
 # default 127.0.0.1:8080 target to work.
@@ -14,6 +17,7 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+SCRIPT_PATH="$ROOT_DIR/scripts/start_demo_service.sh"
 
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv-temporal/bin/python}"
 CLOUD_HOST="${CLOUD_HOST:-127.0.0.1}"
@@ -37,6 +41,12 @@ NGROK_BASIC_AUTH_PASSWORD="${NGROK_BASIC_AUTH_PASSWORD:-SplitOculoDemo2026}"
 CLOUD_PID_FILE="${CLOUD_PID_FILE:-/tmp/cloud_server.pid}"
 NGROK_PID_FILE="${NGROK_PID_FILE:-/tmp/ngrok.pid}"
 PUBLIC_URL_FILE="${PUBLIC_URL_FILE:-$LOG_DIR/public_url.txt}"
+WATCHDOG_INTERVAL="${WATCHDOG_INTERVAL:-10}"
+WATCHDOG_FAILURE_THRESHOLD="${WATCHDOG_FAILURE_THRESHOLD:-3}"
+WATCHDOG_RESTART_BACKOFF="${WATCHDOG_RESTART_BACKOFF:-30}"
+WATCHDOG_PID_FILE="${WATCHDOG_PID_FILE:-/tmp/splitoculo_watchdog.pid}"
+WATCHDOG_LOCK_FILE="${WATCHDOG_LOCK_FILE:-/tmp/splitoculo_watchdog.lock}"
+WATCHDOG_LOG="${WATCHDOG_LOG:-$LOG_DIR/watchdog.log}"
 
 die() {
   echo "ERROR: $*" >&2
@@ -80,6 +90,19 @@ ngrok_pid_is_ours() {
   [[ -n "$pid" ]] || return 1
   pid_is_alive "$pid" || return 1
   pid_command "$pid" | grep -Fq "ngrok http"
+}
+
+watchdog_pid_is_ours() {
+  local pid
+  pid="$(pid_value "$WATCHDOG_PID_FILE" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 1
+  pid_is_alive "$pid" || return 1
+  pid_command "$pid" | grep -Fq "$SCRIPT_PATH watchdog"
+}
+
+watchdog_log() {
+  mkdir -p "$LOG_DIR"
+  printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$WATCHDOG_LOG"
 }
 
 cloud_health() {
@@ -226,6 +249,159 @@ verify_public_service() {
   echo "ngrok log: $NGROK_LOG"
 }
 
+restart_ngrok() {
+  local existing_url
+  existing_url="$(public_url_from_ngrok || true)"
+
+  # Never stop a tunnel that was not started by this helper. It may belong to
+  # another user or service on the host.
+  if [[ -n "$existing_url" ]] && ! ngrok_pid_is_ours; then
+    watchdog_log "unmanaged ngrok tunnel detected at $existing_url; refusing to stop it"
+    return 1
+  fi
+
+  if ngrok_pid_is_ours; then
+    watchdog_log "stopping managed ngrok before restart"
+    stop_pid_file ngrok "$NGROK_PID_FILE" "ngrok http" || true
+    for _ in $(seq 1 20); do
+      ngrok_pid_is_ours || break
+      sleep 1
+    done
+    if ngrok_pid_is_ours; then
+      watchdog_log "managed ngrok did not exit after 20 seconds"
+      return 1
+    fi
+  fi
+
+  start_ngrok
+}
+
+restart_cloud() {
+  if cloud_pid_is_ours; then
+    watchdog_log "stopping the unhealthy managed cloud server before restart"
+    stop_pid_file cloud-server "$CLOUD_PID_FILE" "scripts/cloud_server.py" || true
+    for _ in $(seq 1 30); do
+      cloud_pid_is_ours || break
+      sleep 1
+    done
+    if cloud_pid_is_ours; then
+      watchdog_log "managed cloud server did not exit after 30 seconds"
+      return 1
+    fi
+  fi
+
+  start_cloud
+}
+
+ngrok_public_service_ready() {
+  local public_url response
+  public_url="$(public_url_from_ngrok || true)"
+  [[ -n "$public_url" ]] || return 1
+
+  printf '%s\n' "$public_url" > "$PUBLIC_URL_FILE"
+  response="$(curl -fsS --max-time 5 \
+    -u "$NGROK_BASIC_AUTH_USER:$NGROK_BASIC_AUTH_PASSWORD" \
+    "$public_url/health" 2>/dev/null || true)"
+
+  [[ "$response" == *'"model_loaded":true'* ]] || return 1
+  [[ "$response" == *'"qwen_loaded":true'* ]] || return 1
+}
+
+watchdog_loop() {
+  mkdir -p "$LOG_DIR"
+  require_command curl
+  require_command flock
+  require_command python3
+  require_command ngrok
+
+  # Only one watchdog may supervise this project at a time. The descriptor is
+  # intentionally kept open for the whole lifetime of this process.
+  exec 9>"$WATCHDOG_LOCK_FILE"
+  if ! flock -n 9; then
+    watchdog_log "another watchdog already owns $WATCHDOG_LOCK_FILE; exiting"
+    return 0
+  fi
+
+  trap 'watchdog_log "watchdog stopping"; exit 0' TERM INT
+  watchdog_log "watchdog started (interval=${WATCHDOG_INTERVAL}s, threshold=${WATCHDOG_FAILURE_THRESHOLD})"
+
+  local cloud_failures=0
+  local ngrok_failures=0
+
+  while :; do
+    if cloud_ready; then
+      if (( cloud_failures > 0 )); then
+        watchdog_log "cloud server recovered"
+      fi
+      cloud_failures=0
+    else
+      cloud_failures=$((cloud_failures + 1))
+      watchdog_log "cloud health check failed (${cloud_failures}/${WATCHDOG_FAILURE_THRESHOLD})"
+      if (( cloud_failures >= WATCHDOG_FAILURE_THRESHOLD )); then
+        watchdog_log "cloud server has failed repeatedly; attempting recovery"
+        if restart_cloud; then
+          watchdog_log "cloud server recovery completed"
+          cloud_failures=0
+        else
+          watchdog_log "cloud server recovery failed; retrying after ${WATCHDOG_RESTART_BACKOFF}s"
+          sleep "$WATCHDOG_RESTART_BACKOFF"
+        fi
+      fi
+    fi
+
+    if ngrok_pid_is_ours && ngrok_public_service_ready; then
+      if (( ngrok_failures > 0 )); then
+        watchdog_log "ngrok/public service recovered"
+      fi
+      ngrok_failures=0
+    else
+      ngrok_failures=$((ngrok_failures + 1))
+      watchdog_log "ngrok/public health check failed (${ngrok_failures}/${WATCHDOG_FAILURE_THRESHOLD})"
+      if (( ngrok_failures >= WATCHDOG_FAILURE_THRESHOLD )); then
+        watchdog_log "ngrok has failed repeatedly; attempting tunnel recovery"
+        if restart_ngrok; then
+          watchdog_log "ngrok recovery completed"
+          ngrok_failures=0
+        else
+          watchdog_log "ngrok recovery failed; retrying after ${WATCHDOG_RESTART_BACKOFF}s"
+          sleep "$WATCHDOG_RESTART_BACKOFF"
+        fi
+      fi
+    fi
+
+    sleep "$WATCHDOG_INTERVAL"
+  done
+}
+
+start_watchdog() {
+  mkdir -p "$LOG_DIR"
+  require_command flock
+
+  if watchdog_pid_is_ours; then
+    echo "watchdog is already running: pid=$(pid_value "$WATCHDOG_PID_FILE")"
+    return 0
+  fi
+
+  local existing_pid
+  existing_pid="$(pid_value "$WATCHDOG_PID_FILE" 2>/dev/null || true)"
+  if [[ -n "$existing_pid" ]] && pid_is_alive "$existing_pid"; then
+    die "watchdog pid file points to an unexpected process pid=$existing_pid: $(pid_command "$existing_pid")"
+  fi
+
+  echo "starting watchdog ..."
+  setsid "$SCRIPT_PATH" watchdog >"$WATCHDOG_LOG" 2>&1 < /dev/null &
+  echo "$!" > "$WATCHDOG_PID_FILE"
+  sleep 1
+
+  if watchdog_pid_is_ours; then
+    echo "watchdog pid=$(cat "$WATCHDOG_PID_FILE")"
+  else
+    echo "watchdog failed to start; recent log:" >&2
+    tail -n 80 "$WATCHDOG_LOG" >&2 || true
+    return 1
+  fi
+}
+
 start_service() {
   require_command curl
   require_command python3
@@ -233,6 +409,7 @@ start_service() {
   start_cloud
   start_ngrok
   verify_public_service
+  start_watchdog
 }
 
 stop_pid_file() {
@@ -257,6 +434,7 @@ stop_pid_file() {
 }
 
 stop_service() {
+  stop_pid_file watchdog "$WATCHDOG_PID_FILE" "$SCRIPT_PATH watchdog" || true
   stop_pid_file ngrok "$NGROK_PID_FILE" "ngrok http" || true
   stop_pid_file cloud-server "$CLOUD_PID_FILE" "scripts/cloud_server.py" || true
 }
@@ -266,6 +444,12 @@ status_service() {
   echo "project: $ROOT_DIR"
   echo "cloud pid: $(pid_value "$CLOUD_PID_FILE" 2>/dev/null || echo none)"
   echo "ngrok pid: $(pid_value "$NGROK_PID_FILE" 2>/dev/null || echo none)"
+  echo "watchdog pid: $(pid_value "$WATCHDOG_PID_FILE" 2>/dev/null || echo none)"
+  if watchdog_pid_is_ours; then
+    echo "watchdog: running"
+  else
+    echo "watchdog: offline"
+  fi
   echo "local health:"
   cloud_health || true
   echo
@@ -282,6 +466,9 @@ case "${1:-start}" in
   start)
     start_service
     ;;
+  watchdog)
+    watchdog_loop
+    ;;
   stop)
     stop_service
     ;;
@@ -289,7 +476,7 @@ case "${1:-start}" in
     status_service
     ;;
   *)
-    echo "usage: $0 [start|status|stop]" >&2
+    echo "usage: $0 [start|status|stop|watchdog]" >&2
     exit 2
     ;;
 esac

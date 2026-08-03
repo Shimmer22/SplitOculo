@@ -1,0 +1,380 @@
+[
+  {
+    "method": "Q2",
+    "num_frames": 2,
+    "answer": "果冻",
+    "first_token_s": 0.9927509846165776,
+    "total_s": 3.1278098225593567,
+    "gen_s": 1.0865959487855434,
+    "generated_tokens": 3,
+    "average_tps": 2.760915870662883
+  },
+  {
+    "method": "Q4",
+    "num_frames": 4,
+    "answer": "果冻",
+    "first_token_s": 0.8645163560286164,
+    "total_s": 5.115085774101317,
+    "gen_s": 0.9194642826914787,
+    "generated_tokens": 3,
+    "average_tps": 3.2627694805265577
+  },
+  {
+    "method": "Q8",
+    "num_frames": 8,
+    "answer": "果冻",
+    "first_token_s": 1.6794959539547563,
+    "total_s": 9.65644646063447,
+    "gen_s": 1.735711032524705,
+    "generated_tokens": 3,
+    "average_tps": 1.7283983012058777
+  },
+  {
+    "method": "Q16",
+    "num_frames": 16,
+    "answer": "果冻",
+    "first_token_s": 3.4793056417256594,
+    "total_s": 19.69079419411719,
+    "gen_s": 3.535085859708488,
+    "generated_tokens": 3,
+    "average_tps": 0.848635682146455
+  },
+  {
+    "method": "Q32",
+    "num_frames": 32,
+    "answer": "果冻",
+    "first_token_s": 7.831550030969083,
+    "total_s": 40.24959722068161,
+    "gen_s": 7.887674369849265,
+    "generated_tokens": 3,
+    "average_tps": 0.3803402447073041
+  },
+  {
+    "method": "Q64",
+    "num_frames": 64,
+    "answer": "零食",
+    "first_token_s": 18.507615473121405,
+    "total_s": 83.34738864004612,
+    "gen_s": 18.538989995606244,
+    "generated_tokens": 2,
+    "average_tps": 0.10788074218034541
+  },
+  {
+    "method": "S4964-2",
+    "num_frames": 2,
+    "payload_level": "49x64",
+    "answer": "饮料区",
+    "first_token_s": 0.06373228412121534,
+    "total_s": 16.52361576166004,
+    "gen_s": 0.11917030904442072,
+    "generated_tokens": 3,
+    "average_tps": 25.174055719547983,
+    "payload_int8_bytes": 6272
+  },
+  {
+    "method": "S49128-2",
+    "num_frames": 2,
+    "payload_level": "49x128",
+    "answer": "饮料区",
+    "first_token_s": 0.06119577679783106,
+    "total_s": 0.27915859688073397,
+    "gen_s": 0.11769834440201521,
+    "generated_tokens": 3,
+    "average_tps": 25.488888694585874,
+    "payload_int8_bytes": 12544
+  },
+  {
+    "method": "S19664-2",
+    "num_frames": 2,
+    "payload_level": "196x64",
+    "answer": "Frozen food",
+    "first_token_s": 0.08820884581655264,
+    "total_s": 0.29238778352737427,
+    "gen_s": 0.11591740697622299,
+    "generated_tokens": 3,
+    "average_tps": 25.8804961071581,
+    "payload_int8_bytes": 25088
+  },
+  {
+    "method": "S196128-2",
+    "num_frames": 2,
+    "payload_level": "196x128",
+    "answer": "Frozen foods",
+    "first_token_s": 0.0882168710231781,
+    "total_s": 0.2666851282119751,
+    "gen_s": 0.1155585665255785,
+    "generated_tokens": 3,
+    "average_tps": 25.960862013081133,
+    "payload_int8_bytes": 50176
+  },
+  {
+    "method": "S4964-4",
+    "num_frames": 4,
+    "payload_level": "49x64",
+    "answer": "Frozen foods",
+    "first_token_s": 0.10859107319265604,
+    "total_s": 0.3934527914971113,
+    "gen_s": 0.13575378619134426,
+    "generated_tokens": 3,
+    "average_tps": 22.09883115725049,
+    "payload_int8_bytes": 12544
+  },
+  {
+    "method": "S49128-4",
+    "num_frames": 4,
+    "payload_level": "49x128",
+    "answer": "Frozen foods",
+    "first_token_s": 0.08999232389032841,
+    "total_s": 0.3753475612029433,
+    "gen_s": 0.11880051530897617,
+    "generated_tokens": 3,
+    "average_tps": 25.25241571720127,
+    "payload_int8_bytes": 25088
+  },
+  {
+    "method": "S19664-4",
+    "num_frames": 4,
+    "payload_level": "196x64",
+    "answer": "Frozen food",
+    "first_token_s": 0.09044763538986444,
+    "total_s": 0.4205730250105262,
+    "gen_s": 0.11787613946944475,
+    "generated_tokens": 3,
+    "average_tps": 25.45044326615095,
+    "payload_int8_bytes": 50176
+  },
+  {
+    "method": "S196128-4",
+    "num_frames": 4,
+    "payload_level": "196x128",
+    "answer": "Frozen food",
+    "first_token_s": 0.08913369569927454,
+    "total_s": 0.39022941049188375,
+    "gen_s": 0.11659502517431974,
+    "generated_tokens": 3,
+    "average_tps": 25.73008578637672,
+    "payload_int8_bytes": 100352
+  },
+  {
+    "method": "S4964-8",
+    "num_frames": 8,
+    "payload_level": "49x64",
+    "answer": "Frozen foods",
+    "first_token_s": 0.09071408957242966,
+    "total_s": 0.587818811647594,
+    "gen_s": 0.11814868170768023,
+    "generated_tokens": 3,
+    "average_tps": 25.391734860169716,
+    "payload_int8_bytes": 25088
+  },
+  {
+    "method": "S49128-8",
+    "num_frames": 8,
+    "payload_level": "49x128",
+    "answer": "Frozen foods",
+    "first_token_s": 0.09358136262744665,
+    "total_s": 0.7742981864139438,
+    "gen_s": 0.12156233098357916,
+    "generated_tokens": 3,
+    "average_tps": 24.678697551507504,
+    "payload_int8_bytes": 50176
+  },
+  {
+    "method": "S19664-8",
+    "num_frames": 8,
+    "payload_level": "196x64",
+    "answer": "Frozen food",
+    "first_token_s": 0.09208145085722208,
+    "total_s": 0.5811307663097978,
+    "gen_s": 0.11940825916826725,
+    "generated_tokens": 3,
+    "average_tps": 25.123890264344883,
+    "payload_int8_bytes": 100352
+  },
+  {
+    "method": "S196128-8",
+    "num_frames": 8,
+    "payload_level": "196x128",
+    "answer": "Frozen food",
+    "first_token_s": 0.09059770405292511,
+    "total_s": 0.5844320189207792,
+    "gen_s": 0.11841937340795994,
+    "generated_tokens": 3,
+    "average_tps": 25.333692567894854,
+    "payload_int8_bytes": 200704
+  },
+  {
+    "method": "S4964-16",
+    "num_frames": 16,
+    "payload_level": "49x64",
+    "answer": "Frozen food",
+    "first_token_s": 0.10124334320425987,
+    "total_s": 1.0262508997693658,
+    "gen_s": 0.12880069110542536,
+    "generated_tokens": 3,
+    "average_tps": 23.29180048843413,
+    "payload_int8_bytes": 50176
+  },
+  {
+    "method": "S49128-16",
+    "num_frames": 16,
+    "payload_level": "49x128",
+    "answer": "Frozen food",
+    "first_token_s": 0.1021906640380621,
+    "total_s": 0.9993067560717463,
+    "gen_s": 0.12993088830262423,
+    "generated_tokens": 3,
+    "average_tps": 23.089197951241967,
+    "payload_int8_bytes": 100352
+  },
+  {
+    "method": "S19664-16",
+    "num_frames": 16,
+    "payload_level": "196x64",
+    "answer": "Frozen food",
+    "first_token_s": 0.10106479562819004,
+    "total_s": 0.9950712164863944,
+    "gen_s": 0.12867512367665768,
+    "generated_tokens": 3,
+    "average_tps": 23.31452975742673,
+    "payload_int8_bytes": 200704
+  },
+  {
+    "method": "S196128-16",
+    "num_frames": 16,
+    "payload_level": "196x128",
+    "answer": "Frozen food",
+    "first_token_s": 0.1020279061049223,
+    "total_s": 0.9920205157250166,
+    "gen_s": 0.12974272016435862,
+    "generated_tokens": 3,
+    "average_tps": 23.122684619218617,
+    "payload_int8_bytes": 401408
+  },
+  {
+    "method": "S4964-32",
+    "num_frames": 32,
+    "payload_level": "49x64",
+    "answer": "Frozen food",
+    "first_token_s": 0.13317048083990812,
+    "total_s": 1.8777162376791239,
+    "gen_s": 0.16091079451143742,
+    "generated_tokens": 3,
+    "average_tps": 18.643870407256998,
+    "payload_int8_bytes": 100352
+  },
+  {
+    "method": "S49128-32",
+    "num_frames": 32,
+    "payload_level": "49x128",
+    "answer": "Frozen food",
+    "first_token_s": 0.13493806403130293,
+    "total_s": 2.0851377844810486,
+    "gen_s": 0.1635286659002304,
+    "generated_tokens": 3,
+    "average_tps": 18.345407415176457,
+    "payload_int8_bytes": 200704
+  },
+  {
+    "method": "S19664-32",
+    "num_frames": 32,
+    "payload_level": "196x64",
+    "answer": "Frozen food",
+    "first_token_s": 0.1339898882433772,
+    "total_s": 1.8408102951943874,
+    "gen_s": 0.16217433847486973,
+    "generated_tokens": 3,
+    "average_tps": 18.498610989955573,
+    "payload_int8_bytes": 401408
+  },
+  {
+    "method": "S196128-32",
+    "num_frames": 32,
+    "payload_level": "196x128",
+    "answer": "Frozen food",
+    "first_token_s": 0.13473247177898884,
+    "total_s": 1.8503521895036101,
+    "gen_s": 0.16255157254636288,
+    "generated_tokens": 3,
+    "average_tps": 18.455681190929983,
+    "payload_int8_bytes": 802816
+  },
+  {
+    "method": "S4964-64",
+    "num_frames": 64,
+    "payload_level": "49x64",
+    "answer": "Frozen food",
+    "first_token_s": 0.21210959367454052,
+    "total_s": 3.892725340090692,
+    "gen_s": 0.23927862010896206,
+    "generated_tokens": 3,
+    "average_tps": 12.537685141421612,
+    "payload_int8_bytes": 200704
+  },
+  {
+    "method": "S49128-64",
+    "num_frames": 64,
+    "payload_level": "49x128",
+    "answer": "Frozen food",
+    "first_token_s": 0.21154669020324945,
+    "total_s": 3.8580757156014442,
+    "gen_s": 0.23901215381920338,
+    "generated_tokens": 3,
+    "average_tps": 12.551662968023368,
+    "payload_int8_bytes": 401408
+  },
+  {
+    "method": "S19664-64",
+    "num_frames": 64,
+    "payload_level": "196x64",
+    "answer": "Frozen food",
+    "first_token_s": 0.21187356021255255,
+    "total_s": 3.6312724174931645,
+    "gen_s": 0.2390823233872652,
+    "generated_tokens": 3,
+    "average_tps": 12.547979112368774,
+    "payload_int8_bytes": 802816
+  },
+  {
+    "method": "S196128-64",
+    "num_frames": 64,
+    "payload_level": "196x128",
+    "answer": "Frozen food",
+    "first_token_s": 0.2107101771980524,
+    "total_s": 3.8128433199599385,
+    "gen_s": 0.23807208612561226,
+    "generated_tokens": 3,
+    "average_tps": 12.601225321380733,
+    "payload_int8_bytes": 1605632
+  },
+  {
+    "method": "QConcat2",
+    "num_frames": 2,
+    "error": "skipped: model internals changed"
+  },
+  {
+    "method": "QConcat4",
+    "num_frames": 4,
+    "error": "skipped: model internals changed"
+  },
+  {
+    "method": "QConcat8",
+    "num_frames": 8,
+    "error": "skipped: model internals changed"
+  },
+  {
+    "method": "QConcat16",
+    "num_frames": 16,
+    "error": "skipped: model internals changed"
+  },
+  {
+    "method": "QConcat32",
+    "num_frames": 32,
+    "error": "skipped: model internals changed"
+  },
+  {
+    "method": "QConcat64",
+    "num_frames": 64,
+    "error": "skipped: model internals changed"
+  }
+]

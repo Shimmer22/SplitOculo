@@ -1,0 +1,91 @@
+{
+  "video": "/data/downloads/20260115_0001_dajiangaction5pro_lingshouxiaofei_chaoshi_0001.MP4",
+  "total_frames": 14896,
+  "fps": 29.97,
+  "prompt": "These are uniformly sampled first-person supermarket video frames. Question: During the middle part of the video, the wearer selected or picked items in front of which product area? Answer in one short Chinese noun phrase. Describe only visible product category or shelf area.",
+  "ground_truth": "乳制品",
+  "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "max_new_tokens": 32,
+  "results": [
+    {
+      "frames": 2,
+      "sampled_actual": 2,
+      "answer": "零食区",
+      "first_token_s": 0.839323683641851,
+      "total_s": 2.9886344904080033,
+      "gen_s": 0.954709610901773,
+      "generated_tokens": 3,
+      "average_tps": 3.1423167481956567
+    },
+    {
+      "frames": 4,
+      "sampled_actual": 4,
+      "answer": "饮料区",
+      "first_token_s": 0.14568533468991518,
+      "total_s": 4.4439290296286345,
+      "gen_s": 0.2040507085621357,
+      "generated_tokens": 3,
+      "average_tps": 14.702227799843522
+    },
+    {
+      "frames": 8,
+      "sampled_actual": 8,
+      "answer": "乳制品",
+      "first_token_s": 0.22330267261713743,
+      "total_s": 8.312074484303594,
+      "gen_s": 0.28072664700448513,
+      "generated_tokens": 3,
+      "average_tps": 10.686552317037682
+    },
+    {
+      "frames": 16,
+      "sampled_actual": 16,
+      "answer": "零食区",
+      "first_token_s": 0.3677470739930868,
+      "total_s": 16.501070719212294,
+      "gen_s": 0.4262556415051222,
+      "generated_tokens": 3,
+      "average_tps": 7.03803001740201
+    },
+    {
+      "frames": 32,
+      "sampled_actual": 32,
+      "answer": "乳制品",
+      "first_token_s": 0.9024826623499393,
+      "total_s": 32.251468821428716,
+      "gen_s": 0.9608444599434733,
+      "generated_tokens": 3,
+      "average_tps": 3.122253522881831
+    },
+    {
+      "frames": 64,
+      "sampled_actual": 64,
+      "answer": "酸奶",
+      "first_token_s": 1.2991806585341692,
+      "total_s": 62.6307537490502,
+      "gen_s": 1.3320962572470307,
+      "generated_tokens": 2,
+      "average_tps": 1.5013930030351477
+    },
+    {
+      "frames": 128,
+      "sampled_actual": 128,
+      "answer": "酸奶",
+      "first_token_s": 2.6791653679683805,
+      "total_s": 136.78084503207356,
+      "gen_s": 2.7091667652130127,
+      "generated_tokens": 2,
+      "average_tps": 0.7382343625652542
+    },
+    {
+      "frames": 256,
+      "sampled_actual": 256,
+      "answer": "乳品",
+      "first_token_s": 5.692080814391375,
+      "total_s": 261.612023120746,
+      "gen_s": 5.752056953497231,
+      "generated_tokens": 3,
+      "average_tps": 0.5215525548953424
+    }
+  ]
+}
