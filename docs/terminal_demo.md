@@ -70,8 +70,14 @@ E:\anaconda\envs\cnn_vit\python.exe scripts\terminal_demo.py `
 多个项目按“项目优先”执行：先完成 Baseline 的全部轮次，再完成下一个项目的全部轮次。
 每个项目只显示一张动态汇总卡；已完成轮数、输入帧数和请求负载逐轮累计，端侧编码、模拟
 时延、TTFT 与相对速度显示已完成轮次的平均值。卡片下半部分按窗口起点逐行保留每轮回答。
-默认模式下所有项目和轮次共用一个客户端进程，Edge 与 Temporal 模型只加载一次；开启
-`--interrupt-on-next-round` 时，为了能够安全地硬中断正在运行的轮次，会回退为逐轮客户端。
+所有项目和轮次共用一个客户端进程，Edge 与 Temporal 模型只加载一次；开启
+`--interrupt-on-next-round` 时也保持常驻客户端，由客户端到点关闭当前 HTTP 流。
+中断倒计时从该轮客户端发出 `DEMO_STREAM_START`、即正式推理开始时计算，不包含 Python
+启动和 Edge/Temporal 模型加载；若到点中断，结果行会保留已经流式生成的部分回答，
+同时通知 cloud 在下一个 token 停止生成并释放模型锁，避免上一轮阻塞下一轮。
+服务就绪后 terminal 会显示“正在执行真实推理预热”，并按所选项目分别预热原生 Qwen
+与 SplitOculo 特征路径，各生成 1 个 token。视频预热最多使用 2 个 224×224 代表帧以适配
+6GB GPU；相同模型和输入档位在同一服务会话内只预热一次，后续运行直接使用预热缓存。
 
 首次检查建议先使用 `--projects baseline` 和单张图片，再逐步加入端云、时序和
 codec 方案。选择 `so` 时需要 edge checkpoint；选择 `temporal` 或 `codec` 时还

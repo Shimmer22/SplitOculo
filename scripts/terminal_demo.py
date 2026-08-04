@@ -38,6 +38,7 @@ REQUIRED_HEALTH_FIELDS = {
     "checkpoint_bottleneck_dim",
     "checkpoint_transmission_tokens",
     "checkpoint_target_tokens",
+    "compute_warmup_supported",
 }
 CONFIG_FIELDS = (
     "input",
@@ -693,6 +694,10 @@ def build_demo_command(
         command.extend(["--username", args.username])
     if args.password:
         command.extend(["--password", args.password])
+    if args.interrupt_on_next_round:
+        command.extend(
+            ["--interrupt_after_seconds", str(args.round_step_seconds)]
+        )
     command.append("--stream")
     return command
 
@@ -771,17 +776,34 @@ def wait_for_cloud(
     )
 
 
-def warm_existing_cloud(server_url: str, args: argparse.Namespace) -> dict[str, Any]:
+def warm_existing_cloud(
+    server_url: str,
+    args: argparse.Namespace,
+    projects: list[str],
+) -> dict[str, Any]:
     response = requests.post(
         f"{server_url}/warmup",
+        json={
+            "projects": projects,
+            "max_frames": args.max_frames,
+            "video_pixel_budget": args.baseline_input_size ** 2,
+            "video_fps": args.sample_fps,
+        },
         timeout=args.startup_timeout,
         auth=_auth(args),
     )
     if not response.ok:
         raise RuntimeError(f"cloud warmup returned HTTP {response.status_code}: {response.text[:500]}")
+    try:
+        warmup_result = response.json()
+    except ValueError as exc:
+        raise RuntimeError("cloud warmup returned non-JSON data") from exc
+    if not warmup_result.get("compute_warmed"):
+        raise RuntimeError("cloud warmup did not execute compute inference")
     health = fetch_health(server_url, timeout=5.0, auth=_auth(args))
     if not health or not health.get("qwen_loaded"):
         raise RuntimeError("cloud warmup completed but qwen_loaded is false")
+    health["warmup_result"] = warmup_result
     return health
 
 
@@ -929,7 +951,12 @@ def _card_body(row: dict[str, Any], inner_width: int) -> tuple[list[str], list[s
                 f"（{float(output['window_start_seconds']):g}s）: "
             )
             if output.get("interrupted"):
+                partial = str(output.get("response") or "").strip()
                 value = prefix + "已到点中断"
+                if partial:
+                    value += f"；部分回答：{partial}"
+                else:
+                    value += "（首 token 尚未返回）"
             elif output.get("error"):
                 value = prefix + f"失败：{output['error']}"
             else:
@@ -995,7 +1022,7 @@ def run_demo(
     round_index: int = 1,
     total_rounds: int = 1,
     start_time: float = 0.0,
-    deadline: float | None = None,
+    interrupt_after_seconds: float | None = None,
     aggregate_results: dict[str, dict[str, Any]] | None = None,
     client_rounds: int = 1,
 ) -> int:
@@ -1023,10 +1050,14 @@ def run_demo(
     received_result = False
     live_terminal = sys.stdout.isatty()
     stream_active = False
+    streamed_text = ""
+    armed_deadline: float | None = None
+    use_client_round_metadata = client_rounds > 1
     current_round_index = round_index
     current_total_rounds = total_rounds
     current_start_time = start_time
     current_project = project
+    current_label = project
     round_name = f"第 {current_round_index}/{current_total_rounds} 轮"
     assert process.stdout is not None
     output_queue: queue.Queue[str | None] = queue.Queue()
@@ -1042,8 +1073,8 @@ def run_demo(
     reader.start()
     while True:
         if (
-            deadline is not None
-            and time.monotonic() >= deadline
+            armed_deadline is not None
+            and time.monotonic() >= armed_deadline
             and process.poll() is None
         ):
             process.terminate()
@@ -1056,7 +1087,13 @@ def run_demo(
             update_aggregate_result(
                 aggregates,
                 project,
-                {"label": aggregates.get(project, {}).get("label", project), "interrupted": True},
+                {
+                    "label": aggregates.get(project, {}).get(
+                        "label", current_label
+                    ),
+                    "response": streamed_text.strip() or None,
+                    "interrupted": True,
+                },
                 round_index,
                 total_rounds,
                 start_time,
@@ -1067,8 +1104,10 @@ def run_demo(
             print(f"{round_name}到达下一轮采样时刻，已中断。", file=sys.stderr, flush=True)
             return 124
         wait_seconds = 0.2
-        if deadline is not None:
-            wait_seconds = max(0.01, min(wait_seconds, deadline - time.monotonic()))
+        if armed_deadline is not None:
+            wait_seconds = max(
+                0.01, min(wait_seconds, armed_deadline - time.monotonic())
+            )
         try:
             raw_line = output_queue.get(timeout=wait_seconds)
         except queue.Empty:
@@ -1081,8 +1120,13 @@ def run_demo(
                 event = json.loads(line[len(STREAM_START_PREFIX) :])
                 current_project = str(event.get("project") or current_project)
                 label = str(event.get("label") or "项目")
-                current_round_index = int(event.get("round") or round_index)
-                current_total_rounds = int(event.get("rounds") or total_rounds)
+                current_label = label
+                if use_client_round_metadata:
+                    current_round_index = int(event.get("round") or round_index)
+                    current_total_rounds = int(event.get("rounds") or total_rounds)
+                else:
+                    current_round_index = round_index
+                    current_total_rounds = total_rounds
                 current_start_time = float(
                     event.get("window_start_seconds", start_time)
                 )
@@ -1093,6 +1137,9 @@ def run_demo(
                 label = "项目"
             _clear_status()
             stream_active = True
+            streamed_text = ""
+            if interrupt_after_seconds is not None:
+                armed_deadline = time.monotonic() + interrupt_after_seconds
             if live_terminal:
                 _clear_screen()
                 if aggregates:
@@ -1110,18 +1157,28 @@ def run_demo(
                 text = ""
             if text and live_terminal:
                 print(text, end="", flush=True)
+            if text:
+                streamed_text += text
         elif line.startswith(RESULT_ITEM_PREFIX):
             try:
                 row = json.loads(line[len(RESULT_ITEM_PREFIX) :])
                 row_project = str(row.get("project") or current_project)
-                row_round = int(row.get("round") or current_round_index)
-                row_rounds = int(row.get("rounds") or current_total_rounds)
+                if use_client_round_metadata:
+                    row_round = int(row.get("round") or current_round_index)
+                    row_rounds = int(row.get("rounds") or current_total_rounds)
+                else:
+                    row_round = round_index
+                    row_rounds = total_rounds
                 row_start_time = float(
                     row.get("window_start_seconds", current_start_time)
                 )
                 round_name = f"第 {row_round}/{row_rounds} 轮"
                 full_response_ms = row.get("full_response_ms")
-                if full_response_ms is not None and float(full_response_ms) > 0:
+                if (
+                    not row.get("interrupted")
+                    and full_response_ms is not None
+                    and float(full_response_ms) > 0
+                ):
                     row["relative_speed"] = (
                         args.round_step_seconds * 1000.0 / float(full_response_ms)
                     )
@@ -1139,8 +1196,10 @@ def run_demo(
                     _clear_screen()
                     print(render_comparison(list(aggregates.values())), flush=True)
                 else:
-                    _status(f"{round_name} · {row.get('label') or '项目'} 已完成")
+                    state = "已到点中断" if row.get("interrupted") else "已完成"
+                    _status(f"{round_name} · {row.get('label') or '项目'} {state}")
                 stream_active = False
+                armed_deadline = None
             except json.JSONDecodeError:
                 _status("客户端返回了无效结果事件")
         elif line.startswith(RESULT_JSON_PREFIX):
@@ -1244,9 +1303,21 @@ def execute(
                 close_cloud_session(session)
                 health = _start_session_cloud(args, server_url, session)
             if not health.get("qwen_loaded"):
-                _status("正在预热现有 Qwen 服务...")
-                health = warm_existing_cloud(server_url, args)
-                validate_health(health, args.cloud_checkpoint, args.qwen_path)
+                _status("正在加载现有服务的 Qwen 模型...")
+        _status("正在执行真实推理预热 · 原生 Qwen / SplitOculo...")
+        health = warm_existing_cloud(server_url, args, projects)
+        validate_health(health, args.cloud_checkpoint, args.qwen_path)
+        warmup_result = health.get("warmup_result") or {}
+        warmup_paths = warmup_result.get("paths") or {}
+        if warmup_paths and all(
+            bool(item.get("cached")) for item in warmup_paths.values()
+        ):
+            _status("真实推理预热已就绪 · 使用缓存")
+        else:
+            _status(
+                "真实推理预热完成 · "
+                f"{float(warmup_result.get('warmup_ms') or 0.0):.0f} ms"
+            )
         _status(
             "云端就绪 · "
             f"checkpoint={health.get('checkpoint_transmission_tokens')}x"
@@ -1255,53 +1326,15 @@ def execute(
             f"{health.get('checkpoint_hidden_size')}"
         )
         aggregate_results: dict[str, dict[str, Any]] = {}
-        if not args.interrupt_on_next_round:
-            return run_demo(
-                args,
-                projects,
-                round_index=1,
-                total_rounds=args.rounds,
-                start_time=0.0,
-                aggregate_results=aggregate_results,
-                client_rounds=args.rounds,
-            )
-
-        last_returncode = 0
-        for project in projects:
-            # Hard interruption terminates the client process, so this mode
-            # intentionally keeps the isolated per-round fallback.
-            schedule_started = time.monotonic()
-            for round_index in range(1, args.rounds + 1):
-                scheduled_at = schedule_started + (round_index - 1) * args.round_step_seconds
-                remaining = scheduled_at - time.monotonic()
-                if remaining > 0:
-                    _status(
-                        f"{project} · 等待第 {round_index}/{args.rounds} 轮采样时刻..."
-                    )
-                    time.sleep(remaining)
-                else:
-                    lag = -remaining
-                    if round_index > 1 and lag >= 0.01:
-                        _status(
-                            f"{project} · 第 {round_index}/{args.rounds} 轮"
-                            f"已落后采样 {lag:.2f} 秒"
-                        )
-                window_start = (round_index - 1) * args.round_step_seconds
-                deadline = None
-                if args.interrupt_on_next_round and round_index < args.rounds:
-                    deadline = scheduled_at + args.round_step_seconds
-                last_returncode = run_demo(
-                    args,
-                    [project],
-                    round_index=round_index,
-                    total_rounds=args.rounds,
-                    start_time=window_start,
-                    deadline=deadline,
-                    aggregate_results=aggregate_results,
-                )
-                if last_returncode not in {0, 124}:
-                    return last_returncode
-        return 0 if last_returncode == 124 else last_returncode
+        return run_demo(
+            args,
+            projects,
+            round_index=1,
+            total_rounds=args.rounds,
+            start_time=0.0,
+            aggregate_results=aggregate_results,
+            client_rounds=args.rounds,
+        )
     except KeyboardInterrupt:
         _clear_status()
         print("已中断。", file=sys.stderr)

@@ -120,3 +120,63 @@ def test_demo_client_reuses_models_across_projects_and_rounds(tmp_path):
         ("temporal", 1),
         ("temporal", 2),
     ]
+
+
+def test_demo_client_continues_after_interrupted_round(tmp_path):
+    input_path = tmp_path / "input.jpg"
+    input_path.touch()
+    output = io.StringIO()
+    argv = [
+        "demo_client.py",
+        "--input",
+        str(input_path),
+        "--projects",
+        "baseline",
+        "--rounds",
+        "2",
+        "--round_step_seconds",
+        "0.001",
+        "--interrupt_after_seconds",
+        "0.001",
+    ]
+    completed = {
+        "label": "Baseline",
+        "response": "done",
+        "frames": 1,
+        "request_bytes": 10,
+        "full_response_ms": 1,
+    }
+    with (
+        mock.patch.object(demo_client.sys, "argv", argv),
+        mock.patch.object(demo_client.sys, "stdout", output),
+        mock.patch.object(
+            demo_client,
+            "_variant_specs",
+            return_value=[("Baseline", False, False, False, True)],
+        ),
+        mock.patch.object(
+            demo_client,
+            "_run_variant",
+            side_effect=[
+                demo_client.RoundInterrupted(
+                    "partial",
+                    {"frames": 2, "request_bytes": 20},
+                ),
+                completed,
+            ],
+        ),
+    ):
+        assert demo_client.main() == 0
+
+    rows = [
+        json.loads(line.split("=", 1)[1])
+        for line in output.getvalue().splitlines()
+        if line.startswith("DEMO_RESULT_ITEM=")
+    ]
+    assert rows[0]["round"] == 1
+    assert rows[0]["interrupted"] is True
+    assert rows[0]["response"] == "partial"
+    assert rows[0]["frames"] == 2
+    assert rows[0]["request_bytes"] == 20
+    assert rows[1]["round"] == 2
+    assert rows[1]["response"] == "done"

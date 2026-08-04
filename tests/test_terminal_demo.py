@@ -64,6 +64,7 @@ def _health(args):
         "checkpoint_bottleneck_dim": 64,
         "checkpoint_transmission_tokens": 49,
         "checkpoint_target_tokens": 256,
+        "compute_warmup_supported": True,
     }
 
 
@@ -114,6 +115,12 @@ def test_demo_command_sets_sliding_window_start(tmp_path):
     assert demo[demo.index("--start_time") + 1] == "4.5"
     assert demo[demo.index("--rounds") + 1] == "3"
     assert demo[demo.index("--round_step_seconds") + 1] == "2.0"
+
+
+def test_demo_command_passes_persistent_interrupt_deadline(tmp_path):
+    args = _args(tmp_path, interrupt_on_next_round=True, round_step_seconds=5.0)
+    demo = terminal_demo.build_demo_command(args, ["baseline"], client_rounds=3)
+    assert demo[demo.index("--interrupt_after_seconds") + 1] == "5.0"
 
 
 def test_saved_config_round_trip_excludes_password(tmp_path):
@@ -182,6 +189,33 @@ def test_health_accepts_requested_qwen_before_warmup(tmp_path):
     health["qwen_model_name"] = None
     health["qwen_path"] = args.qwen_path
     terminal_demo.validate_health(health, args.cloud_checkpoint, args.qwen_path)
+
+
+def test_terminal_requests_compute_warmup_for_selected_projects(tmp_path):
+    args = _args(tmp_path, max_frames=8, baseline_input_size=224, sample_fps=2.0)
+    health = _health(args)
+    response = mock.Mock(ok=True)
+    response.json.return_value = {
+        "status": "ok",
+        "compute_warmed": True,
+        "warmup_ms": 1234,
+        "paths": {"native_qwen": {"cached": False}},
+    }
+    with (
+        mock.patch.object(terminal_demo.requests, "post", return_value=response) as post,
+        mock.patch.object(terminal_demo, "fetch_health", return_value=health),
+    ):
+        result = terminal_demo.warm_existing_cloud(
+            "http://127.0.0.1:8080", args, ["baseline"]
+        )
+
+    assert result["warmup_result"]["compute_warmed"] is True
+    assert post.call_args.kwargs["json"] == {
+        "projects": ["baseline"],
+        "max_frames": 8,
+        "video_pixel_budget": 224 * 224,
+        "video_fps": 2.0,
+    }
 
 
 def test_render_result_contains_core_and_codec_metrics():
@@ -265,6 +299,30 @@ def test_aggregate_result_sums_counts_and_averages_metrics():
     assert "第 2 轮（2s）: second" in rendered
 
 
+def test_interrupted_round_counts_input_without_averaging_incomplete_speed():
+    aggregates = {}
+    aggregate = terminal_demo.update_aggregate_result(
+        aggregates,
+        "baseline",
+        {
+            "label": "Baseline",
+            "response": "partial",
+            "interrupted": True,
+            "frames": 2,
+            "request_bytes": 1024,
+        },
+        round_index=1,
+        total_rounds=2,
+        start_time=0.0,
+    )
+
+    assert aggregate["frames"] == 2
+    assert aggregate["request_bytes"] == 1024
+    assert aggregate.get("relative_speed") is None
+    rendered = terminal_demo.render_result(aggregate)
+    assert "已到点中断；部分回答：partial" in rendered
+
+
 def test_comparison_renders_results_side_by_side():
     rendered = terminal_demo.render_comparison(
         [
@@ -324,6 +382,7 @@ def test_interactive_session_keeps_owned_cloud_running(tmp_path):
     health = _health(args)
     with (
         mock.patch.object(terminal_demo, "fetch_health", return_value=health),
+        mock.patch.object(terminal_demo, "warm_existing_cloud", return_value=health),
         mock.patch.object(terminal_demo, "run_demo", return_value=0),
         mock.patch.object(terminal_demo, "start_cloud") as start,
     ):
@@ -338,6 +397,30 @@ def test_execute_uses_one_persistent_client_for_all_projects(tmp_path):
     session = {"process": None, "log_path": None, "log_handle": None}
     with (
         mock.patch.object(terminal_demo, "fetch_health", return_value=health),
+        mock.patch.object(terminal_demo, "warm_existing_cloud", return_value=health),
+        mock.patch.object(terminal_demo, "run_demo", return_value=0) as run,
+    ):
+        assert terminal_demo.execute(
+            args, ["baseline", "so"], cloud_session=session
+        ) == 0
+
+    run.assert_called_once()
+    assert run.call_args.args[1] == ["baseline", "so"]
+    assert run.call_args.kwargs["client_rounds"] == 3
+
+
+def test_interrupt_mode_still_uses_one_persistent_client(tmp_path):
+    args = _args(
+        tmp_path,
+        projects="baseline,so",
+        rounds=3,
+        interrupt_on_next_round=True,
+    )
+    health = _health(args)
+    session = {"process": None, "log_path": None, "log_handle": None}
+    with (
+        mock.patch.object(terminal_demo, "fetch_health", return_value=health),
+        mock.patch.object(terminal_demo, "warm_existing_cloud", return_value=health),
         mock.patch.object(terminal_demo, "run_demo", return_value=0) as run,
     ):
         assert terminal_demo.execute(

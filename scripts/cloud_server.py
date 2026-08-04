@@ -62,7 +62,7 @@ from core.runtime_compat import patch_numpy_legacy_aliases
 
 patch_numpy_legacy_aliases()
 
-from transformers import TextIteratorStreamer
+from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
 
 from models.cloud_upsampler import CloudUpsampler, TransformerUpsampler
 from models.bottleneck import DimensionBottleneck
@@ -73,6 +73,16 @@ MAX_REMOTE_CHECKPOINT_BYTES = 4 * 1024 * 1024 * 1024
 REMOTE_CHECKPOINT_CHUNK_BYTES = 8 * 1024 * 1024
 REMOTE_CHECKPOINT_TIMEOUT_SECONDS = 60
 DEFAULT_MAX_VIDEO_FRAMES = 16
+
+
+class CancelEventStoppingCriteria(StoppingCriteria):
+    """Stop generation promptly when the streaming HTTP client disconnects."""
+
+    def __init__(self, event):
+        self.event = event
+
+    def __call__(self, input_ids, scores, **kwargs):
+        return self.event.is_set()
 
 
 def _is_remote_checkpoint_reference(reference):
@@ -649,6 +659,7 @@ class CloudInferenceEngine:
         prompt="Describe this image.",
         max_new_tokens=256,
         on_text=None,
+        cancel_event=None,
     ):
         """Timed image path with TTFT measured at the first streamed token."""
         self._synchronize()
@@ -670,6 +681,7 @@ class CloudInferenceEngine:
             modality="image",
             max_new_tokens=max_new_tokens,
             on_text=on_text,
+            cancel_event=cancel_event,
         )
         return answer, {
             **generation_metrics,
@@ -805,6 +817,7 @@ class CloudInferenceEngine:
         modality="image",
         max_new_tokens=256,
         on_text=None,
+        cancel_event=None,
     ):
         """Inject visual tokens and stream text to measure first-token latency and TPS."""
         if self.qwen_model is None:
@@ -862,6 +875,10 @@ class CloudInferenceEngine:
             "eos_token_id": self.processor.tokenizer.eos_token_id,
             "streamer": streamer,
         }
+        if cancel_event is not None:
+            generation_kwargs["stopping_criteria"] = StoppingCriteriaList(
+                [CancelEventStoppingCriteria(cancel_event)]
+            )
         output_holder = {}
         error_holder = {}
 
@@ -958,6 +975,7 @@ class CloudInferenceEngine:
         max_new_tokens=256,
         multilevel_payload=False,
         on_text=None,
+        cancel_event=None,
     ):
         """Timed SplitOculo video path with reconstruction, visual tail, and generation metrics."""
         if compressed_frame_features.dim() == 4:
@@ -1007,6 +1025,7 @@ class CloudInferenceEngine:
             modality="video",
             max_new_tokens=max_new_tokens,
             on_text=on_text,
+            cancel_event=cancel_event,
         )
         metrics = {
             **generation_metrics,
@@ -1038,6 +1057,7 @@ class CloudInferenceEngine:
         video_pixel_budget=224 * 224,
         video_fps=2.0,
         on_text=None,
+        cancel_event=None,
     ):
         """Run the complete native Qwen vision encoder and language model."""
         if not frames:
@@ -1116,6 +1136,10 @@ class CloudInferenceEngine:
             "do_sample": False,
             "streamer": streamer,
         }
+        if cancel_event is not None:
+            generation_kwargs["stopping_criteria"] = StoppingCriteriaList(
+                [CancelEventStoppingCriteria(cancel_event)]
+            )
         output_holder = {}
         error_holder = {}
 
@@ -1441,6 +1465,10 @@ def health():
         'max_video_frames': (
             current_engine.max_video_frames if current_engine else None
         ),
+        'compute_warmup_supported': True,
+        'compute_warmup_count': len(
+            getattr(current_engine, '_compute_warmup_signatures', set())
+        ) if current_engine else 0,
     }
     result.update(_checkpoint_info(current_engine))
     return jsonify(result)
@@ -1449,7 +1477,7 @@ def health():
 @app.route('/warmup', methods=['POST'])
 @_engine_access
 def warmup():
-    """Load Qwen before the first measured request."""
+    """Load Qwen and execute representative native/split inference paths."""
     started = time.perf_counter()
     try:
         if engine is None:
@@ -1458,11 +1486,97 @@ def warmup():
             model_path = getattr(engine, 'qwen_path', 'Qwen/Qwen2.5-VL-3B-Instruct')
             offline = getattr(engine, 'offline_mode', False)
             engine.load_qwen(model_name=model_path, local_only=offline)
+        data = request.get_json(silent=True) or {}
+        projects = {
+            str(value).strip().lower()
+            for value in data.get('projects', ['baseline', 'so'])
+            if str(value).strip()
+        }
+        run_native = 'baseline' in projects
+        run_split = any(project != 'baseline' for project in projects)
+        requested_frames = max(1, int(data.get('max_frames', 1)))
+        warmup_frames = 1 if requested_frames == 1 else 2
+        pixel_budget = max(28 * 28, int(data.get('video_pixel_budget', 224 * 224)))
+        frame_edge = max(28, int(round(pixel_budget ** 0.5)))
+        prompt = str(data.get('prompt') or 'Answer briefly.')
+        signatures = getattr(engine, '_compute_warmup_signatures', set())
+        engine._compute_warmup_signatures = signatures
+        paths = {}
+
+        if run_native:
+            signature = ('native', warmup_frames, pixel_budget)
+            path_started = time.perf_counter()
+            cached = signature in signatures
+            if not cached:
+                frames = [
+                    Image.new('RGB', (frame_edge, frame_edge), color=(127, 127, 127))
+                    for _ in range(warmup_frames)
+                ]
+                engine.infer_qwen_frames_with_timing(
+                    frames,
+                    prompt=prompt,
+                    max_new_tokens=1,
+                    video_pixel_budget=pixel_budget,
+                    video_fps=float(data.get('video_fps', 2.0)),
+                )
+                signatures.add(signature)
+            paths['native_qwen'] = {
+                'cached': cached,
+                'warmup_ms': (time.perf_counter() - path_started) * 1000,
+                'frames': warmup_frames,
+                'pixel_budget': pixel_budget,
+            }
+
+        if run_split:
+            payload_dim = int(
+                engine.bottleneck_dim if engine.bottleneck is not None
+                else engine.hidden_size
+            )
+            signature = (
+                'split', warmup_frames, int(engine.transmission_tokens), payload_dim
+            )
+            path_started = time.perf_counter()
+            cached = signature in signatures
+            if not cached:
+                compressed = torch.zeros(
+                    (
+                        warmup_frames,
+                        int(engine.transmission_tokens),
+                        payload_dim,
+                    ),
+                    dtype=torch.float32,
+                    device=engine.device,
+                )
+                if warmup_frames == 1:
+                    engine.infer_payload_with_timing(
+                        compressed,
+                        prompt=prompt,
+                        max_new_tokens=1,
+                    )
+                else:
+                    engine.infer_video_from_frame_features_with_timing(
+                        compressed,
+                        prompt=prompt,
+                        max_new_tokens=1,
+                    )
+                signatures.add(signature)
+            paths['splitoculo'] = {
+                'cached': cached,
+                'warmup_ms': (time.perf_counter() - path_started) * 1000,
+                'frames': warmup_frames,
+                'payload_shape': [
+                    warmup_frames,
+                    int(engine.transmission_tokens),
+                    payload_dim,
+                ],
+            }
         return jsonify({
             'status': 'ok',
             'model_loaded': True,
             'qwen_loaded': True,
             'qwen_model_name': engine.qwen_model_name,
+            'compute_warmed': True,
+            'paths': paths,
             'warmup_ms': (time.perf_counter() - started) * 1000,
         })
     except Exception as exc:
@@ -1562,7 +1676,7 @@ def load_checkpoint():
         return jsonify({'error': str(exc)}), 500
 
 
-def _infer_payload_data(data, on_text=None):
+def _infer_payload_data(data, on_text=None, cancel_event=None):
     """Run a SplitOculo request and return the normal response dictionary."""
     start_time = time.perf_counter()
     features_b64 = data['features']
@@ -1597,6 +1711,7 @@ def _infer_payload_data(data, on_text=None):
             max_new_tokens=int(data.get('max_new_tokens', 256)),
             multilevel_payload=multilevel_payload,
             on_text=on_text,
+            cancel_event=cancel_event,
         )
     else:
         response, inference_metrics = engine.infer_payload_with_timing(
@@ -1604,6 +1719,7 @@ def _infer_payload_data(data, on_text=None):
             prompt,
             max_new_tokens=int(data.get('max_new_tokens', 256)),
             on_text=on_text,
+            cancel_event=cancel_event,
         )
     cloud_inference_ms = (time.perf_counter() - infer_start) * 1000
     cloud_process_ms = (time.perf_counter() - start_time) * 1000
@@ -1619,7 +1735,7 @@ def _infer_payload_data(data, on_text=None):
     }
 
 
-def _infer_qwen_data(data, on_text=None):
+def _infer_qwen_data(data, on_text=None, cancel_event=None):
     """Run a native-Qwen request and return the normal response dictionary."""
     start_time = time.perf_counter()
     encoded_frames = data.get("frames") or []
@@ -1642,6 +1758,7 @@ def _infer_qwen_data(data, on_text=None):
         video_pixel_budget=int(data.get("video_pixel_budget", 224 * 224)),
         video_fps=float(data.get("video_fps", 2.0)),
         on_text=on_text,
+        cancel_event=cancel_event,
     )
     cloud_inference_ms = (time.perf_counter() - inference_start) * 1000
     cloud_process_ms = (time.perf_counter() - start_time) * 1000
@@ -1662,15 +1779,18 @@ def _ndjson_response(task):
     """Run an inference task in a worker and emit delta/result NDJSON events."""
     events = queue.Queue()
     finished = object()
+    cancel_event = threading.Event()
 
     def emit_text(chunk):
+        if cancel_event.is_set():
+            return
         for character in chunk:
             events.put({'type': 'delta', 'text': character})
 
     def worker():
         try:
             with _engine_lock:
-                result = task(emit_text)
+                result = task(emit_text, cancel_event)
             events.put({'type': 'result', 'result': result})
         except Exception as exc:
             events.put({'type': 'error', 'error': str(exc)})
@@ -1680,11 +1800,14 @@ def _ndjson_response(task):
     threading.Thread(target=worker, daemon=True).start()
 
     def generate():
-        while True:
-            event = events.get()
-            if event is finished:
-                break
-            yield json.dumps(event, ensure_ascii=False) + "\n"
+        try:
+            while True:
+                event = events.get()
+                if event is finished:
+                    break
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        finally:
+            cancel_event.set()
 
     return Response(
         generate(),
@@ -1709,7 +1832,11 @@ def infer():
 @app.route('/infer_stream', methods=['POST'])
 def infer_stream():
     data = request.get_json(silent=True) or {}
-    return _ndjson_response(lambda on_text: _infer_payload_data(data, on_text))
+    return _ndjson_response(
+        lambda on_text, cancel_event: _infer_payload_data(
+            data, on_text, cancel_event
+        )
+    )
 
 
 @app.route('/infer_qwen', methods=['POST'])
@@ -1727,7 +1854,11 @@ def infer_qwen():
 @app.route('/infer_qwen_stream', methods=['POST'])
 def infer_qwen_stream():
     data = request.get_json(silent=True) or {}
-    return _ndjson_response(lambda on_text: _infer_qwen_data(data, on_text))
+    return _ndjson_response(
+        lambda on_text, cancel_event: _infer_qwen_data(
+            data, on_text, cancel_event
+        )
+    )
 
 
 def main():

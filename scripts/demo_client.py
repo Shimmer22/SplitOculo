@@ -13,6 +13,7 @@ from io import BytesIO
 import json
 import struct
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -37,6 +38,13 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".
 RAW_EXTENSIONS = {".raw", ".rgb", ".bgr", ".yuv"}
 
 
+class RoundInterrupted(RuntimeError):
+    def __init__(self, partial_text="", result=None):
+        super().__init__("round inference deadline reached")
+        self.partial_text = partial_text
+        self.result = dict(result or {})
+
+
 def _raise_for_cloud_error(response):
     """Turn a cloud HTTP failure into a useful demo error."""
     if response.ok:
@@ -55,30 +63,76 @@ def _raise_for_cloud_error(response):
 
 
 def _post_cloud_stream(url, payload, args, on_text):
-    response = requests.post(
-        url,
-        json=payload,
-        headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"},
-        auth=(args.username, args.password) if args.username else None,
-        timeout=args.timeout,
-        stream=True,
-    )
+    interrupt_after = getattr(args, "current_interrupt_after_seconds", None)
+    interrupt_deadline = getattr(args, "current_interrupt_deadline", None)
+    request_started = time.monotonic()
+    request_timeout = args.timeout
+    if interrupt_deadline is not None:
+        remaining = interrupt_deadline - request_started
+        if remaining <= 0:
+            raise RoundInterrupted()
+        request_timeout = (min(float(args.timeout), 10.0), remaining)
+    elif interrupt_after is not None:
+        interrupt_deadline = request_started + float(interrupt_after)
+        request_timeout = (min(float(args.timeout), 10.0), float(interrupt_after))
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"},
+            auth=(args.username, args.password) if args.username else None,
+            timeout=request_timeout,
+            stream=True,
+        )
+    except requests.Timeout as exc:
+        if interrupt_after is not None:
+            raise RoundInterrupted() from exc
+        raise
     _raise_for_cloud_error(response)
     response.encoding = "utf-8"
     result = None
-    for line in response.iter_lines(decode_unicode=True):
-        if not line:
-            continue
-        event = json.loads(line)
-        event_type = event.get("type")
-        if event_type == "delta":
-            text = str(event.get("text") or "")
-            if text:
-                on_text(text)
-        elif event_type == "result":
-            result = event.get("result")
-        elif event_type == "error":
-            raise RuntimeError(str(event.get("error") or "cloud streaming failed"))
+    chunks = []
+    interrupted = threading.Event()
+    timer = None
+    if interrupt_deadline is not None:
+        remaining = max(0.0, interrupt_deadline - time.monotonic())
+
+        def _interrupt_response():
+            interrupted.set()
+            close_response = getattr(response, "close", None)
+            if close_response is not None:
+                close_response()
+
+        timer = threading.Timer(remaining, _interrupt_response)
+        timer.daemon = True
+        timer.start()
+    try:
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            event = json.loads(line)
+            event_type = event.get("type")
+            if event_type == "delta":
+                text = str(event.get("text") or "")
+                if text:
+                    chunks.append(text)
+                    on_text(text)
+            elif event_type == "result":
+                result = event.get("result")
+            elif event_type == "error":
+                raise RuntimeError(str(event.get("error") or "cloud streaming failed"))
+    except Exception as exc:
+        if interrupted.is_set():
+            raise RoundInterrupted("".join(chunks)) from exc
+        raise
+    finally:
+        if timer is not None:
+            timer.cancel()
+        close_response = getattr(response, "close", None)
+        if close_response is not None:
+            close_response()
+    if interrupted.is_set():
+        raise RoundInterrupted("".join(chunks))
     if not isinstance(result, dict):
         raise RuntimeError("cloud stream ended without a result event")
     return result
@@ -379,12 +433,26 @@ def _run_pure_qwen(path, args, label, on_text=None):
 
     request_started = time.perf_counter()
     if on_text is not None:
-        cloud = _post_cloud_stream(
-            f"{args.server.rstrip('/')}/infer_qwen_stream",
-            payload,
-            args,
-            on_text,
-        )
+        try:
+            cloud = _post_cloud_stream(
+                f"{args.server.rstrip('/')}/infer_qwen_stream",
+                payload,
+                args,
+                on_text,
+            )
+        except RoundInterrupted as exc:
+            exc.result.update(
+                {
+                    "frames": len(frames),
+                    "edge_encode_ms": encode_ms,
+                    "edge_decode_ms": decode_ms,
+                    "payload_bytes": payload_bytes,
+                    "request_bytes": payload_size,
+                    "upload_delay_ms": bandwidth_delay_ms,
+                    "full_response_ms": (time.perf_counter() - started) * 1000,
+                }
+            )
+            raise
         response = None
     else:
         response = requests.post(
@@ -494,12 +562,26 @@ def _run_variant(
 
     request_started = time.perf_counter()
     if on_text is not None:
-        cloud = _post_cloud_stream(
-            f"{args.server.rstrip('/')}/infer_stream",
-            payload,
-            args,
-            on_text,
-        )
+        try:
+            cloud = _post_cloud_stream(
+                f"{args.server.rstrip('/')}/infer_stream",
+                payload,
+                args,
+                on_text,
+            )
+        except RoundInterrupted as exc:
+            exc.result.update(
+                {
+                    "frames": edge_metrics["frames"],
+                    "edge_encode_ms": edge_metrics["encode_ms"],
+                    "edge_decode_ms": edge_metrics["decode_ms"],
+                    "payload_bytes": edge_metrics["payload_bytes"],
+                    "request_bytes": payload_size,
+                    "upload_delay_ms": bandwidth_delay_ms,
+                    "full_response_ms": (time.perf_counter() - started) * 1000,
+                }
+            )
+            raise
         response = None
     else:
         response = requests.post(
@@ -650,6 +732,7 @@ def main():
     parser.add_argument("--start_time", type=float, default=0.0)
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--round_step_seconds", type=float, default=2.0)
+    parser.add_argument("--interrupt_after_seconds", type=float, default=None)
     parser.add_argument("--codec_flow_impl", choices=("feature_grid", "feature_grid_center", "dense"), default="feature_grid")
     parser.add_argument(
         "--codec_selection_policy",
@@ -676,6 +759,8 @@ def main():
         raise ValueError("--baseline_input_size must be positive")
     if args.rounds <= 0 or args.round_step_seconds <= 0:
         raise ValueError("--rounds and --round_step_seconds must be positive")
+    if args.interrupt_after_seconds is not None and args.interrupt_after_seconds <= 0:
+        raise ValueError("--interrupt_after_seconds must be positive")
     path = Path(args.input)
     project_names = [
         item.strip().lower() for item in args.projects.split(",") if item.strip()
@@ -751,6 +836,17 @@ def main():
                     + (round_index - 1) * args.round_step_seconds
                 )
                 args.start_time = window_start
+                args.current_interrupt_after_seconds = (
+                    args.interrupt_after_seconds
+                    if round_index < args.rounds
+                    else None
+                )
+                args.current_interrupt_deadline = (
+                    schedule_started + round_index * args.round_step_seconds
+                    if round_index < args.rounds
+                    and args.interrupt_after_seconds is not None
+                    else None
+                )
                 event_context = {
                     "project": project,
                     "label": label,
@@ -794,6 +890,23 @@ def main():
                             temporal_metadata.get("temporal_patch_size", 2)
                         )
                     row.update(event_context)
+                    results.append(row)
+                    print(
+                        "DEMO_RESULT_ITEM="
+                        + json.dumps(row, ensure_ascii=False),
+                        flush=True,
+                    )
+                except RoundInterrupted as exc:
+                    row = {
+                        **exc.result,
+                        **event_context,
+                        "pure_qwen": bool(pure_qwen),
+                        "spatial_acceleration": bool(spatial_acc),
+                        "temporal_redundancy_acceleration": bool(codec_acc),
+                        "temporal_pair_fusion": bool(temporal_acc),
+                        "interrupted": True,
+                        "response": exc.partial_text,
+                    }
                     results.append(row)
                     print(
                         "DEMO_RESULT_ITEM="
