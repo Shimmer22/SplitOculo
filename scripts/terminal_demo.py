@@ -39,6 +39,7 @@ REQUIRED_HEALTH_FIELDS = {
     "checkpoint_transmission_tokens",
     "checkpoint_target_tokens",
     "compute_warmup_supported",
+    "feature_metrics_supported",
 }
 CONFIG_FIELDS = (
     "input",
@@ -859,8 +860,10 @@ def _wrap_cells(value: Any, width: int) -> list[str]:
 AVERAGED_RESULT_FIELDS = (
     "edge_encode_ms",
     "upload_delay_ms",
-    "ttft_without_network_ms",
-    "relative_speed",
+    "cloud_ttft_ms",
+    "first_response_ms",
+    "feature_cosine_similarity",
+    "feature_mse",
 )
 
 
@@ -883,6 +886,8 @@ def update_aggregate_result(
             "round_outputs": [],
             "_metric_totals": {},
             "_metric_counts": {},
+            "_relative_budget_ms": 0.0,
+            "_relative_cost_ms": 0.0,
         },
     )
     aggregate["label"] = row.get("label") or aggregate["label"]
@@ -901,6 +906,19 @@ def update_aggregate_result(
         totals[field] = float(totals.get(field, 0.0)) + float(value)
         counts[field] = int(counts.get(field, 0)) + 1
         aggregate[field] = totals[field] / counts[field]
+    relative_budget_ms = row.get("relative_budget_ms")
+    first_response_ms = row.get("first_response_ms")
+    if (
+        relative_budget_ms is not None
+        and first_response_ms is not None
+        and float(first_response_ms) > 0
+    ):
+        aggregate["_relative_budget_ms"] += float(relative_budget_ms)
+        aggregate["_relative_cost_ms"] += float(first_response_ms)
+        aggregate["relative_speed"] = (
+            aggregate["_relative_budget_ms"]
+            / aggregate["_relative_cost_ms"]
+        )
     aggregate["round_outputs"].append(
         {
             "round": round_index,
@@ -908,6 +926,9 @@ def update_aggregate_result(
             "response": row.get("response"),
             "error": row.get("error"),
             "interrupted": bool(row.get("interrupted")),
+            "relative_speed": row.get("relative_speed"),
+            "feature_cosine_similarity": row.get("feature_cosine_similarity"),
+            "feature_mse": row.get("feature_mse"),
         }
     )
     return aggregate
@@ -918,7 +939,8 @@ def _card_body(row: dict[str, Any], inner_width: int) -> tuple[list[str], list[s
     label = str(row.get("round_label") or row.get("label") or "Result")
     edge = _milliseconds(row.get("edge_encode_ms"))
     simulated = _milliseconds(row.get("upload_delay_ms"))
-    ttft = _milliseconds(row.get("ttft_without_network_ms"))
+    ttft = _milliseconds(row.get("cloud_ttft_ms"))
+    first_response = _milliseconds(row.get("first_response_ms"))
     frames = row.get("frames")
     frame_text = "-" if frames is None else str(frames)
     payload = _kilobytes(row.get("request_bytes", row.get("payload_bytes")))
@@ -941,8 +963,35 @@ def _card_body(row: dict[str, Any], inner_width: int) -> tuple[list[str], list[s
         _fit_cell(f"{'平均' if aggregate_mode else ''}相对速度: {speed_text}", inner_width, "center"),
         _fit_cell(f"{'平均' if aggregate_mode else ''}端侧编码: {edge}", inner_width, "center"),
         _fit_cell(f"{'平均' if aggregate_mode else ''}模拟时延: {simulated}", inner_width, "center"),
-        _fit_cell(f"平均 TTFT: {ttft}" if aggregate_mode else f"TTFT: {ttft}", inner_width, "center"),
+        _fit_cell(
+            f"{'平均' if aggregate_mode else ''}纯计算 TTFT: {ttft}",
+            inner_width,
+            "center",
+        ),
+        _fit_cell(
+            f"{'平均' if aggregate_mode else ''}首响应时间: {first_response}",
+            inner_width,
+            "center",
+        ),
     ])
+    if row.get("feature_cosine_similarity") is not None:
+        header.append(
+            _fit_cell(
+                f"{'平均' if aggregate_mode else ''}特征 Cossim: "
+                f"{float(row['feature_cosine_similarity']):.6f}",
+                inner_width,
+                "center",
+            )
+        )
+    if row.get("feature_mse") is not None:
+        header.append(
+            _fit_cell(
+                f"{'平均' if aggregate_mode else ''}特征 MSE: "
+                f"{float(row['feature_mse']):.6f}",
+                inner_width,
+                "center",
+            )
+        )
     if aggregate_mode:
         response = []
         for output in row.get("round_outputs") or []:
@@ -1173,15 +1222,27 @@ def run_demo(
                     row.get("window_start_seconds", current_start_time)
                 )
                 round_name = f"第 {row_round}/{row_rounds} 轮"
-                full_response_ms = row.get("full_response_ms")
-                if (
-                    not row.get("interrupted")
-                    and full_response_ms is not None
-                    and float(full_response_ms) > 0
-                ):
-                    row["relative_speed"] = (
-                        args.round_step_seconds * 1000.0 / float(full_response_ms)
+                cloud_ttft_ms = row.get("cloud_ttft_ms")
+                if not row.get("interrupted") and cloud_ttft_ms is not None:
+                    first_response_ms = float(row.get("upload_delay_ms") or 0.0) + float(
+                        cloud_ttft_ms
                     )
+                    if row_round == 1:
+                        frames = int(row.get("frames") or 0)
+                        sample_fps = float(row.get("sample_fps") or args.sample_fps or 0.0)
+                        budget_seconds = (
+                            frames / sample_fps
+                            if frames > 0 and sample_fps > 0
+                            else args.round_step_seconds
+                        )
+                    else:
+                        budget_seconds = args.round_step_seconds
+                    row["first_response_ms"] = first_response_ms
+                    row["relative_budget_ms"] = budget_seconds * 1000.0
+                    if first_response_ms > 0:
+                        row["relative_speed"] = (
+                            row["relative_budget_ms"] / first_response_ms
+                        )
                 update_aggregate_result(
                     aggregates,
                     row_project,

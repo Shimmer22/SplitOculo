@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 from io import BytesIO
 import json
 import struct
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -231,6 +233,19 @@ def _payload(features: torch.Tensor, modality: str, prompt: str, level=None):
     return result, int(quantized.nbytes)
 
 
+def _attach_feature_tracking(payload, args, pure_qwen):
+    if not getattr(args, "feature_tracking_enabled", False):
+        return
+    payload["feature_session_id"] = args.feature_session_id
+    payload["feature_round"] = int(args.current_round)
+    if pure_qwen:
+        payload["capture_layer4_features"] = True
+    else:
+        payload["feature_reference_mode"] = (
+            "per_frame" if args.current_project == "so" else "temporal"
+        )
+
+
 PROJECTS = {
     "baseline": ("纯 Qwen Baseline", False, False, False, True),
     "so": ("逐帧 SplitOculo", True, False, False, False),
@@ -382,6 +397,7 @@ def _jpeg_frames_payload(
     jpeg_quality,
     input_size=224,
     video_fps=2.0,
+    max_new_tokens=256,
 ):
     encoded_frames = []
     binary_bytes = 0
@@ -401,7 +417,7 @@ def _jpeg_frames_payload(
         "frames": encoded_frames,
         "frame_format": "jpeg",
         "prompt": prompt,
-        "max_new_tokens": 256,
+        "max_new_tokens": int(max_new_tokens),
         "video_pixel_budget": int(input_size * input_size),
         "input_size": int(input_size),
         "video_fps": float(video_fps),
@@ -423,7 +439,9 @@ def _run_pure_qwen(path, args, label, on_text=None):
         args.baseline_jpeg_quality,
         args.baseline_input_size,
         args.sample_fps,
+        getattr(args, "max_new_tokens", 256),
     )
+    _attach_feature_tracking(payload, args, pure_qwen=True)
     encode_ms = (time.perf_counter() - encode_start) * 1000
     payload_size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     bandwidth_delay_ms = 0.0
@@ -487,6 +505,9 @@ def _run_pure_qwen(path, args, label, on_text=None):
         "http_roundtrip_ms": http_roundtrip_ms,
         "network_overhead_ms": network_overhead_ms,
         "cloud_ttft_ms": cloud_ttft_ms,
+        "feature_cosine_similarity": cloud.get("feature_cosine_similarity"),
+        "feature_mse": cloud.get("feature_mse"),
+        "feature_metric_error": cloud.get("feature_metric_error"),
         "upload_delay_ms": bandwidth_delay_ms,
         "bandwidth_kb_s": args.bandwidth_kb_s,
         "payload_bytes": payload_bytes,
@@ -553,6 +574,8 @@ def _run_variant(
         codec_acc,
         temporal_acc,
     )
+    payload["max_new_tokens"] = int(getattr(args, "max_new_tokens", 256))
+    _attach_feature_tracking(payload, args, pure_qwen=False)
     modality = edge_metrics["modality"]
     payload_size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     bandwidth_delay_ms = 0.0
@@ -621,6 +644,9 @@ def _run_variant(
         "http_roundtrip_ms": http_roundtrip_ms,
         "network_overhead_ms": network_overhead_ms,
         "cloud_ttft_ms": cloud_ttft_ms,
+        "feature_cosine_similarity": cloud.get("feature_cosine_similarity"),
+        "feature_mse": cloud.get("feature_mse"),
+        "feature_metric_error": cloud.get("feature_metric_error"),
         "upload_delay_ms": bandwidth_delay_ms,
         "bandwidth_kb_s": args.bandwidth_kb_s,
         "payload_bytes": edge_metrics["payload_bytes"],
@@ -766,6 +792,11 @@ def main():
         item.strip().lower() for item in args.projects.split(",") if item.strip()
     ]
     project_specs = _variant_specs(args)
+    args.feature_tracking_enabled = (
+        "baseline" in project_names
+        and any(project != "baseline" for project in project_names)
+    )
+    args.feature_session_id = uuid.uuid4().hex
     if args.cloud_checkpoint and any(not spec[4] for spec in project_specs):
         try:
             checkpoint_result = load_cloud_checkpoint(
@@ -788,6 +819,7 @@ def main():
     temporal_metadata = None
     load_ms = 0.0
     results = []
+    warmed_projects = set()
     initial_start_time = float(args.start_time)
     for project, spec in zip(project_names, project_specs):
         label, spatial_acc, codec_acc, temporal_acc, pure_qwen = spec
@@ -817,6 +849,28 @@ def main():
                 )
                 temporal_fusion.eval()
                 load_ms += (time.perf_counter() - load_started) * 1000
+            if not pure_qwen and project not in warmed_projects:
+                warmup_args = copy.copy(args)
+                warmup_args.start_time = initial_start_time
+                warmup_args.max_new_tokens = 1
+                warmup_args.current_interrupt_after_seconds = None
+                warmup_args.current_interrupt_deadline = None
+                warmup_args.feature_tracking_enabled = False
+                print(f"正在执行 {label} 端到端预热...", flush=True)
+                _run_variant(
+                    encoder,
+                    temporal_fusion,
+                    path,
+                    warmup_args,
+                    label,
+                    spatial_acc,
+                    codec_acc,
+                    temporal_acc,
+                    pure_qwen,
+                    on_text=None,
+                )
+                warmed_projects.add(project)
+                print(f"{label} 端到端预热完成", flush=True)
             schedule_started = time.monotonic()
             for round_index in range(1, args.rounds + 1):
                 scheduled_at = (
@@ -836,6 +890,8 @@ def main():
                     + (round_index - 1) * args.round_step_seconds
                 )
                 args.start_time = window_start
+                args.current_project = project
+                args.current_round = round_index
                 args.current_interrupt_after_seconds = (
                     args.interrupt_after_seconds
                     if round_index < args.rounds
@@ -943,6 +999,16 @@ def main():
             }
             results.append(row)
             print("DEMO_RESULT_ITEM=" + json.dumps(row, ensure_ascii=False), flush=True)
+    if args.feature_tracking_enabled:
+        try:
+            requests.post(
+                f"{args.server.rstrip('/')}/feature_session/release",
+                json={"feature_session_id": args.feature_session_id},
+                auth=(args.username, args.password) if args.username else None,
+                timeout=min(float(args.timeout), 5.0),
+            )
+        except requests.RequestException:
+            pass
     print("DEMO_RESULT_JSON=" + json.dumps({"model_load_ms": load_ms, "results": results}, ensure_ascii=False))
     if any("error" in item for item in results):
         return 1

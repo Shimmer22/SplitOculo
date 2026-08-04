@@ -50,7 +50,8 @@ def test_demo_client_reuses_edge_encoder_across_rounds(tmp_path):
         if line.startswith("DEMO_RESULT_ITEM="):
             rows.append(json.loads(line.split("=", 1)[1]))
     assert encoder.call_count == 1
-    assert run.call_count == 3
+    assert run.call_count == 4
+    assert run.call_args_list[0].args[3].max_new_tokens == 1
     assert [row["round"] for row in rows] == [1, 2, 3]
     assert [row["window_start_seconds"] for row in rows] == [0.0, 0.001, 0.002]
 
@@ -113,7 +114,13 @@ def test_demo_client_reuses_models_across_projects_and_rounds(tmp_path):
     ]
     assert encoder.call_count == 1
     assert load_temporal.call_count == 1
-    assert run.call_count == 4
+    assert run.call_count == 6
+    warmup_calls = [
+        call
+        for call in run.call_args_list
+        if getattr(call.args[3], "max_new_tokens", None) == 1
+    ]
+    assert [call.args[4] for call in warmup_calls] == ["SO", "Temporal"]
     assert [(row["project"], row["round"]) for row in rows] == [
         ("so", 1),
         ("so", 2),

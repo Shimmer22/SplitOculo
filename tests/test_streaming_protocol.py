@@ -52,6 +52,28 @@ def test_cancel_stopping_criteria_tracks_event():
     assert criteria(None, None) is True
 
 
+def test_feature_reconstruction_metrics_and_session_release():
+    candidate = cloud_server.torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    reference = candidate.clone()
+    metrics = cloud_server.CloudInferenceEngine.feature_reconstruction_metrics(
+        candidate, reference
+    )
+    assert metrics["feature_cosine_similarity"] == 1.0
+    assert metrics["feature_mse"] == 0.0
+
+    payload = {"feature_session_id": "test-session", "feature_round": 1}
+    references = {"per_frame": reference.cpu(), "temporal": reference.cpu()}
+    assert cloud_server._store_feature_references(payload, references) is True
+    with cloud_server.app.test_client() as client:
+        response = client.post(
+            "/feature_session/release",
+            json={"feature_session_id": "test-session"},
+        )
+    assert response.status_code == 200
+    assert response.get_json()["rounds_released"] == 1
+    assert "test-session" not in cloud_server._feature_reference_sessions
+
+
 def test_demo_client_forwards_delta_and_returns_result():
     class FakeResponse:
         ok = True

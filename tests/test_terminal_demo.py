@@ -65,6 +65,7 @@ def _health(args):
         "checkpoint_transmission_tokens": 49,
         "checkpoint_target_tokens": 256,
         "compute_warmup_supported": True,
+        "feature_metrics_supported": True,
     }
 
 
@@ -227,6 +228,8 @@ def test_render_result_contains_core_and_codec_metrics():
             "cloud_process_ms": 25,
             "network_overhead_ms": 1,
             "upload_delay_ms": 3,
+            "cloud_ttft_ms": 35,
+            "first_response_ms": 38,
             "end_to_end_ttft_ms": 42,
             "ttft_without_network_ms": 38,
             "full_response_ms": 55,
@@ -247,7 +250,8 @@ def test_render_result_contains_core_and_codec_metrics():
     assert "A person is walking." in rendered
     assert "端侧编码: 12.5 ms" in rendered
     assert "模拟时延: 3.0 ms" in rendered
-    assert "TTFT: 38.0 ms" in rendered
+    assert "纯计算 TTFT: 35.0 ms" in rendered
+    assert "首响应时间: 38.0 ms" in rendered
     assert "Cloud process" not in rendered
     assert "第 1/3 轮" in rendered
     assert "总输入帧数: 4" in rendered
@@ -266,7 +270,10 @@ def test_aggregate_result_sums_counts_and_averages_metrics():
             "frames": 2,
             "request_bytes": 1024,
             "edge_encode_ms": 10,
-            "relative_speed": 0.5,
+            "cloud_ttft_ms": 1000,
+            "first_response_ms": 1000,
+            "relative_budget_ms": 4000,
+            "relative_speed": 4,
         },
         round_index=1,
         total_rounds=2,
@@ -281,7 +288,10 @@ def test_aggregate_result_sums_counts_and_averages_metrics():
             "frames": 3,
             "request_bytes": 2048,
             "edge_encode_ms": 20,
-            "relative_speed": 1.5,
+            "cloud_ttft_ms": 1000,
+            "first_response_ms": 1000,
+            "relative_budget_ms": 2000,
+            "relative_speed": 2,
         },
         round_index=2,
         total_rounds=2,
@@ -292,11 +302,33 @@ def test_aggregate_result_sums_counts_and_averages_metrics():
     assert aggregate["frames"] == 5
     assert aggregate["request_bytes"] == 3072
     assert aggregate["edge_encode_ms"] == 15
-    assert aggregate["relative_speed"] == 1
+    assert aggregate["relative_speed"] == 3
     rendered = terminal_demo.render_result(aggregate)
     assert "已完成轮次: 2/2" in rendered
     assert "第 1 轮（0s）: first" in rendered
     assert "第 2 轮（2s）: second" in rendered
+
+
+def test_feature_reconstruction_metrics_render_in_header_and_round():
+    aggregates = {}
+    aggregate = terminal_demo.update_aggregate_result(
+        aggregates,
+        "so",
+        {
+            "label": "SO",
+            "response": "done",
+            "frames": 2,
+            "feature_cosine_similarity": 0.9876543,
+            "feature_mse": 0.0123456,
+        },
+        round_index=1,
+        total_rounds=1,
+        start_time=0.0,
+    )
+    rendered = terminal_demo.render_result(aggregate)
+    assert "特征 Cossim: 0.987654" in rendered
+    assert "特征 MSE: 0.012346" in rendered
+    assert "第 1 轮（0s）: done" in rendered
 
 
 def test_interrupted_round_counts_input_without_averaging_incomplete_speed():

@@ -73,6 +73,8 @@ MAX_REMOTE_CHECKPOINT_BYTES = 4 * 1024 * 1024 * 1024
 REMOTE_CHECKPOINT_CHUNK_BYTES = 8 * 1024 * 1024
 REMOTE_CHECKPOINT_TIMEOUT_SECONDS = 60
 DEFAULT_MAX_VIDEO_FRAMES = 16
+_feature_reference_sessions = {}
+_feature_reference_lock = threading.Lock()
 
 
 class CancelEventStoppingCriteria(StoppingCriteria):
@@ -337,6 +339,152 @@ class CloudInferenceEngine:
 
             print("Qwen loaded")
             return True
+
+    @torch.no_grad()
+    def _extract_visual_layer(self, pixel_values, grid_thw):
+        """Return original-order tokens after the configured split layer."""
+        visual = self.qwen_model.model.visual
+        hidden_states = visual.patch_embed(
+            pixel_values.to(visual.patch_embed.proj.weight.dtype)
+        )
+        rotary_pos_emb = visual.rot_pos_emb(grid_thw)
+        window_index, cu_window_seqlens = visual.get_window_index(grid_thw)
+        cu_window_seqlens = torch.tensor(
+            cu_window_seqlens,
+            device=hidden_states.device,
+            dtype=torch.int32,
+        )
+        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+        seq_len = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(
+            seq_len // visual.spatial_merge_unit,
+            visual.spatial_merge_unit,
+            -1,
+        )
+        hidden_states = hidden_states[window_index].reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            seq_len // visual.spatial_merge_unit,
+            visual.spatial_merge_unit,
+            -1,
+        )
+        rotary_pos_emb = rotary_pos_emb[window_index].reshape(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        for layer_num, block in enumerate(visual.blocks):
+            active_cu_seqlens = (
+                cu_seqlens
+                if layer_num in visual.fullatt_block_indexes
+                else cu_window_seqlens
+            )
+            hidden_states = block(
+                hidden_states,
+                cu_seqlens=active_cu_seqlens,
+                position_embeddings=position_embeddings,
+            )
+            if layer_num == self.split_layer - 1:
+                break
+        reverse_indices = torch.argsort(window_index)
+        hidden_states = hidden_states.reshape(
+            seq_len // visual.spatial_merge_unit,
+            visual.spatial_merge_unit,
+            -1,
+        )
+        return hidden_states[reverse_indices].reshape(seq_len, -1)
+
+    @torch.no_grad()
+    def extract_layer4_references(
+        self,
+        frames,
+        video_pixel_budget=224 * 224,
+        video_fps=2.0,
+    ):
+        """Extract per-frame and temporal Qwen layer-4 teacher features."""
+        image_messages = [
+            [{"role": "user", "content": [{"type": "image", "image": frame}]}]
+            for frame in frames
+        ]
+        image_texts = [
+            self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for messages in image_messages
+        ]
+        image_inputs = self.processor(
+            text=image_texts,
+            images=list(frames),
+            return_tensors="pt",
+            padding=True,
+        )
+        image_grid = image_inputs["image_grid_thw"].to(self.device)
+        image_features = self._extract_visual_layer(
+            image_inputs["pixel_values"].to(self.device), image_grid
+        )
+        image_counts = [
+            int(grid[0] * grid[1] * grid[2]) for grid in image_grid.tolist()
+        ]
+        per_frame = torch.stack(
+            list(image_features.split(image_counts, dim=0)), dim=0
+        )
+
+        if len(frames) == 1:
+            temporal = per_frame
+        else:
+            messages = [{
+                "role": "user",
+                "content": [{"type": "video", "video": "sampled_frames"}],
+            }]
+            text = self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            video_inputs = self.processor(
+                text=[text],
+                videos=[frames],
+                videos_kwargs={
+                    "size": {
+                        "shortest_edge": int(video_pixel_budget),
+                        "longest_edge": int(video_pixel_budget),
+                    },
+                    "fps": float(video_fps),
+                },
+                return_tensors="pt",
+                padding=True,
+            )
+            video_grid = video_inputs["video_grid_thw"].to(self.device)
+            temporal_flat = self._extract_visual_layer(
+                video_inputs["pixel_values_videos"].to(self.device), video_grid
+            )
+            grid_t, grid_h, grid_w = [int(value) for value in video_grid[0].tolist()]
+            temporal = temporal_flat.reshape(grid_t, grid_h * grid_w, -1)
+        return {
+            "per_frame": per_frame.detach().to("cpu", dtype=torch.bfloat16),
+            "temporal": temporal.detach().to("cpu", dtype=torch.bfloat16),
+        }
+
+    @staticmethod
+    def feature_reconstruction_metrics(candidate, reference):
+        reference = reference.to(candidate.device, dtype=torch.float32)
+        candidate = candidate.to(dtype=torch.float32)
+        if tuple(candidate.shape) != tuple(reference.shape):
+            return {
+                "feature_metric_error": (
+                    f"shape mismatch: reconstructed={list(candidate.shape)}, "
+                    f"reference={list(reference.shape)}"
+                )
+            }
+        return {
+            "feature_cosine_similarity": float(
+                F.cosine_similarity(candidate, reference, dim=-1).mean().item()
+            ),
+            "feature_mse": float(F.mse_loss(candidate, reference).item()),
+        }
     
     def decode_features(
         self,
@@ -660,6 +808,7 @@ class CloudInferenceEngine:
         max_new_tokens=256,
         on_text=None,
         cancel_event=None,
+        reference_features=None,
     ):
         """Timed image path with TTFT measured at the first streamed token."""
         self._synchronize()
@@ -667,6 +816,11 @@ class CloudInferenceEngine:
         upsampled = self.reconstruct_payload_tokens(compressed_features)
         self._synchronize()
         reconstruct_seconds = time.perf_counter() - reconstruct_start
+        feature_metrics = (
+            self.feature_reconstruction_metrics(upsampled, reference_features)
+            if reference_features is not None
+            else {}
+        )
 
         target_h = target_w = int(self.target_tokens ** 0.5)
         grid_thw = torch.tensor([[1, target_h, target_w]], dtype=torch.long, device=self.device)
@@ -685,6 +839,7 @@ class CloudInferenceEngine:
         )
         return answer, {
             **generation_metrics,
+            **feature_metrics,
             "reconstruct_seconds": reconstruct_seconds,
             "visual_tail_seconds": visual_tail_seconds,
             "ttft_seconds": reconstruct_seconds + visual_tail_seconds + generation_metrics.get("ttft_seconds", 0.0),
@@ -976,6 +1131,7 @@ class CloudInferenceEngine:
         multilevel_payload=False,
         on_text=None,
         cancel_event=None,
+        reference_features=None,
     ):
         """Timed SplitOculo video path with reconstruction, visual tail, and generation metrics."""
         if compressed_frame_features.dim() == 4:
@@ -1001,6 +1157,11 @@ class CloudInferenceEngine:
             upsampled = self.reconstruct_tokens(compressed_frame_features)
         self._synchronize()
         reconstruct_seconds = time.perf_counter() - reconstruct_start
+        feature_metrics = (
+            self.feature_reconstruction_metrics(upsampled, reference_features)
+            if reference_features is not None
+            else {}
+        )
 
         frame_count = int(upsampled.shape[0])
         video_tokens = upsampled.reshape(
@@ -1029,6 +1190,7 @@ class CloudInferenceEngine:
         )
         metrics = {
             **generation_metrics,
+            **feature_metrics,
             "reconstruct_seconds": reconstruct_seconds,
             "visual_tail_seconds": visual_tail_seconds,
             "ttft_seconds": reconstruct_seconds + visual_tail_seconds + generation_metrics.get("ttft_seconds", 0.0),
@@ -1466,6 +1628,7 @@ def health():
             current_engine.max_video_frames if current_engine else None
         ),
         'compute_warmup_supported': True,
+        'feature_metrics_supported': True,
         'compute_warmup_count': len(
             getattr(current_engine, '_compute_warmup_signatures', set())
         ) if current_engine else 0,
@@ -1676,6 +1839,33 @@ def load_checkpoint():
         return jsonify({'error': str(exc)}), 500
 
 
+def _feature_reference_key(data):
+    session_id = str(data.get("feature_session_id") or "").strip()
+    round_index = data.get("feature_round")
+    if not session_id or round_index is None:
+        return None
+    return session_id, int(round_index)
+
+
+def _get_feature_reference(data):
+    key = _feature_reference_key(data)
+    mode = str(data.get("feature_reference_mode") or "").strip()
+    if key is None or mode not in {"per_frame", "temporal"}:
+        return None
+    with _feature_reference_lock:
+        return _feature_reference_sessions.get(key[0], {}).get(key[1], {}).get(mode)
+
+
+def _store_feature_references(data, references):
+    key = _feature_reference_key(data)
+    if key is None:
+        return False
+    with _feature_reference_lock:
+        session = _feature_reference_sessions.setdefault(key[0], {})
+        session[key[1]] = references
+    return True
+
+
 def _infer_payload_data(data, on_text=None, cancel_event=None):
     """Run a SplitOculo request and return the normal response dictionary."""
     start_time = time.perf_counter()
@@ -1696,6 +1886,7 @@ def _infer_payload_data(data, on_text=None, cancel_event=None):
     )
 
     cloud_decode_ms = (time.perf_counter() - decode_start) * 1000
+    reference_features = _get_feature_reference(data)
     infer_start = time.perf_counter()
     if modality == 'video':
         multilevel_payload = engine.is_multilevel_payload(
@@ -1712,6 +1903,7 @@ def _infer_payload_data(data, on_text=None, cancel_event=None):
             multilevel_payload=multilevel_payload,
             on_text=on_text,
             cancel_event=cancel_event,
+            reference_features=reference_features,
         )
     else:
         response, inference_metrics = engine.infer_payload_with_timing(
@@ -1720,10 +1912,11 @@ def _infer_payload_data(data, on_text=None, cancel_event=None):
             max_new_tokens=int(data.get('max_new_tokens', 256)),
             on_text=on_text,
             cancel_event=cancel_event,
+            reference_features=reference_features,
         )
     cloud_inference_ms = (time.perf_counter() - infer_start) * 1000
     cloud_process_ms = (time.perf_counter() - start_time) * 1000
-    return {
+    result = {
         'response': response,
         'latency_ms': cloud_process_ms,
         'cloud_process_ms': cloud_process_ms,
@@ -1733,6 +1926,14 @@ def _infer_payload_data(data, on_text=None, cancel_event=None):
         'inference_metrics': inference_metrics,
         'modality': modality,
     }
+    for field in (
+        'feature_cosine_similarity',
+        'feature_mse',
+        'feature_metric_error',
+    ):
+        if field in inference_metrics:
+            result[field] = inference_metrics[field]
+    return result
 
 
 def _infer_qwen_data(data, on_text=None, cancel_event=None):
@@ -1760,6 +1961,17 @@ def _infer_qwen_data(data, on_text=None, cancel_event=None):
         on_text=on_text,
         cancel_event=cancel_event,
     )
+    feature_reference_cached = False
+    if (
+        _as_bool(data.get("capture_layer4_features"), False)
+        and not (cancel_event is not None and cancel_event.is_set())
+    ):
+        references = engine.extract_layer4_references(
+            frames,
+            video_pixel_budget=int(data.get("video_pixel_budget", 224 * 224)),
+            video_fps=float(data.get("video_fps", 2.0)),
+        )
+        feature_reference_cached = _store_feature_references(data, references)
     cloud_inference_ms = (time.perf_counter() - inference_start) * 1000
     cloud_process_ms = (time.perf_counter() - start_time) * 1000
     return {
@@ -1772,6 +1984,7 @@ def _infer_qwen_data(data, on_text=None, cancel_event=None):
         'inference_metrics': inference_metrics,
         'modality': inference_metrics.get('modality', 'video'),
         'pure_qwen': True,
+        'feature_reference_cached': feature_reference_cached,
     }
 
 
@@ -1859,6 +2072,23 @@ def infer_qwen_stream():
             data, on_text, cancel_event
         )
     )
+
+
+@app.route('/feature_session/release', methods=['POST'])
+def release_feature_session():
+    """Release temporary layer-4 references after one complete demo run."""
+    data = request.get_json(silent=True) or {}
+    session_id = str(data.get('feature_session_id') or '').strip()
+    if not session_id:
+        return jsonify({'error': 'feature_session_id is required'}), 400
+    with _feature_reference_lock:
+        released = _feature_reference_sessions.pop(session_id, None)
+    gc.collect()
+    return jsonify({
+        'status': 'ok',
+        'released': released is not None,
+        'rounds_released': len(released or {}),
+    })
 
 
 def main():
